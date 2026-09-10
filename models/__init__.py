@@ -3,8 +3,8 @@ from .predictor_v2 import SpectralSpatialCleanHSIPredictor
 from .predictor_raw_direct import (
     RawMSIDirectPredictor,
     extract_legacy_raw_direct_state_dict,
-    load_legacy_raw_direct_checkpoint,
 )
+from .legacy_checkpoint import load_legacy_raw_direct_checkpoint
 
 __all__ = [
     "CleanHSIPredictor",

@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+*.pth
+*.pt
+*.ckpt
+.idea/
+logs/
+outputs/
+data/raw/*
+!data/raw/.gitkeep
+data/cache/
+checkpoints/

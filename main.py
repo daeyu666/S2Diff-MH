@@ -64,10 +64,7 @@ def format_metrics(metrics):
     return " ".join(f"{k}={metrics[k]:.6f}" for k in keys if k in metrics)
 
 
-def run_train(cfg, train_loader, test_loader, info, device):
-    process = build_progressive_process(cfg)
-    model = build_model(cfg, info, device)
-
+def _load_starting_weights(cfg, model, device):
     if cfg.legacy_raw_direct_checkpoint:
         if cfg.predictor != "raw_direct":
             raise ValueError("--legacy_raw_direct_checkpoint requires --predictor raw_direct")
@@ -75,7 +72,8 @@ def run_train(cfg, train_loader, test_loader, info, device):
             model, cfg.legacy_raw_direct_checkpoint, map_location=str(device)
         )
         print("Loaded legacy Raw-Direct checkpoint:", report)
-    elif cfg.init_checkpoint:
+        return True
+    if cfg.init_checkpoint:
         load_checkpoint(
             model,
             cfg.init_checkpoint,
@@ -83,6 +81,14 @@ def run_train(cfg, train_loader, test_loader, info, device):
             map_location=str(device),
             load_optimizer=False,
         )
+        return True
+    return False
+
+
+def run_train(cfg, train_loader, test_loader, info, device):
+    process = build_progressive_process(cfg)
+    model = build_model(cfg, info, device)
+    _load_starting_weights(cfg, model, device)
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
@@ -155,8 +161,13 @@ def run_train(cfg, train_loader, test_loader, info, device):
 def run_test(cfg, test_loader, info, device):
     process = build_progressive_process(cfg)
     model = build_model(cfg, info, device)
-    checkpoint = cfg.resume or checkpoint_paths(cfg)[0]
-    load_checkpoint(model, checkpoint, map_location=str(device))
+    if cfg.legacy_raw_direct_checkpoint:
+        if cfg.resume:
+            raise ValueError("Use either --legacy_raw_direct_checkpoint or --resume, not both")
+        _load_starting_weights(cfg, model, device)
+    else:
+        checkpoint = cfg.resume or checkpoint_paths(cfg)[0]
+        load_checkpoint(model, checkpoint, map_location=str(device))
     metrics = evaluate(model, test_loader, process, device, scale_ratio=cfg.scale_ratio)
     print(format_metrics(metrics))
 

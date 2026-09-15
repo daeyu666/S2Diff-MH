@@ -6,7 +6,8 @@ The repository currently contains:
 
 1. **Innovation 1: sensor-degradation-consistent progressive diffusion**;
 2. **registered Raw-MSI Direct fusion baseline**;
-3. **Innovation 2 Stage-0: calibrated degradation-locked deformation identifiability test (CDRDI)**.
+3. **Innovation 2 Stage-0: calibrated degradation-locked deformation identifiability test**;
+4. **Innovation 2 Stage-1: learned physical-residual deformation solver**.
 
 The abandoned GAAT-inspired V4 registration chain is intentionally not included.
 
@@ -63,11 +64,12 @@ Raw sensor response curves are stored under `data/srf/`, and HSI wavelength file
 
 - `v1`: compact time-conditioned clean-HSI predictor;
 - `v2`: Innovation-1 spectral-spatial predictor;
-- `raw_direct`: V2 HSI backbone + full Raw MSI feature encoder with direct three-scale injection.
+- `raw_direct`: V2 HSI backbone + full Raw MSI feature encoder with direct three-scale injection;
+- `cdrdi_residual_solver`: shared-weight physical-residual geometry update network for Innovation 2 Stage-1.
 
 `raw_direct` intentionally contains no MSI high-pass filter, no learned MSI transfer gate, no time-varying MSI injection schedule, and no registration module.
 
-## Innovation 2 Stage-0: CDRDI geometry identifiability
+## Innovation 2 Stage-0: deformation-only identifiability
 
 Before coupling deformation to diffusion, the repository first tests one isolated question:
 
@@ -88,37 +90,89 @@ With the shared spatial PSF, the fixed-degradation closure is
 R0(Y_H) ~= P0(W_phi(Y_M))
 ```
 
-Only geometry is optimized. `P0` and `R0` are never learnable. The local deformation is generated from sparse control-point offsets and differentiable cubic B-spline interpolation. The solver uses a coarse rigid state followed by coarse and fine residual local fields. Ground-truth deformation is used only to synthesize the observation and compute EPE after solving; it is not passed to the solver.
+Only geometry is optimized. `P0` and `R0` are never learnable. The local deformation is generated from sparse control-point offsets and differentiable cubic B-spline interpolation. Ground-truth deformation is used only to synthesize the observation and compute EPE after solving; it is not passed to the solver.
 
-Run a first sanity check with one synthetic deformation:
+Run the identifiability check:
 
 ```bash
 python validate_cdrdi_geometry.py \
   --dataset PaviaU \
   --device cuda \
-  --cases 1 \
+  --cases 10 \
   --max_translation 4 \
   --max_rotation_deg 2 \
   --max_local_px 2 \
   --seed 10
 ```
 
-Then use multiple random cases:
+Run the Stage-0 optimizer ablations:
 
 ```bash
-python validate_cdrdi_geometry.py \
+python validate_cdrdi_ablation.py --variant rigid_only   --dataset PaviaU --device cuda --cases 10 --max_local_px 4
+python validate_cdrdi_ablation.py --variant direct_fine  --dataset PaviaU --device cuda --cases 10 --max_local_px 4
+python validate_cdrdi_ablation.py --variant single_scale --dataset PaviaU --device cuda --cases 10 --max_local_px 4
+python validate_cdrdi_ablation.py --variant full         --dataset PaviaU --device cuda --cases 10 --max_local_px 4
+```
+
+Stage-0 establishes that the fixed-degradation deformation-only inverse problem is identifiable. The optimizer ablation supports non-rigid freedom and hierarchical parameter release, but it does **not** support claiming that multi-scale closure is better than single-scale closure. Stage-1 therefore starts from the single native closure scale.
+
+## Innovation 2 Stage-1: learned physical-residual solver
+
+Stage-1 replaces direct geometry optimization with a learned shared-weight update operator. At update `k`, the network receives the current fixed-degradation physical state:
+
+```text
+e_k = Z_H - P0(W_phi_k(Y_M))
+phi_(k+1) = phi_k + G_theta(Z_H, Z_M(phi_k), e_k, grad Z_M(phi_k), phi_k)
+```
+
+The network predicts a rigid increment and a 5x5 B-spline control-grid increment. The observation is always regenerated through forward warp plus fixed `P0`; observed LR-HSI is never inverse-warped.
+
+The one-shot and recursive experiments use the **same model class and the same number of trainable parameters**. `one_shot` calls the update network once from zero geometry; `recursive` reuses the same weights for `K` residual updates.
+
+Training remains flow-GT-free:
+
+- loss: fixed `P0/R0` physical closure + smooth deformation regularization + folding prevention;
+- no deformation EPE enters the training loss;
+- model selection uses observable validation closure, not GT EPE;
+- GT deformation is used only after inference for diagnostic EPE/P95 reporting.
+
+Train the one-shot baseline:
+
+```bash
+python train_cdrdi_learned.py \
+  --variant one_shot \
   --dataset PaviaU \
   --device cuda \
-  --cases 5 \
+  --epochs 100 \
   --max_translation 4 \
   --max_rotation_deg 2 \
-  --max_local_px 2 \
+  --max_local_px 4 \
   --seed 10
 ```
 
-The main diagnostic is total sampling-map EPE in HR pixels (`EPE_HR_mean` and `EPE_HR_p95`), not the separate rigid/local parameter error, because different rigid/local decompositions can describe nearly identical total acquisition geometry. `GT_commute_MAE` should remain close to numerical precision and verifies that the fixed shared `P0` and fixed `R0` paths close correctly.
+Train the recursive single-scale solver with three shared-weight updates:
 
-This Stage-0 solver is direct differentiable optimization, not the final learned recursive deformation network. It exists only to establish whether the proposed deformation-only inverse problem is identifiable before adding another network or coupling it to Innovation 1.
+```bash
+python train_cdrdi_learned.py \
+  --variant recursive \
+  --recursive_steps 3 \
+  --dataset PaviaU \
+  --device cuda \
+  --epochs 100 \
+  --max_translation 4 \
+  --max_rotation_deg 2 \
+  --max_local_px 4 \
+  --seed 10
+```
+
+Evaluation prints both physical closure and total sampling-map EPE after every recursive update. A useful recursive mechanism should show a consistent trend such as:
+
+```text
+closure(phi_0) > closure(phi_1) > closure(phi_2) > closure(phi_3)
+EPE(phi_0)     > EPE(phi_1)     > EPE(phi_2)     > EPE(phi_3)
+```
+
+Multi-scale closure is intentionally not part of the default Stage-1 model. It should only be reintroduced as a later network-level ablation if the single-scale recursive mechanism is first shown to work.
 
 ## Data
 
@@ -198,6 +252,7 @@ python main.py \
   --stage train \
   --dataset PaviaU \
   --degradation_mode physical \
+  --diffusion_steps 12 \
   --predictor raw_direct \
   --legacy_raw_direct_checkpoint ./checkpoints/legacy/PaviaU_innovation1_physical_v3_raw_direct.pth \
   --epochs 200 \
@@ -212,7 +267,7 @@ The compatibility loader reports ignored, missing, and unexpected keys. For a ma
 pytest -q
 ```
 
-The test suite covers physical terminal closure, HR-grid reverse updates, V2/Raw-Direct forward shapes, fixed-degradation CDRDI closure, legacy Raw-Direct key filtering, and a repository-scope guard that prevents the abandoned V4 alignment files from silently returning.
+The test suite covers physical terminal closure, HR-grid reverse updates, V2/Raw-Direct forward shapes, fixed-degradation CDRDI closure, learned CDRDI forward/backpropagation, legacy Raw-Direct key filtering, and the repository-scope guard against abandoned V4 alignment files.
 
 ## Explicitly excluded from this clean baseline
 
@@ -226,4 +281,4 @@ The following old S2Diff research branches are not migrated:
 - GAAT-inspired global rigid / local progressive / confidence / subpixel alignment;
 - the abandoned MSI high-frequency + gate + time-varying guidance as a claimed innovation.
 
-Innovation 2 is being rebuilt independently as calibrated degradation-locked recursive deformation inversion rather than reviving the old feature-registration chain.
+Innovation 2 is being rebuilt independently as calibrated degradation-locked deformation inversion. The `Recursive` label will only be retained as a claimed mechanism if Stage-1 learned-network experiments show a real advantage over the one-shot baseline.

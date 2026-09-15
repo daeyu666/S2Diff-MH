@@ -43,12 +43,19 @@ from utils import (
 
 
 VARIANTS = ("one_shot", "recursive")
+LOSS_MODES = ("all_steps", "final_only")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Stage-1 learned physical-residual deformation solver")
     p.add_argument("--variant", choices=VARIANTS, required=True)
     p.add_argument("--recursive_steps", type=int, default=3)
+    p.add_argument(
+        "--loss_mode",
+        choices=LOSS_MODES,
+        default="all_steps",
+        help="all_steps averages closure over every update; final_only supervises only the final unrolled state",
+    )
     p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei"], default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--checkpoint_root", default="./checkpoints/cdrdi_stage1")
@@ -176,7 +183,10 @@ def _solver_steps(args) -> int:
 def unsupervised_geometry_loss(outputs: Dict[str, object], target: torch.Tensor, args):
     predictions = outputs["predictions"]
     closures = torch.stack([charbonnier_mean(target - pred) for pred in predictions])
-    closure_loss = closures.mean()
+    if args.loss_mode == "final_only":
+        closure_loss = closures[-1]
+    else:
+        closure_loss = closures.mean()
     final_local = outputs["final_local_field"]
     regularizer = deformation_regularizer(final_local)
     jac = jacobian_determinant(final_local)
@@ -395,7 +405,7 @@ def main():
 
     steps = _solver_steps(args)
     run_name = args.save_name or (
-        f"{args.dataset}_{args.variant}_k{steps}_local{args.max_local_px:g}_seed{args.seed}"
+        f"{args.dataset}_{args.variant}_k{steps}_{args.loss_mode}_local{args.max_local_px:g}_seed{args.seed}"
     )
     ensure_dir(args.checkpoint_root)
     ensure_dir(args.log_root)
@@ -431,8 +441,8 @@ def main():
 
     print("=" * 96)
     print(
-        f"CDRDI_STAGE1 variant={args.variant} steps={steps} dataset={args.dataset} "
-        f"params={count_parameters(model):.4f}M"
+        f"CDRDI_STAGE1 variant={args.variant} steps={steps} loss_mode={args.loss_mode} "
+        f"dataset={args.dataset} params={count_parameters(model):.4f}M"
     )
     print(
         "Training supervision: fixed P0/R0 physical closure only; "
@@ -491,6 +501,7 @@ def main():
                 extra={
                     "variant": args.variant,
                     "steps": steps,
+                    "loss_mode": args.loss_mode,
                     "dataset": args.dataset,
                     "max_translation": args.max_translation,
                     "max_rotation_deg": args.max_rotation_deg,

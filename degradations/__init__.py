@@ -6,6 +6,10 @@ from typing import Any
 
 from .base import BaseDegradation
 from .bicubic import BicubicDegradation
+from .deformation_aware import (
+    DeformationAwareProgressiveDegradation,
+    bilinear_border_warp_adjoint,
+)
 from .gaussian_bicubic import GaussianBicubicDegradation
 from .physical import PhysicalDegradation, sigma_from_mtf_nyquist
 from .progressive import ProgressiveDegradation, ProgressiveState
@@ -35,10 +39,12 @@ def build_degradation(mode: str, *, scale_ratio: int = 4, **kwargs: Any) -> Base
 __all__ = [
     "BaseDegradation",
     "BicubicDegradation",
+    "DeformationAwareProgressiveDegradation",
     "GaussianBicubicDegradation",
     "PhysicalDegradation",
     "ProgressiveDegradation",
     "ProgressiveState",
+    "bilinear_border_warp_adjoint",
     "build_degradation",
     "sigma_from_mtf_nyquist",
 ]

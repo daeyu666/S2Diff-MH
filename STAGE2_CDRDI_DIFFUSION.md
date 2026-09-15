@@ -168,3 +168,31 @@ python train_cdrdi_diffusion_estimated.py \
 The best checkpoint is selected by `ESTIMATED` PSNR, not Oracle PSNR. Evaluation always reports `REGISTERED`, `NAIVE`, `ORACLE`, `ESTIMATED`, geometry EPE, and the estimated-to-oracle gap.
 
 Stage-2D is an adaptation experiment, not a change to the CDRDI geometry solver and not a return to inverse image registration.
+
+## Final paper-style test
+
+Before closing Innovation-2, run a fixed final test that records both the complete metric set and the exact train/test conditions. The dedicated script prints `PSNR`, `SSIM`, `ERGAS`, `SAM`, `CC`, and `RMSE` for registered, naive, oracle, and estimated paths, and writes the same protocol plus per-case results to JSON.
+
+Current final geometry setting: train-unroll `K=6`, test recursion `K=9`, final-only closure training. Current final diffusion setting: Stage-2D estimated-phi-aware adaptation with frozen CDRDI.
+
+```bash
+python test_cdrdi_final_metrics.py \
+  --dataset PaviaU \
+  --device cuda \
+  --cases 10 \
+  --geometry_steps 9 \
+  --geometry_checkpoint ./checkpoints/cdrdi_stage1/PaviaU_recursive_k6_finalonly_300ep_lr1e4.pth \
+  --diffusion_checkpoint ./checkpoints/cdrdi_stage2/PaviaU_estimated_deform_diffusion_k9_stage2d_A.pth \
+  --max_translation 4 \
+  --max_rotation_deg 2 \
+  --max_local_px 4 \
+  --seed 10
+```
+
+The test protocol is deterministic (`synthetic_case_generator_seed = seed + 70000`) so it uses the same 10 synthetic cases as the Stage-2 coupling diagnostic. Metrics are full-frame and use the repository's existing `metrics.py` implementation. The JSON record defaults to:
+
+```text
+./results/cdrdi_final_test_PaviaU_seed10_cases10.json
+```
+
+Use `--print_cases` when every individual case must also be printed to the terminal.

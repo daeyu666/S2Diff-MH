@@ -56,3 +56,24 @@ def test_terminal_observation_is_forward_geometry_then_sensor_degradation():
     actual = geo.terminal_observation(x)
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
     geo.assert_terminal_closure(x)
+
+
+def test_oracle_reverse_update_telescopes_to_clean_reference_state():
+    torch.manual_seed(5)
+    x = torch.rand(1, 6, 16, 16)
+    operator = PhysicalDegradation(scale_ratio=4, mtf_nyquist=0.2, truncate=3.0)
+    base = ProgressiveDegradation(operator=operator, total_steps=12)
+    rigid = torch.tensor([[1.3, -0.9, 1.1]])
+    local = 0.05 * torch.randn(1, 2, 16, 16)
+    geo = DeformationAwareProgressiveDegradation(base, rigid=rigid, local_field=local)
+
+    terminal = geo.terminal_observation(x)
+    state = geo.terminal_state(terminal, target_size=(16, 16))
+    assert torch.allclose(state, geo.state_at(x, 12), atol=2e-5, rtol=2e-5)
+
+    for t in range(12, 0, -1):
+        state = geo.reverse_update(state, x, t)
+        expected = geo.state_at(x, t - 1)
+        assert torch.allclose(state, expected, atol=3e-5, rtol=3e-5)
+
+    assert torch.allclose(state, x, atol=3e-5, rtol=3e-5)

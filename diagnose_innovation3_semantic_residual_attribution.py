@@ -4,10 +4,12 @@ Question: does the terminal LR-HSI residual contain useful spectral error but lo
 its HR pixel/material ownership after PSF + detector integration + downsampling?
 
 PaviaU label 0 is always treated as UNLABELED. Class prototypes are estimated
-only from repository training-patch support; the center test rectangle never
-contributes to prototypes. Test labels are oracle semantic information. Test GT
-spectra are used only for scoring and for the explicit C1-5 oracle-direction
-ceiling.
+from labeled pixels outside the held-out center test rectangle; the center test
+rectangle never contributes to prototypes. If a test class has no labeled
+prototype support outside the test rectangle, that class is reported and
+excluded from class-conditioned comparisons rather than leaking test spectra.
+Test labels are oracle semantic information. Test GT spectra are used only for
+scoring and for the explicit C1-5 oracle-direction ceiling.
 
 Groups:
   C1-0 raw physical residual + observable global self-calibrated gain.
@@ -147,23 +149,35 @@ def _load_labels(path: str, key: str, hw: Tuple[int, int]) -> np.ndarray:
     raise RuntimeError(f"Unable to align 2-D label map to HSI shape {hw}. " + " | ".join(errors))
 
 
-def _train_support(dataset, hw: Tuple[int, int]) -> np.ndarray:
-    out = np.zeros(hw, dtype=bool)
-    p = int(dataset.patch_size)
-    for top, left in dataset.coords:
-        out[top:top + p, left:left + p] = True
+def _outside_test_support(
+    hw: Tuple[int, int],
+    top: int,
+    left: int,
+    test_size: int,
+) -> np.ndarray:
+    """All pixels outside the held-out center test rectangle.
+
+    This is intentionally broader than the union of sampled training patches:
+    semantic prototypes are a diagnostic prior, and any labeled pixel outside
+    the held-out rectangle is admissible without test leakage.
+    """
+    out = np.ones(hw, dtype=bool)
+    bottom = min(top + int(test_size), hw[0])
+    right = min(left + int(test_size), hw[1])
+    out[top:bottom, left:right] = False
     return out
 
 
-def _prototypes(image, labels, train_support, classes):
-    proto, counts = {}, {}
+def _prototypes(image, labels, support, classes):
+    proto, counts, missing = {}, {}, []
     for c in classes:
-        m = train_support & (labels == c)
+        m = support & (labels == c)
         counts[c] = int(m.sum())
         if counts[c] == 0:
-            raise RuntimeError(f"Test class {c} has no labeled training-support pixels")
+            missing.append(c)
+            continue
         proto[c] = image[m].mean(axis=0).astype(np.float32)
-    return proto, counts
+    return proto, counts, missing
 
 
 def _target_from_prototypes(base, labels, prototypes, mapping=None):
@@ -388,36 +402,70 @@ def main():
 
     image = np.asarray(train_loader.dataset.image, dtype=np.float32)
     labels = _load_labels(args.label_file, args.label_key, image.shape[:2])
-    support_train = _train_support(train_loader.dataset, image.shape[:2])
     if len(test_loader.dataset.coords) != 1:
         raise RuntimeError("Stage-C1 expects the repository single center test patch")
     top, left = test_loader.dataset.coords[0]
     labels_np = labels[top:top + args.test_size, left:left + args.test_size]
     if labels_np.shape != (args.test_size, args.test_size):
         raise RuntimeError(f"test label crop shape={labels_np.shape}, expected={(args.test_size, args.test_size)}")
-    classes = sorted(int(c) for c in np.unique(labels_np) if c > 0)
+
+    all_test_classes = sorted(int(c) for c in np.unique(labels_np) if c > 0)
     coverage = float((labels_np > 0).mean())
-    if not classes:
+    if not all_test_classes:
         raise RuntimeError("center test patch has no labeled pixels")
     if coverage < args.min_test_label_coverage:
         msg = f"label coverage {coverage:.6f} < {args.min_test_label_coverage:.6f}; conclusions apply only to sparse labeled support"
         if args.fail_on_low_coverage:
             raise RuntimeError(msg)
         print("WARNING", msg)
-    prototypes, train_counts = _prototypes(image, labels, support_train, classes)
-    test_counts = {c: int((labels_np == c).sum()) for c in classes}
+
+    prototype_support = _outside_test_support(
+        image.shape[:2], top, left, args.test_size
+    )
+    prototypes, prototype_counts, missing_classes = _prototypes(
+        image, labels, prototype_support, all_test_classes
+    )
+    classes = [c for c in all_test_classes if c in prototypes]
+    if missing_classes:
+        print(
+            "WARNING UNSUPPORTED_TEST_CLASSES "
+            f"{missing_classes} have no labeled prototype pixels outside the "
+            "held-out test rectangle; excluded from C1-1..C1-5 fair semantic comparisons."
+        )
+    if len(classes) < 2:
+        raise RuntimeError(
+            "Fewer than 2 test classes have leakage-free prototype support outside "
+            "the held-out rectangle; class-attribution diagnostic is not identifiable."
+        )
+
+    supported_np = np.isin(labels_np, np.asarray(classes, dtype=np.int64))
+    supported_coverage = float(supported_np.mean())
+    labeled_retention = float(
+        supported_np.sum() / max(int((labels_np > 0).sum()), 1)
+    )
+    test_counts_all = {c: int((labels_np == c).sum()) for c in all_test_classes}
+    test_counts_supported = {c: test_counts_all[c] for c in classes}
     perm = _perm_mapping(classes)
 
     print("=" * 150)
-    print(f"DIAGNOSTIC stage=C1 dataset={args.dataset} test_coord=({top},{left}) coverage={coverage:.6f} classes={classes}")
-    print(f"TEST_CLASS_COUNTS {test_counts}")
-    print(f"TRAIN_PROTOTYPE_COUNTS {train_counts}")
+    print(
+        f"DIAGNOSTIC stage=C1 dataset={args.dataset} test_coord=({top},{left}) "
+        f"label_coverage={coverage:.6f} supported_coverage={supported_coverage:.6f} "
+        f"labeled_retention={labeled_retention:.6f}"
+    )
+    print(f"TEST_CLASSES_ALL {all_test_classes}")
+    print(f"TEST_CLASSES_SUPPORTED {classes}")
+    print(f"TEST_CLASSES_EXCLUDED {missing_classes}")
+    print(f"TEST_CLASS_COUNTS_ALL {test_counts_all}")
+    print(f"TEST_CLASS_COUNTS_SUPPORTED {test_counts_supported}")
+    print(f"OUTSIDE_TEST_PROTOTYPE_COUNTS {prototype_counts}")
     print(f"PERMUTED_CLASS_MAPPING {perm}")
 
     batch = next(iter(test_loader))
     gt, msi = batch["gt"].to(device), batch["hr_msi"].to(device)
     labels_t = torch.from_numpy(labels_np).to(device=device, dtype=torch.long).unsqueeze(0)
-    label_mask = labels_t > 0
+    supported_classes_t = torch.as_tensor(classes, device=device, dtype=torch.long)
+    label_mask = (labels_t.unsqueeze(-1) == supported_classes_t.view(1, 1, 1, -1)).any(dim=-1)
     masks = _class_masks(labels_t, classes)
     risk = ranked_msi_heterogeneity(msi, eps=args.eps)
 
@@ -488,10 +536,15 @@ def main():
             "test_coord": [int(top), int(left)],
             "test_size": args.test_size,
             "test_label_coverage": coverage,
-            "test_classes": classes,
-            "test_class_counts": test_counts,
-            "train_prototype_counts": train_counts,
-            "training_support": "union of repository training patches; center test rectangle excluded",
+            "supported_label_coverage": supported_coverage,
+            "supported_fraction_of_labeled_test_pixels": labeled_retention,
+            "test_classes_all": all_test_classes,
+            "test_classes_supported": classes,
+            "test_classes_excluded_no_external_prototype": missing_classes,
+            "test_class_counts_all": test_counts_all,
+            "test_class_counts_supported": test_counts_supported,
+            "outside_test_prototype_counts": prototype_counts,
+            "prototype_support": "all labeled pixels outside held-out center test rectangle",
             "label_zero": "unlabeled, never a material class",
             "permuted_class_mapping": {str(k): int(v) for k, v in perm.items()},
             "solver_steps": args.solver_steps,
@@ -511,7 +564,7 @@ def main():
             "C1-3": "oracle class identity + class-specific LR magnitude fields from physical closure",
             "C1-4": "same class masks/DOF as C1-3 but cyclically wrong class-prototype identity",
             "C1-5": "unit oracle-allowed GT direction; GT magnitude removed; magnitude from physical closure",
-            "semantic_closure_weight": "normalized D_T(1[label>0])",
+            "semantic_closure_weight": "normalized D_T(1[label in leakage-free supported test classes])",
         },
         "baseline": {**base_metrics, **base_sem},
         "rows": rows,

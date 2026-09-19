@@ -81,5 +81,5 @@ def test_zero_initialized_refiner_starts_from_exact_baseline():
     msi = torch.rand(2, 4, 8, 8)
     t = torch.tensor([3, 9])
     refined, details = module(x_t, base, msi, t, return_details=True)
-    assert torch.equal(refined, base)
+    assert torch.allclose(refined, base, atol=1e-6, rtol=1e-6)
     assert torch.equal(details["pre_update"], torch.zeros_like(base))

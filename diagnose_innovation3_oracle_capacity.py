@@ -38,7 +38,7 @@ import argparse
 import json
 import math
 import os
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -323,7 +323,6 @@ def _summarize_stage(
         eps=eps,
     )
 
-    ideal_e = _interior_spectra(oracle["ideal"].unsqueeze(0)) if False else None
     # Crop the BxHxW scalar fields directly and the BxCxHxW vectors with
     # _interior_spectra so all arrays share exactly the same pixel ordering.
     ideal = _interior_spectra(oracle["ideal"])

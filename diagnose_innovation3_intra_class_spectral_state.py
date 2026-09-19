@@ -215,25 +215,32 @@ def _spherical_kmeans(
     return np.stack(prototypes, axis=0).astype(np.float32), assign
 
 
-def _fit_pca(spectra: np.ndarray, max_rank: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _fit_pca(
+    spectra: np.ndarray,
+    max_rank: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     x = torch.from_numpy(np.asarray(spectra, dtype=np.float32)).double()
     mean = x.mean(dim=0)
     centered = x - mean
     if x.shape[0] <= 1:
         basis = torch.zeros((x.shape[1], 0), dtype=torch.float64)
         evals = torch.zeros((0,), dtype=torch.float64)
+        total_variance = 0.0
     else:
         cov = centered.T @ centered / float(max(int(x.shape[0]) - 1, 1))
         evals_all, evecs = torch.linalg.eigh(cov)
+        evals_all = evals_all.clamp_min(0.0)
+        total_variance = float(evals_all.sum().item())
         order = torch.argsort(evals_all, descending=True)
         r = min(int(max_rank), int(x.shape[1]), max(int(x.shape[0]) - 1, 0))
         order = order[:r]
-        evals = evals_all[order].clamp_min(0.0)
+        evals = evals_all[order]
         basis = evecs[:, order]
     return (
         mean.float().numpy(),
         basis.float().numpy(),
         evals.float().numpy(),
+        total_variance,
     )
 
 
@@ -280,8 +287,13 @@ def _build_kmeans_codebooks(
 def _build_pca_models(training: Dict[int, np.ndarray], max_rank: int):
     models = {}
     for c, x in training.items():
-        mean, basis, evals = _fit_pca(x, max_rank)
-        models[c] = {"mean": mean, "basis": basis, "evals": evals}
+        mean, basis, evals, total_variance = _fit_pca(x, max_rank)
+        models[c] = {
+            "mean": mean,
+            "basis": basis,
+            "evals": evals,
+            "total_variance": total_variance,
+        }
     return models
 
 
@@ -387,10 +399,11 @@ def _variance_capture(models, rank: int) -> Dict[int, float]:
     out = {}
     for c, model in models.items():
         eig = np.asarray(model["evals"], dtype=np.float64)
-        if eig.size == 0 or float(eig.sum()) <= 0.0:
+        total = float(model.get("total_variance", 0.0))
+        if eig.size == 0 or total <= 0.0:
             out[c] = float("nan")
         else:
-            out[c] = float(eig[: min(int(rank), eig.size)].sum() / eig.sum())
+            out[c] = float(eig[: min(int(rank), eig.size)].sum() / total)
     return out
 
 

@@ -326,9 +326,11 @@ class HeterogeneityGuidedSpectralRefiner(nn.Module):
             base_norm = torch.linalg.vector_norm(
                 base_x0, dim=1, keepdim=True
             ).clamp_min(self.eps)
-            unit = base_x0 / base_norm
-            new_unit = F.normalize(unit + pre_update, dim=1, eps=self.eps)
-            refined = base_norm * new_unit
+            candidate = base_x0 + pre_update
+            candidate_norm = torch.linalg.vector_norm(
+                candidate, dim=1, keepdim=True
+            ).clamp_min(self.eps)
+            refined = candidate * (base_norm / candidate_norm)
         else:
             refined = base_x0 + pre_update
 

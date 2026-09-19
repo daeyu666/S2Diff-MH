@@ -530,7 +530,7 @@ def main():
         summary = {}
         for key in keys:
             vals = [row[key] for row in rows]
-            if key.endswith("N"):
+            if key.endswith("_N"):
                 summary[key] = int(sum(vals))
             else:
                 tensor = torch.tensor(vals, dtype=torch.float64)

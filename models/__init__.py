@@ -5,6 +5,13 @@ from .predictor_raw_direct import (
     extract_legacy_raw_direct_state_dict,
 )
 from .legacy_checkpoint import load_legacy_raw_direct_checkpoint
+from .spectral_fidelity_refiner import (
+    HeterogeneityGuidedSpectralPredictor,
+    HeterogeneityGuidedSpectralRefiner,
+    dct_ii_matrix,
+    local_spectral_heterogeneity,
+    ranked_msi_heterogeneity,
+)
 
 __all__ = [
     "CleanHSIPredictor",
@@ -12,4 +19,9 @@ __all__ = [
     "RawMSIDirectPredictor",
     "extract_legacy_raw_direct_state_dict",
     "load_legacy_raw_direct_checkpoint",
+    "HeterogeneityGuidedSpectralPredictor",
+    "HeterogeneityGuidedSpectralRefiner",
+    "dct_ii_matrix",
+    "local_spectral_heterogeneity",
+    "ranked_msi_heterogeneity",
 ]

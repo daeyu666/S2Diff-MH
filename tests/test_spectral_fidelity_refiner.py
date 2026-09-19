@@ -48,11 +48,19 @@ def test_tangent_projection_is_orthogonal_to_base():
         variant="full",
     )
     base = torch.rand(2, 31, 5, 6) + 0.1
-    residual = torch.randn_like(base)
-    tangent = module.project_tangent(residual, base)
+    residual = module.project_broadshape(torch.randn_like(base))
+    tangent = module.project_tangent(
+        residual,
+        base,
+        preserve_broadshape=True,
+    )
     unit = base / torch.linalg.vector_norm(base, dim=1, keepdim=True)
     dot = (tangent * unit).sum(dim=1)
+    coeff = module.dct(tangent)
+    outside = torch.ones(31, dtype=torch.bool)
+    outside[4:module.low_end] = False
     assert float(dot.abs().max()) < 2e-5
+    assert float(coeff[:, outside].abs().max()) < 2e-5
 
 
 def test_gate_is_monotone_in_msi_heterogeneity_rank():

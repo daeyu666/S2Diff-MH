@@ -252,13 +252,32 @@ class HeterogeneityGuidedSpectralRefiner(nn.Module):
         self,
         residual: torch.Tensor,
         base_x0: torch.Tensor,
+        *,
+        preserve_broadshape: bool = False,
     ) -> torch.Tensor:
+        """Remove the component that changes the current spectral magnitude.
+
+        When preserve_broadshape=True, the subtraction direction is P_S(u),
+        where S is the diagnosed C4:L DCT subspace.  Because residual is already
+        in S, this keeps the correction inside S while enforcing <r,u>=0.
+        """
         base_norm = torch.linalg.vector_norm(
             base_x0, dim=1, keepdim=True
         ).clamp_min(self.eps)
         unit = base_x0 / base_norm
-        parallel = (residual * unit).sum(dim=1, keepdim=True) * unit
-        return residual - parallel
+        numerator = (residual * unit).sum(dim=1, keepdim=True)
+        if not preserve_broadshape:
+            return residual - numerator * unit
+
+        unit_subspace = self.project_broadshape(unit)
+        denominator = (unit_subspace * unit).sum(dim=1, keepdim=True)
+        safe = denominator.abs() > self.eps
+        scale = torch.where(
+            safe,
+            numerator / denominator.clamp_min(self.eps),
+            torch.zeros_like(numerator),
+        )
+        return residual - scale * unit_subspace
 
     def gate_from_rank(self, rank: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.gate_slope * rank + self.gate_bias)
@@ -286,7 +305,11 @@ class HeterogeneityGuidedSpectralRefiner(nn.Module):
             else raw_residual
         )
         directional_residual = (
-            self.project_tangent(spectral_residual, base_x0)
+            self.project_tangent(
+                spectral_residual,
+                base_x0,
+                preserve_broadshape=self.use_broadshape,
+            )
             if self.use_tangent
             else spectral_residual
         )

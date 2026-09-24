@@ -12,6 +12,10 @@ from .spectral_fidelity_refiner import (
     local_spectral_heterogeneity,
     ranked_msi_heterogeneity,
 )
+from .innovation3_gigi_refiner import (
+    GlobalInterGuidedInteraction,
+    TerminalGIGISpectralRefiner,
+)
 
 __all__ = [
     "CleanHSIPredictor",
@@ -24,4 +28,6 @@ __all__ = [
     "dct_ii_matrix",
     "local_spectral_heterogeneity",
     "ranked_msi_heterogeneity",
+    "GlobalInterGuidedInteraction",
+    "TerminalGIGISpectralRefiner",
 ]

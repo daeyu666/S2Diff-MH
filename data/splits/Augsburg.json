@@ -1,0 +1,28 @@
+{
+  "dataset": "Augsburg",
+  "protocol": "MDAS_official_geographic_split",
+  "synthetic_x4": {
+    "train_file": "sr_deep_model_data/EeteS_EnMAP_10m_deep_train.tif",
+    "validation_file": "sr_deep_model_data/EeteS_EnMAP_10m_deep_valid.tif",
+    "test_file": "sub_area_1/EeteS_EnMAP_10m_sub_area1.tif",
+    "hr_hsi": "EnMAP 10m",
+    "effective_lr_hsi": "benchmark degradation x4 (40m effective)",
+    "hr_msi": "S2A B2/B3/B4/B8 synthesized with fixed V4.0 SRF",
+    "train_patch": [
+      64,
+      64
+    ],
+    "train_stride": [
+      32,
+      32
+    ],
+    "evaluation_patch": [
+      128,
+      128
+    ]
+  },
+  "real_sensor_semireal": {
+    "hr_msi": "real Sentinel-2 L2A native-10m B2/B3/B4/B8",
+    "note": "semi-real/real-sensor only; HSI reference is HySpex/EnMAP-derived, not fully real spaceborne HR-HSI GT"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "dataset": "Chikusei",
+  "protocol": "top_strip_16x128",
+  "usable_shape": [
+    2304,
+    2048,
+    128
+  ],
+  "test": {
+    "rows": [
+      0,
+      128
+    ],
+    "cols": [
+      0,
+      2048
+    ],
+    "patch": [
+      128,
+      128
+    ],
+    "count": 16
+  },
+  "validation": {
+    "rows": [
+      128,
+      256
+    ],
+    "cols": [
+      0,
+      2048
+    ],
+    "patch": [
+      128,
+      128
+    ],
+    "count": 16
+  },
+  "train": {
+    "rows": [
+      256,
+      2304
+    ],
+    "cols": [
+      0,
+      2048
+    ],
+    "patch": [
+      64,
+      64
+    ],
+    "stride": [
+      32,
+      32
+    ]
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "dataset": "CAVE",
+  "protocol": "deterministic_20_12_scene_split",
+  "scene_order": [
+    "balloons",
+    "beads",
+    "cd",
+    "chart_and_stuffed_toy",
+    "clay",
+    "cloth",
+    "egyptian_statue",
+    "face",
+    "fake_and_real_beers",
+    "fake_and_real_food",
+    "fake_and_real_lemon_slices",
+    "fake_and_real_lemons",
+    "fake_and_real_peppers",
+    "fake_and_real_strawberries",
+    "fake_and_real_sushi",
+    "fake_and_real_tomatoes",
+    "feathers",
+    "flowers",
+    "glass_tiles",
+    "hairs",
+    "jelly_beans",
+    "oil_painting",
+    "paints",
+    "photo_and_face",
+    "pompoms",
+    "real_and_fake_apples",
+    "real_and_fake_peppers",
+    "sponges",
+    "stuffed_toys",
+    "superballs",
+    "thread_spools",
+    "watercolors"
+  ],
+  "train_scenes": [
+    "balloons",
+    "beads",
+    "cd",
+    "chart_and_stuffed_toy",
+    "clay",
+    "cloth",
+    "egyptian_statue",
+    "face",
+    "fake_and_real_beers",
+    "fake_and_real_food",
+    "fake_and_real_lemon_slices",
+    "fake_and_real_lemons",
+    "fake_and_real_peppers",
+    "fake_and_real_strawberries",
+    "fake_and_real_sushi",
+    "fake_and_real_tomatoes"
+  ],
+  "validation_scenes": [
+    "feathers",
+    "flowers",
+    "glass_tiles",
+    "hairs"
+  ],
+  "test_scenes": [
+    "jelly_beans",
+    "oil_painting",
+    "paints",
+    "photo_and_face",
+    "pompoms",
+    "real_and_fake_apples",
+    "real_and_fake_peppers",
+    "sponges",
+    "stuffed_toys",
+    "superballs",
+    "thread_spools",
+    "watercolors"
+  ],
+  "train": {
+    "patch": [
+      64,
+      64
+    ],
+    "stride": [
+      32,
+      32
+    ]
+  },
+  "validation": {
+    "unit": "full_scene",
+    "size": [
+      512,
+      512
+    ]
+  },
+  "test": {
+    "unit": "full_scene",
+    "size": [
+      512,
+      512
+    ]
+  }
+}

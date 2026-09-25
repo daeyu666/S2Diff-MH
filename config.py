@@ -63,7 +63,7 @@ class TrainConfig:
 def parse_args(argv=None) -> TrainConfig:
     p = argparse.ArgumentParser(description="S2Diff-MH clean Innovation1 baseline")
     p.add_argument("--stage", choices=["train", "test", "diagnose"], default="train")
-    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei"], default="PaviaU")
+    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei", "CAVE", "Botswana", "Augsburg"], default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--checkpoint_root", default="./checkpoints")
     p.add_argument("--log_root", default="./logs")

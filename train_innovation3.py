@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from config import TrainConfig
-from data_loader import build_loaders
+from data_loader import build_loaders, build_train_val_test_loaders
 from innovation1 import batch_state_at, build_progressive_process
 from losses import SAMLoss
 from metrics import MetricAverager, calc_metrics
@@ -370,7 +370,7 @@ def train(args):
     set_seed(args.seed)
     device = get_device(args.device)
     cfg = _config(args)
-    train_loader, test_loader, info = build_loaders(cfg)
+    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
     process = build_progressive_process(cfg)
     model = _build_model(args, info, device)
 
@@ -466,7 +466,7 @@ def train(args):
         if epoch % args.eval_interval == 0 or epoch == args.epochs:
             baseline, refined, mechanism = evaluate_pair(
                 model,
-                test_loader,
+                val_loader,
                 process,
                 device,
                 args.scale_ratio,

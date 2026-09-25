@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from config import TrainConfig
-from data_loader import build_loaders
+from data_loader import build_loaders, build_train_val_test_loaders
 from innovation1 import build_progressive_process, reconstruct_from_terminal_lr
 from losses import SAMLoss
 from metrics import MetricAverager, calc_metrics
@@ -449,7 +449,7 @@ def train(args):
     set_seed(args.seed)
     device = get_device(args.device)
     cfg = _config(args)
-    train_loader, test_loader, info = build_loaders(cfg)
+    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
     process = build_progressive_process(cfg)
     baseline = _build_baseline(args, info, device)
     projector = _build_projector(args, info, device)
@@ -599,7 +599,7 @@ def train(args):
                 refiner,
                 baseline,
                 projector,
-                test_loader,
+                val_loader,
                 process,
                 device,
                 args.scale_ratio,

@@ -27,7 +27,7 @@ from cdrdi_geometry import (
     spectral_project,
 )
 from config import TrainConfig
-from data_loader import build_loaders
+from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.physical import PhysicalDegradation
 from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
 from utils import (
@@ -384,7 +384,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
-    train_loader, test_loader, info = build_loaders(cfg)
+    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
     srf = torch.as_tensor(info["srf_weights"], device=device, dtype=torch.float32)
     p0 = PhysicalDegradation(
         scale_ratio=args.scale_ratio,
@@ -472,7 +472,7 @@ def main():
 
         if epoch % args.eval_interval != 0 and epoch != args.epochs:
             continue
-        metrics = evaluate(model, test_loader, p0=p0, srf=srf, args=args, device=device)
+        metrics = evaluate(model, val_loader, p0=p0, srf=srf, args=args, device=device)
         print_eval(metrics, variant=args.variant)
         logger.write(
             {

@@ -2,32 +2,7 @@
   "dataset": "Houston13",
   "sensor_scene": "Houston2013",
   "protocol": "center128",
-  "test": {
-    "type": "center",
-    "size": [
-      128,
-      128
-    ]
-  },
-  "validation": {
-    "type": "top_left",
-    "size": [
-      128,
-      128
-    ]
-  },
-  "train": {
-    "patch": [
-      64,
-      64
-    ],
-    "stride": [
-      32,
-      32
-    ],
-    "exclude": [
-      "validation",
-      "test"
-    ]
-  }
+  "test": {"type": "center", "size": [128, 128]},
+  "validation": {"type": "top_left", "size": [128, 128]},
+  "train": {"patch": [64, 64], "stride": [32, 32], "exclude": ["validation", "test"]}
 }

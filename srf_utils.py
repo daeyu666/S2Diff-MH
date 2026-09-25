@@ -26,6 +26,30 @@ WV2_ALL_8_BANDS = [
     "WV2 NIR2",
 ]
 
+NIKON_D700_3_BANDS = [
+    "Nikon D700 Red",
+    "Nikon D700 Green",
+    "Nikon D700 Blue",
+]
+
+EO1_ALI_8_BANDS = [
+    "ALI MS-1",
+    "ALI MS-2",
+    "ALI MS-3",
+    "ALI MS-4",
+    "ALI MS-4p",
+    "ALI MS-5p",
+    "ALI MS-5",
+    "ALI MS-7",
+]
+
+S2A_NATIVE10_4_BANDS = [
+    "S2A B2",
+    "S2A B3",
+    "S2A B4",
+    "S2A B8",
+]
+
 
 def load_hsi_wavelengths(wavelength_path: str, n_bands: int) -> np.ndarray:
     if not os.path.exists(wavelength_path):
@@ -66,7 +90,15 @@ def estimate_band_widths(wavelengths: np.ndarray) -> np.ndarray:
     edges[1:-1] = 0.5 * (wavelengths[:-1] + wavelengths[1:])
     edges[0] = wavelengths[0] - 0.5 * (wavelengths[1] - wavelengths[0])
     edges[-1] = wavelengths[-1] + 0.5 * (wavelengths[-1] - wavelengths[-2])
-    return np.maximum(edges[1:] - edges[:-1], 1e-6).astype(np.float32)
+    widths = np.maximum(edges[1:] - edges[:-1], 1e-6)
+    # Standard Botswana removes several Hyperion wavelength intervals.  Do not
+    # let a deleted interval become a huge integration cell on its boundary.
+    positive_steps = np.diff(wavelengths)
+    positive_steps = positive_steps[positive_steps > 0]
+    if positive_steps.size:
+        nominal = float(np.median(positive_steps))
+        widths = np.minimum(widths, 1.5 * nominal)
+    return widths.astype(np.float32)
 
 
 def interp_srf_to_hsi_wavelengths(
@@ -166,5 +198,23 @@ def sensor_protocol(dataset: str):
             "bands": WV2_ALL_8_BANDS,
             "srf_path": "./data/srf/wv2_relative_spectral_response_data_for_i.atcorr.csv",
             "wavelength_path": f"./data/wavelengths/{dataset}.txt",
+        }
+    if dataset == "CAVE":
+        return {
+            "bands": NIKON_D700_3_BANDS,
+            "srf_path": "./data/srf/nikon_d700_relative_spectral_response.csv",
+            "wavelength_path": "./data/wavelengths/CAVE_400_700_10nm.txt",
+        }
+    if dataset == "Botswana":
+        return {
+            "bands": EO1_ALI_8_BANDS,
+            "srf_path": "./data/srf/eo1_ali_8band_relative_spectral_response.csv",
+            "wavelength_path": "./data/wavelengths/Botswana_Hyperion_145.txt",
+        }
+    if dataset == "Augsburg":
+        return {
+            "bands": S2A_NATIVE10_4_BANDS,
+            "srf_path": "./data/srf/sentinel2a_srf_v4_B2_B3_B4_B8.csv",
+            "wavelength_path": None,
         }
     raise ValueError(f"No fixed sensor protocol for dataset={dataset!r}")

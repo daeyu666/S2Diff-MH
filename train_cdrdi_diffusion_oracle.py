@@ -359,7 +359,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
-    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
+    train_loader, val_loader, test_loader, info = build_train_val_test_loaders(cfg)
     base_process = build_progressive_process(cfg)
     model = build_model(cfg, info, device)
 

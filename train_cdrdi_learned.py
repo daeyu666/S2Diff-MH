@@ -384,7 +384,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
-    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
+    train_loader, val_loader, test_loader, info = build_train_val_test_loaders(cfg)
     srf = torch.as_tensor(info["srf_weights"], device=device, dtype=torch.float32)
     p0 = PhysicalDegradation(
         scale_ratio=args.scale_ratio,

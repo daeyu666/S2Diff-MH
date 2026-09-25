@@ -7,7 +7,7 @@ import os
 import torch
 
 from config import parse_args, print_config
-from data_loader import build_loaders
+from data_loader import build_loaders, build_train_val_test_loaders
 from innovation1 import build_progressive_process, evaluate, train_one_epoch
 from models import (
     CleanHSIPredictor,
@@ -85,7 +85,7 @@ def _load_starting_weights(cfg, model, device):
     return False
 
 
-def run_train(cfg, train_loader, test_loader, info, device):
+def run_train(cfg, train_loader, val_loader, info, device):
     process = build_progressive_process(cfg)
     model = build_model(cfg, info, device)
     _load_starting_weights(cfg, model, device)
@@ -143,9 +143,9 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
         if epoch % cfg.eval_interval == 0 or epoch == cfg.epochs:
             metrics = evaluate(
-                model, test_loader, process, device, scale_ratio=cfg.scale_ratio
+                model, val_loader, process, device, scale_ratio=cfg.scale_ratio
             )
-            print("eval", format_metrics(metrics))
+            print("val", format_metrics(metrics))
             row["PSNR"], row["SAM"] = metrics["PSNR"], metrics["SAM"]
             if metrics["PSNR"] > best_psnr:
                 best_psnr = metrics["PSNR"]
@@ -177,10 +177,14 @@ def main():
     print_config(cfg)
     set_seed(cfg.seed)
     device = get_device(cfg.device)
-    train_loader, test_loader, info = build_loaders(cfg)
+    if cfg.stage == "train":
+        train_loader, val_loader, test_loader, info = build_train_val_test_loaders(cfg)
+    else:
+        train_loader, test_loader, info = build_loaders(cfg)
+        val_loader = None
     print("dataset info:", info)
     if cfg.stage == "train":
-        run_train(cfg, train_loader, test_loader, info, device)
+        run_train(cfg, train_loader, val_loader, info, device)
     elif cfg.stage == "test":
         run_test(cfg, test_loader, info, device)
     else:

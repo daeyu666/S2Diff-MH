@@ -449,7 +449,7 @@ def train(args):
     set_seed(args.seed)
     device = get_device(args.device)
     cfg = _config(args)
-    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
+    train_loader, val_loader, test_loader, info = build_train_val_test_loaders(cfg)
     process = build_progressive_process(cfg)
     baseline = _build_baseline(args, info, device)
     projector = _build_projector(args, info, device)

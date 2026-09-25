@@ -1,39 +1,8 @@
 {
   "dataset": "Botswana",
   "protocol": "center128",
-  "test": {
-    "type": "center",
-    "size": [
-      128,
-      128
-    ]
-  },
-  "validation": {
-    "type": "top_left",
-    "size": [
-      128,
-      128
-    ]
-  },
-  "train": {
-    "patch": [
-      64,
-      64
-    ],
-    "stride": [
-      32,
-      32
-    ],
-    "exclude": [
-      "validation",
-      "test"
-    ]
-  },
-  "hyperion_band_ids": [
-    "B10-B55",
-    "B82-B97",
-    "B102-B119",
-    "B134-B164",
-    "B187-B220"
-  ]
+  "test": {"type": "center", "size": [128, 128]},
+  "validation": {"type": "top_left", "size": [128, 128]},
+  "train": {"patch": [64, 64], "stride": [32, 32], "exclude": ["validation", "test"]},
+  "hyperion_band_ids": ["B10-B55","B82-B97","B102-B119","B134-B164","B187-B220"]
 }

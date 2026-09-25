@@ -40,7 +40,7 @@ from cdrdi_geometry import (
     spectral_project,
 )
 from config import TrainConfig
-from data_loader import build_loaders
+from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from innovation1 import build_progressive_process, reconstruct_from_terminal_lr
 from losses import SAMLoss
@@ -736,7 +736,7 @@ def train(args):
     set_seed(args.seed)
     device = get_device(args.device)
     cfg = _config(args)
-    train_loader, test_loader, info = build_loaders(cfg)
+    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
     base_process = build_progressive_process(cfg)
     p0 = base_process.operator
     srf = torch.as_tensor(
@@ -935,7 +935,7 @@ def train(args):
                 diffusion_model,
                 geometry_model,
                 projector,
-                test_loader,
+                val_loader,
                 base_process=base_process,
                 p0=p0,
                 srf=srf,

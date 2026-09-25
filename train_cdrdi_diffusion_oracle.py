@@ -31,7 +31,7 @@ import torch.nn.functional as F
 
 from cdrdi_geometry import SyntheticGeometry, sample_synthetic_geometry
 from config import TrainConfig
-from data_loader import build_loaders
+from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from innovation1 import build_progressive_process, model_predict, reconstruct_from_terminal_lr
 from losses import SAMLoss
@@ -359,7 +359,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
-    train_loader, test_loader, info = build_loaders(cfg)
+    train_loader, val_loader, val_loader, info = build_train_val_val_loaders(cfg)
     base_process = build_progressive_process(cfg)
     model = build_model(cfg, info, device)
 
@@ -408,7 +408,7 @@ def main():
     )
     train_generator = _make_generator(device, args.seed + 91000)
 
-    initial = evaluate(model, test_loader, base_process=base_process, args=args, device=device)
+    initial = evaluate(model, val_loader, base_process=base_process, args=args, device=device)
     print("=" * 104)
     print("STAGE2B_INITIAL")
     print_eval(initial, prefix="INITIAL")
@@ -438,7 +438,7 @@ def main():
         }
 
         if epoch % int(args.eval_interval) == 0 or epoch == int(args.epochs):
-            metrics = evaluate(model, test_loader, base_process=base_process, args=args, device=device)
+            metrics = evaluate(model, val_loader, base_process=base_process, args=args, device=device)
             print_eval(metrics)
             reg_psnr = metrics["registered"]["PSNR"]
             naive_psnr = metrics["naive"]["PSNR"]

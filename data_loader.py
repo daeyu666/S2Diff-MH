@@ -27,7 +27,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -104,7 +104,7 @@ def _extract_cube(value):
     return None
 
 
-def _fix_hsi_shape(arr: np.ndarray, expected_bands: int | None = None) -> np.ndarray:
+def _fix_hsi_shape(arr: np.ndarray, expected_bands: Optional[int] = None) -> np.ndarray:
     arr = np.squeeze(np.asarray(arr))
     if arr.ndim != 3:
         raise ValueError(f"HSI must be 3-D, got {arr.shape}")

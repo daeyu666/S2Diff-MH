@@ -223,7 +223,7 @@ data/raw/Augsburg/Augsburg_data_4_publication/
 - **CAVE Multispectral Image Database (32 scenes, official Columbia page):**
   https://cave.cs.columbia.edu/repository/Multispectral
 - **Botswana Hyperion `Botswana.mat` (UPV/EHU public hyperspectral scenes):**
-  https://www.ehu.eus/ccwintco/index.php?title=Hyperspectral_Remote_Sensing_Scenes
+  http://www.ehu.eus/ccwintco/uploads/7/72/Botswana.mat
 - **Augsburg MDAS dataset (official TUM dataset DOI):**
   https://doi.org/10.14459/2022mp1657312
   (landing page: https://mediatum.ub.tum.de/1657312)

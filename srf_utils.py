@@ -84,21 +84,22 @@ def load_hsi_wavelengths(wavelength_path: str, n_bands: int) -> np.ndarray:
 
 def estimate_band_widths(wavelengths: np.ndarray) -> np.ndarray:
     wavelengths = np.asarray(wavelengths, dtype=np.float32).reshape(-1)
-    if wavelengths.size == 1:
-        return np.ones_like(wavelengths)
-    edges = np.zeros(wavelengths.size + 1, dtype=np.float32)
-    edges[1:-1] = 0.5 * (wavelengths[:-1] + wavelengths[1:])
-    edges[0] = wavelengths[0] - 0.5 * (wavelengths[1] - wavelengths[0])
-    edges[-1] = wavelengths[-1] + 0.5 * (wavelengths[-1] - wavelengths[-2])
-    widths = np.maximum(edges[1:] - edges[:-1], 1e-6)
-    # Standard Botswana removes several Hyperion wavelength intervals.  Do not
-    # let a deleted interval become a huge integration cell on its boundary.
-    positive_steps = np.diff(wavelengths)
-    positive_steps = positive_steps[positive_steps > 0]
-    if positive_steps.size:
-        nominal = float(np.median(positive_steps))
-        widths = np.minimum(widths, 1.5 * nominal)
-    return widths.astype(np.float32)
+    if not wavelengths.size or not np.isfinite(wavelengths).all():
+        raise ValueError("Wavelengths must be a nonempty finite array")
+    # EnMAP VNIR/SWIR overlap: preserve original cube band order, integrate on
+    # sorted unique centres, and share duplicate-centre cells across detectors.
+    centres, inverse, counts = np.unique(wavelengths, return_inverse=True, return_counts=True)
+    if centres.size == 1:
+        return np.full(wavelengths.size, 1.0 / wavelengths.size, dtype=np.float32)
+    edges = np.empty(centres.size + 1, dtype=np.float32)
+    edges[1:-1] = 0.5 * (centres[:-1] + centres[1:])
+    edges[0] = centres[0] - 0.5 * (centres[1] - centres[0])
+    edges[-1] = centres[-1] + 0.5 * (centres[-1] - centres[-2])
+    widths = np.diff(edges)
+    # Removed Hyperion intervals must not become huge integration cells.
+    nominal = float(np.median(np.diff(centres)))
+    widths = np.minimum(widths, 1.5 * nominal)
+    return (widths[inverse] / counts[inverse]).astype(np.float32)
 
 
 def interp_srf_to_hsi_wavelengths(
@@ -186,7 +187,7 @@ def hsi_to_msi_numpy(hsi: np.ndarray, srf_weights: np.ndarray, clip: bool = True
     return np.clip(msi, 0.0, 1.0) if clip else msi
 
 
-def sensor_protocol(dataset: str):
+def _sensor_protocol(dataset: str):
     if dataset == "PaviaU":
         return {
             "bands": IKONOS_4_BANDS,
@@ -218,3 +219,12 @@ def sensor_protocol(dataset: str):
             "wavelength_path": None,
         }
     raise ValueError(f"No fixed sensor protocol for dataset={dataset!r}")
+
+
+def sensor_protocol(dataset: str):
+    """Resolve bundled resources relative to this module, independent of cwd."""
+    protocol = _sensor_protocol(dataset)
+    for key in ("srf_path", "wavelength_path"):
+        if protocol[key] is not None:
+            protocol[key] = os.path.join(os.path.dirname(os.path.abspath(__file__)), protocol[key])
+    return protocol

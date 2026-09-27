@@ -39,7 +39,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Innovation-3 heterogeneity-guided spectral refinement")
     p.add_argument("--stage", choices=["train", "test"], default="train")
     p.add_argument("--variant", choices=["generic", "hetero", "broad", "full"], default="full")
-    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei"], default="PaviaU")
+    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei", "CAVE", "Botswana", "Augsburg"], default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=10)

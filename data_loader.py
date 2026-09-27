@@ -150,7 +150,11 @@ def read_hsi_mat(path: str, candidate_keys: Sequence[str]) -> np.ndarray:
                 found = []
                 def visitor(name, obj):
                     if not found and isinstance(obj, h5py.Dataset) and len(obj.shape) == 3:
-                        found.append(np.asarray(obj))
+                        cube = np.asarray(obj)
+                        # MATLAB v7.3 stores dimensions in reverse order.
+                        if "MATLAB_class" in obj.attrs:
+                            cube = cube.transpose(2, 1, 0)
+                        found.append(cube)
                 handle.visititems(visitor)
                 if found:
                     return _fix_hsi_shape(found[0])
@@ -319,6 +323,29 @@ def _find_cave_scene_dirs(root: str) -> Dict[str, str]:
     return mapping
 
 
+def _read_cave_band(path: str) -> np.ndarray:
+    """Read scalar reflectance while preserving PNG bit depth."""
+    from PIL import Image
+    with open(path, "rb") as handle:
+        header = handle.read(29)
+    if header[:8] != b"\x89PNG\r\n\x1a\n" or header[24] not in (8, 16):
+        raise ValueError(f"Unsupported CAVE PNG: {path}")
+    bit_depth = header[24]
+    with Image.open(path) as image:
+        arr = np.asarray(image)
+    if arr.ndim == 3:
+        if bit_depth != 8 or arr.shape[2] not in (3, 4):
+            raise ValueError(f"Unsupported multi-channel CAVE band: {path}")
+        if not (np.array_equal(arr[..., 0], arr[..., 1]) and np.array_equal(arr[..., 1], arr[..., 2])):
+            raise ValueError(f"CAVE spectral band is not replicated grayscale: {path}")
+        if arr.shape[2] == 4 and not np.all(arr[..., 3] == 255):
+            raise ValueError(f"CAVE spectral band has non-opaque alpha: {path}")
+        arr = arr[..., 0]
+    if arr.ndim != 2:
+        raise ValueError(f"Invalid CAVE band shape {arr.shape}: {path}")
+    return arr.astype(np.float32) / float((1 << bit_depth) - 1)
+
+
 @functools.lru_cache(maxsize=4)
 def _load_cave_scene(scene_dir: str) -> np.ndarray:
     try:
@@ -332,11 +359,10 @@ def _load_cave_scene(scene_dir: str) -> np.ndarray:
         if not matches:
             raise FileNotFoundError(f"Missing CAVE band {idx:02d} in {scene_dir}")
         files.append(sorted(matches)[0])
-    bands = [np.asarray(Image.open(path), dtype=np.float32) for path in files]
+    bands = [_read_cave_band(path) for path in files]
     cube = np.stack(bands, axis=2)
-    # Official CAVE reflectance PNGs are 16-bit.
-    if cube.max() > 1.0:
-        cube = cube / 65535.0
+    if cube.shape != (512, 512, 31):
+        raise ValueError(f"Unexpected CAVE shape {cube.shape}: {scene_dir}")
     return np.clip(cube, 0.0, 1.0).astype(np.float32)
 
 
@@ -412,6 +438,8 @@ def _read_tiff_cube(path: str, expected_bands: int = 242) -> np.ndarray:
     except ImportError as exc:
         raise ImportError("Augsburg GeoTIFF loading requires tifffile") from exc
     arr = _fix_hsi_shape(arr, expected_bands=expected_bands)
+    if arr.shape[2] != expected_bands or not np.isfinite(arr).all():
+        raise ValueError(f"Invalid Augsburg cube: {path}, shape={arr.shape}")
     # MDAS EnMAP/HySpex reflectance products use scale 1e4 in the reference code.
     arr = arr.astype(np.float32)
     if np.nanmax(arr) > 2.0:
@@ -447,7 +475,6 @@ def _make_loader(dataset, batch_size, shuffle, num_workers, drop_last=False):
 
 def _build_standard_single_scene(cfg, image: np.ndarray, weights: np.ndarray):
     image = normalize_hsi(image)
-    image = crop_to_scale(image, cfg.scale_ratio)
     if cfg.dataset == "Chikusei":
         image = _prepare_chikusei(image)
         train_coords = _chikusei_coords(cfg.patch_size, cfg.stride, "train", cfg.test_size)
@@ -456,6 +483,7 @@ def _build_standard_single_scene(cfg, image: np.ndarray, weights: np.ndarray):
         val_rect = (128, 0, 256, 2048)
         test_rect = (0, 0, 128, 2048)
     else:
+        image = crop_to_scale(image, cfg.scale_ratio)
         train_coords, val_rect, test_rect = _single_scene_coords(
             cfg.dataset, image.shape[0], image.shape[1], cfg.patch_size, cfg.stride, "train", cfg.test_size
         )

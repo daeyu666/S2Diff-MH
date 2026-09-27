@@ -7,3 +7,6 @@ hdf5storage
 pytest
 Pillow
 tifffile
+
+# Geographic split audit
+rasterio

@@ -244,6 +244,8 @@ def main():
         num_workers=0,
     )
     _, test_loader, info = build_loaders(cfg)
+    if len(test_loader) != 1:
+        raise ValueError("Legacy single-patch diagnostic: use train_cdrdi_diffusion_estimated.py --stage test for complete multi-sample evaluation")
     batch = next(iter(test_loader))
     gt = batch["gt"].to(device)
     hr_msi = batch["hr_msi"].to(device)

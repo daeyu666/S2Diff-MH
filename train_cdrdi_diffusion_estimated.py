@@ -32,6 +32,7 @@ from cdrdi_geometry import (
     spectral_project,
 )
 from config import TrainConfig
+from evaluation_protocol import evaluate_all_samples
 from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from innovation1 import build_progressive_process, model_predict, reconstruct_from_terminal_lr
@@ -45,7 +46,7 @@ from utils import CSVLogger, AverageMeter, ensure_dir, get_device, load_checkpoi
 
 def parse_args():
     p = argparse.ArgumentParser(description="Stage-2D estimated-phi-aware diffusion fine-tuning")
-    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei"], default="PaviaU")
+    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei", "CAVE", "Botswana", "Augsburg"], default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--checkpoint_root", default="./checkpoints/cdrdi_stage2")
     p.add_argument("--log_root", default="./logs/cdrdi_stage2")
@@ -277,6 +278,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
+@evaluate_all_samples
 def evaluate(model, geometry_model, test_loader, *, base_process, p0, srf, args, device):
     model.eval()
     geometry_model.eval()

@@ -48,7 +48,7 @@ def parse_args():
     p.add_argument("--variant", choices=VARIANTS, default="full")
     p.add_argument(
         "--dataset",
-        choices=["PaviaU", "Houston13", "Chikusei"],
+        choices=["PaviaU", "Houston13", "Chikusei", "CAVE", "Botswana", "Augsburg"],
         default="PaviaU",
     )
     p.add_argument("--data_root", default="./data/raw")

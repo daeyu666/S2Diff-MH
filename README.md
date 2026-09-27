@@ -344,3 +344,64 @@ The following old S2Diff research branches are not migrated:
 - the abandoned MSI high-frequency + gate + time-varying guidance as a claimed innovation.
 
 Innovation 2 is being rebuilt independently as calibrated degradation-locked deformation inversion. The `Recursive` label will only be retained as a claimed mechanism if Stage-1 learned-network experiments show a real advantage over the one-shot baseline.
+
+## Verified data protocol (2026-09-27)
+
+The audit is executable: `python check_data_protocol.py --data-root /path/to/data/raw --output audit.json`.
+Run it in each repository with the same raw data root; add `--compare /path/to/S2Diff-MH-audit.json`
+on the comparison run. Install the repository requirements plus `rasterio` for geographic checks.
+It reads every CAVE scene, all nine official Augsburg SR TIFFs, all split coordinates,
+and every validation/test sample. It checks SRF weights, finite values, shapes, geographic/scene
+separation, and compares resource hashes, coordinates and sampled returned tensors across repositories.
+Training samples overlap within the training split by design; cross-split overlap is zero.
+
+| Dataset | Raw H x W x bands | Prepared H x W x bands | Train / validation / test samples | MSI channels |
+|---|---|---|---|---|
+| PaviaU | 610 x 340 x 103 | 608 x 340 x 103 | 110 / 1 / 1 | 4 |
+| Houston13 | 349 x 1905 x 144 | 348 x 1904 x 144 | 470 / 1 / 1 | 8 |
+| Chikusei | 2517 x 2335 x 128 | 2304 x 2048 x 128 | 3969 / 16 / 16 | 8 |
+| CAVE | 32 scenes, each 512 x 512 x 31 | unchanged | 3600 / 4 / 12 (16 / 4 / 12 scenes) | 3 |
+| Botswana | 1476 x 256 x 145 | unchanged | 269 / 1 / 1 | 8 |
+| Augsburg synthetic x4 | train 540 x 1371 x 242; validation 300 x 639 x 242; test 300 x 360 x 242 | no full-cube crop; fixed tiles | 615 / 8 / 4 | 4 |
+
+Counts use train patch=64, stride=32, evaluation patch=128, scale=4; CAVE evaluates full scenes.
+Single-scene center rectangles refer to the scale-trimmed image, using zero-based half-open coordinates:
+PaviaU `[240:368,106:234]`, Houston13 `[110:238,888:1016]`, Botswana `[674:802,64:192]`.
+Their validation rectangle is `[0:128,0:128]`. Normalization remains the existing full-scene
+min/max convention; disjoint samples do not imply training-only normalization statistics.
+
+Chikusei MATLAB v7.3 dimensions are reversed on disk. The loader now restores `(H,W,C)`
+using the MATLAB attribute, then center-crops the **raw** scene at origin `(106,143)`.
+No preliminary scale trim is performed for Chikusei. Old results from the transposed HDF5
+fallback or previous crop are a different protocol and must be rerun for a fair comparison.
+
+CAVE `watercolors` is an official 8-bit RGBA exception: all 31 local PNGs were checked
+byte-for-byte against the [Columbia ZIP](https://www.cs.columbia.edu/CAVE/databases/multispectral/zip/watercolors_ms.zip).
+RGB components must be identical and alpha opaque; the scalar band is divided by 255.
+Other local scenes are 16-bit grayscale and divided by 65535. No color averaging or alpha-as-spectrum is used.
+
+Augsburg's 242-band metadata contains a VNIR/SWIR wavelength overlap (985 -> 905 nm).
+For synthetic SRF quadrature, cell widths are computed on sorted unique centres and divided
+among duplicate-centre bands, then mapped back to the original cube order. This is an explicit
+centre-sampling approximation, not recovery of the complete HySpex-to-Sentinel instrument simulation.
+Positive widths and row-sum checks alone are insufficient without this overlap handling.
+Bundled sensor paths are resolved relative to the repository rather than the launch directory.
+
+The three official Augsburg footprints are disjoint in EPSG:32632. Existing synthetic x4 evaluation
+uses only complete 128 tiles: validation covers 256 x 512 of 300 x 639, and test covers 256 x 256
+of 300 x 360 (65,536 / 108,000 pixels). Discarded border pixels are not evaluated. This is **not**
+the full-region official MDAS x3 benchmark. See `AUGSBURG_REAL_WORLD_PROTOCOL.md` for the proposed
+x3 full-region and real-MSI experiments; those experiments have not been run by the data audit.
+
+Use the same degradation settings explicitly in both repositories: Both repositories and EMR-Diff now default to physical;
+older comparison versions defaulted to gaussian_bicubic. Matching splits/SRF does not
+make those two different observation operators equivalent. Formal comparisons must pass
+`--degradation_mode physical --scale_ratio 4` (or the same explicitly selected alternative) to all methods.
+New dataset choices are enabled in generic training entry points; this audit validates data pipelines,
+not the memory requirements or accuracy of every model on full 512 x 512 CAVE evaluation images.
+
+Multi-sample evaluation: the S2Diff-MH CDRDI/GIGI training evaluators now aggregate every
+held-out sample (macro mean; minimum Jacobian retains the worst case). Previously they silently
+used only the first validation/test patch. The legacy standalone CDRDI final-test diagnostic
+and HSIFN misalignment visualization now reject multi-sample splits rather than report partial
+results as full benchmarks. Model-specific visualization extensions remain separate work.

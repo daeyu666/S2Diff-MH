@@ -40,6 +40,7 @@ from cdrdi_geometry import (
     spectral_project,
 )
 from config import TrainConfig
+from evaluation_protocol import evaluate_all_samples
 from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from innovation1 import build_progressive_process, reconstruct_from_terminal_lr
@@ -68,7 +69,7 @@ def parse_args():
     p.add_argument("--variant", choices=VARIANTS, default="full")
     p.add_argument(
         "--dataset",
-        choices=["PaviaU", "Houston13", "Chikusei"],
+        choices=["PaviaU", "Houston13", "Chikusei", "CAVE", "Botswana", "Augsburg"],
         default="PaviaU",
     )
     p.add_argument("--data_root", default="./data/raw")
@@ -543,6 +544,7 @@ def _warp_pair(
 
 
 @torch.no_grad()
+@evaluate_all_samples
 def evaluate(
     refiner,
     diffusion_model,

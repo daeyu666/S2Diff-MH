@@ -27,6 +27,7 @@ from cdrdi_geometry import (
     spectral_project,
 )
 from config import TrainConfig
+from evaluation_protocol import evaluate_all_samples
 from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.physical import PhysicalDegradation
 from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
@@ -56,7 +57,7 @@ def parse_args():
         default="all_steps",
         help="all_steps averages closure over every update; final_only supervises only the final unrolled state",
     )
-    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei"], default="PaviaU")
+    p.add_argument("--dataset", choices=["PaviaU", "Houston13", "Chikusei", "CAVE", "Botswana", "Augsburg"], default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--checkpoint_root", default="./checkpoints/cdrdi_stage1")
     p.add_argument("--log_root", default="./logs/cdrdi_stage1")
@@ -259,6 +260,7 @@ def _epe_from_sampling(
 
 
 @torch.no_grad()
+@evaluate_all_samples
 def evaluate(model, test_loader, *, p0, srf, args, device):
     model.eval()
     batch = next(iter(test_loader))

@@ -268,16 +268,20 @@ def _physical_residual(
     )
 
 
-def _pixel_sam_deg(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8):
-    p = pred.float()
-    t = target.float()
+def _pixel_sam_deg(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-12):
+    """Per-pixel SAM in degrees, consistent with metrics.calc_sam."""
+    p = torch.clamp(pred.float(), 0.0, 1.0)
+    t = torch.clamp(target.float(), 0.0, 1.0)
     dot = (p * t).sum(dim=1)
     pn = torch.linalg.vector_norm(p, dim=1)
     tn = torch.linalg.vector_norm(t, dim=1)
-    cosine = dot / (pn * tn).clamp_min(eps)
-    return torch.acos(cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)) * (
-        180.0 / math.pi
-    )
+
+    valid = (pn > eps) & (tn > eps)
+    angle = torch.full_like(pn, float("nan"))
+    if valid.any():
+        cosine = (dot[valid] / (pn[valid] * tn[valid]).clamp_min(eps)).clamp(-1.0, 1.0)
+        angle[valid] = torch.acos(cosine) * (180.0 / math.pi)
+    return angle
 
 
 def _region_sam(pred, target, heterogeneity, fraction: float) -> Tuple[float, float]:

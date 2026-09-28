@@ -18,15 +18,23 @@ def calc_psnr(pred: torch.Tensor, target: torch.Tensor, max_value: float = 1.0) 
     return 100.0 if rmse <= 1e-12 else 20.0 * math.log10(max_value / rmse)
 
 
-def calc_sam(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:
-    pred = pred.detach().float()
-    target = target.detach().float()
+def calc_sam(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-12) -> float:
+    """Mean spectral angle in degrees over pixels with valid non-zero spectra."""
+    pred = torch.clamp(pred.detach().float(), 0.0, 1.0)
+    target = torch.clamp(target.detach().float(), 0.0, 1.0)
+
     dot = torch.sum(pred * target, dim=1)
-    pred_norm = torch.sqrt(torch.sum(pred * pred, dim=1) + eps)
-    target_norm = torch.sqrt(torch.sum(target * target, dim=1) + eps)
-    cos = dot / (pred_norm * target_norm + eps)
-    cos = torch.clamp(cos, -1.0 + eps, 1.0 - eps)
-    return torch.mean(torch.acos(cos) * 180.0 / math.pi).item()
+    pred_norm = torch.linalg.vector_norm(pred, dim=1)
+    target_norm = torch.linalg.vector_norm(target, dim=1)
+
+    valid = (pred_norm > eps) & (target_norm > eps)
+    if not torch.any(valid):
+        return 0.0
+
+    denom = (pred_norm[valid] * target_norm[valid]).clamp_min(eps)
+    cos = (dot[valid] / denom).clamp(-1.0, 1.0)
+    angle = torch.acos(cos) * 180.0 / math.pi
+    return torch.mean(angle).item()
 
 
 def calc_cc(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> float:

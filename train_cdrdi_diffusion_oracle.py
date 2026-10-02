@@ -74,6 +74,18 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument(
+        "--diffusion_train_crop_size",
+        type=int,
+        default=0,
+        help=(
+            "If >0, synthesize/estimate deformation and diffusion states at the full "
+            "training sample size, then take an aligned random crop of x_t, GT and "
+            "HR-MSI only for the trainable diffusion forward/backward pass. "
+            "Use 256 with CAVE --patch_size 512 to preserve full-scene geometry "
+            "while reducing diffusion activation memory."
+        ),
+    )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -192,7 +204,57 @@ def batch_state_at(process, gt: torch.Tensor, timesteps: torch.Tensor) -> torch.
     return out
 
 
-def train_one_epoch(model, loader, optimizer, *, base_process, generator, args, device):
+def _crop_diffusion_training_triplet(
+    x_t: torch.Tensor,
+    gt: torch.Tensor,
+    hr_msi: torch.Tensor,
+    crop_size: int,
+    *,
+    generator: torch.Generator,
+):
+    """Crop only after the full-resolution deformation-aware state is built.
+
+    This preserves the acquisition geometry defined on the original full scene
+    (notably rotation radius and the 5x5 B-spline field), while limiting the
+    activation memory of the trainable diffusion predictor.
+    """
+    crop = int(crop_size)
+    if crop <= 0:
+        return x_t, gt, hr_msi
+
+    h, w = gt.shape[-2:]
+    if x_t.shape[-2:] != (h, w) or hr_msi.shape[-2:] != (h, w):
+        raise ValueError("x_t, gt and hr_msi must be spatially aligned before cropping")
+    if crop > min(h, w):
+        raise ValueError(
+            f"--diffusion_train_crop_size={crop} exceeds training sample size {(h, w)}"
+        )
+    if crop == h and crop == w:
+        return x_t, gt, hr_msi
+
+    top = int(
+        torch.randint(
+            0,
+            h - crop + 1,
+            (1,),
+            generator=generator,
+            device=gt.device,
+        ).item()
+    )
+    left = int(
+        torch.randint(
+            0,
+            w - crop + 1,
+            (1,),
+            generator=generator,
+            device=gt.device,
+        ).item()
+    )
+    sl = (..., slice(top, top + crop), slice(left, left + crop))
+    return x_t[sl], gt[sl], hr_msi[sl]
+
+
+def train_one_epoch(model, loader, optimizer, *, base_process, generator, crop_generator, args, device):
     model.train()
     sam_fn = SAMLoss()
     loss_meter = AverageMeter()
@@ -221,15 +283,24 @@ def train_one_epoch(model, loader, optimizer, *, base_process, generator, args, 
         )
         with torch.no_grad():
             x_t = batch_state_at(process, gt, timesteps)
+            x_t_train, gt_train, hr_msi_train = _crop_diffusion_training_triplet(
+                x_t,
+                gt,
+                hr_msi,
+                args.diffusion_train_crop_size,
+                generator=crop_generator,
+            )
 
-        pred_x0 = model_predict(model, x_t, timesteps, hr_msi)
-        l1 = F.l1_loss(pred_x0, gt)
-        sam = sam_fn(pred_x0, gt)
+        # Clear the previous step's gradients before allocating the new forward
+        # activations; this materially lowers the peak memory on 512x512 CAVE.
+        optimizer.zero_grad(set_to_none=True)
+        pred_x0 = model_predict(model, x_t_train, timesteps, hr_msi_train)
+        l1 = F.l1_loss(pred_x0, gt_train)
+        sam = sam_fn(pred_x0, gt_train)
         loss = float(args.lambda_l1) * l1 + float(args.lambda_sam) * sam
         if not torch.isfinite(loss):
             raise FloatingPointError("non-finite Stage-2 oracle diffusion loss")
 
-        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip), error_if_nonfinite=True)
@@ -337,6 +408,13 @@ def main():
         raise ValueError("--min_strength must lie in [0,1]")
     if args.eval_cases < 1:
         raise ValueError("--eval_cases must be >=1")
+    if args.diffusion_train_crop_size < 0:
+        raise ValueError("--diffusion_train_crop_size must be >=0")
+    if (
+        args.diffusion_train_crop_size > 0
+        and args.diffusion_train_crop_size % args.scale_ratio != 0
+    ):
+        raise ValueError("--diffusion_train_crop_size must be divisible by --scale_ratio")
 
     set_seed(args.seed)
     device = get_device(args.device)
@@ -409,6 +487,13 @@ def main():
         ],
     )
     train_generator = _make_generator(device, args.seed + 91000)
+    crop_generator = _make_generator(device, args.seed + 91100)
+    if args.diffusion_train_crop_size > 0:
+        print(
+            "DIFFUSION_TRAIN_CROP "
+            f"full_sample={args.patch_size} crop={args.diffusion_train_crop_size} "
+            "geometry_state=full_resolution diffusion_backward=cropped"
+        )
 
     initial = evaluate(model, val_loader, base_process=base_process, args=args, device=device)
     print("=" * 104)
@@ -422,6 +507,7 @@ def main():
             optimizer,
             base_process=base_process,
             generator=train_generator,
+            crop_generator=crop_generator,
             args=args,
             device=device,
         )

@@ -95,6 +95,14 @@ def parse_args():
             "while reducing diffusion activation memory."
         ),
     )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help=(
+            "Use CUDA FP16 autocast plus GradScaler for the trainable diffusion "
+            "forward/backward pass. Geometry/state synthesis and evaluation remain FP32."
+        ),
+    )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -113,6 +121,14 @@ def parse_args():
     p.add_argument("--resume", default="")
     p.add_argument("--save_name", default="")
     return p.parse_args()
+
+
+def _make_grad_scaler(enabled: bool):
+    """Create a CUDA GradScaler across old/new PyTorch AMP APIs."""
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def _make_generator(device: torch.device, seed: int) -> torch.Generator:
@@ -268,12 +284,14 @@ def train_one_epoch(
     geometry_model,
     loader,
     optimizer,
+    scaler,
     *,
     base_process,
     p0,
     srf,
     generator,
     crop_generator,
+    amp_enabled,
     args,
     device,
 ):
@@ -328,19 +346,43 @@ def train_one_epoch(
         # Clear the previous step's gradients before allocating the new forward
         # activations; this lowers peak memory for full-scene CAVE training.
         optimizer.zero_grad(set_to_none=True)
-        pred_x0 = model_predict(model, x_t_train, timesteps, hr_msi_train)
-        l1 = F.l1_loss(pred_x0, gt_train)
-        sam = sam_fn(pred_x0, gt_train)
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            pred_x0 = model_predict(model, x_t_train, timesteps, hr_msi_train)
+
+        # Keep L1/SAM evaluation in FP32 while retaining reduced-precision
+        # diffusion activations for backward.
+        pred_loss = pred_x0.float()
+        gt_loss = gt_train.float()
+        l1 = F.l1_loss(pred_loss, gt_loss)
+        sam = sam_fn(pred_loss, gt_loss)
         loss = float(args.lambda_l1) * l1 + float(args.lambda_sam) * sam
         if not torch.isfinite(loss):
             raise FloatingPointError("non-finite Stage-2D estimated-phi diffusion loss")
 
-        loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), float(args.grad_clip), error_if_nonfinite=True
-            )
-        optimizer.step()
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    float(args.grad_clip),
+                    error_if_nonfinite=True,
+                )
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    float(args.grad_clip),
+                    error_if_nonfinite=True,
+                )
+            optimizer.step()
 
         loss_meter.update(float(loss.detach().item()), b)
         l1_meter.update(float(l1.detach().item()), b)
@@ -506,6 +548,13 @@ def main():
 
     model = build_model(cfg, info, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    scaler = _make_grad_scaler(amp_enabled)
+    print(
+        "DIFFUSION_AMP "
+        f"requested={bool(args.amp)} enabled={amp_enabled} "
+        "dtype=float16 objective=float32"
+    )
 
     run_name = args.save_name or f"{args.dataset}_estimated_deform_diffusion_k{args.geometry_steps}_local{args.max_local_px:g}_seed{args.seed}"
     ensure_dir(args.checkpoint_root)
@@ -562,11 +611,13 @@ def main():
             geometry_model,
             train_loader,
             optimizer,
+            scaler,
             base_process=base_process,
             p0=p0,
             srf=srf,
             generator=generator,
             crop_generator=crop_generator,
+            amp_enabled=amp_enabled,
             args=args,
             device=device,
         )

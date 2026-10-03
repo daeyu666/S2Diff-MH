@@ -24,6 +24,7 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from cdrdi_geometry import (
     SyntheticGeometry,
@@ -103,6 +104,15 @@ def parse_args():
             "forward/backward pass. Geometry/state synthesis and evaluation remain FP32."
         ),
     )
+    p.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help=(
+            "Checkpoint the trainable diffusion forward so activations are recomputed "
+            "during backward. This reduces peak memory without changing full-resolution "
+            "geometry, diffusion inputs, loss, or evaluation."
+        ),
+    )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=5e-6)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -121,6 +131,31 @@ def parse_args():
     p.add_argument("--resume", default="")
     p.add_argument("--save_name", default="")
     return p.parse_args()
+
+
+def _train_diffusion_predict(
+    model,
+    x_t: torch.Tensor,
+    timesteps: torch.Tensor,
+    hr_msi: torch.Tensor,
+    *,
+    gradient_checkpointing: bool,
+):
+    """Memory-aware training prediction; numerically equivalent forward."""
+    if not gradient_checkpointing:
+        return model_predict(model, x_t, timesteps, hr_msi)
+
+    def _forward(x_in, t_in, msi_in):
+        return model_predict(model, x_in, t_in, msi_in)
+
+    return checkpoint(
+        _forward,
+        x_t,
+        timesteps,
+        hr_msi,
+        use_reentrant=False,
+        preserve_rng_state=True,
+    )
 
 
 def _make_grad_scaler(enabled: bool):
@@ -351,7 +386,13 @@ def train_one_epoch(
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
-            pred_x0 = model_predict(model, x_t_train, timesteps, hr_msi_train)
+            pred_x0 = _train_diffusion_predict(
+                model,
+                x_t_train,
+                timesteps,
+                hr_msi_train,
+                gradient_checkpointing=args.gradient_checkpointing,
+            )
 
         # Keep L1/SAM evaluation in FP32 while retaining reduced-precision
         # diffusion activations for backward.
@@ -554,6 +595,11 @@ def main():
         "DIFFUSION_AMP "
         f"requested={bool(args.amp)} enabled={amp_enabled} "
         "dtype=float16 objective=float32"
+    )
+    print(
+        "DIFFUSION_GRAD_CHECKPOINT "
+        f"enabled={bool(args.gradient_checkpointing)} "
+        "full_resolution_forward=True"
     )
 
     run_name = args.save_name or f"{args.dataset}_estimated_deform_diffusion_k{args.geometry_steps}_local{args.max_local_px:g}_seed{args.seed}"

@@ -104,6 +104,15 @@ def parse_args():
             "geometry, diffusion inputs, loss, or evaluation."
         ),
     )
+    p.add_argument(
+        "--spectral_chunk_pixels",
+        type=int,
+        default=0,
+        help=(
+            "If >0, process LocalSpectralStem pixels in chunks of this size. "
+            "This is mathematically equivalent and reduces Conv1d workspace on large scenes."
+        ),
+    )
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -133,8 +142,16 @@ def _train_diffusion_predict(
     *,
     gradient_checkpointing: bool,
 ):
-    """Memory-aware training prediction; numerically equivalent forward."""
+    """Memory-aware training prediction.
+
+    RawMSIDirectPredictor uses internal per-EMR-block checkpointing. The outer
+    whole-model checkpoint is kept only as a fallback for predictors that do
+    not expose the internal runtime toggle.
+    """
     if not gradient_checkpointing:
+        return model_predict(model, x_t, timesteps, hr_msi)
+
+    if hasattr(model, "internal_gradient_checkpointing"):
         return model_predict(model, x_t, timesteps, hr_msi)
 
     def _forward(x_in, t_in, msi_in):
@@ -148,7 +165,6 @@ def _train_diffusion_predict(
         use_reentrant=False,
         preserve_rng_state=True,
     )
-
 
 def _make_grad_scaler(enabled: bool):
     """Create a CUDA GradScaler across old/new PyTorch AMP APIs."""
@@ -498,6 +514,8 @@ def main():
         and args.diffusion_train_crop_size % args.scale_ratio != 0
     ):
         raise ValueError("--diffusion_train_crop_size must be divisible by --scale_ratio")
+    if args.spectral_chunk_pixels < 0:
+        raise ValueError("--spectral_chunk_pixels must be >=0")
 
     set_seed(args.seed)
     device = get_device(args.device)
@@ -525,6 +543,15 @@ def main():
     train_loader, val_loader, test_loader, info = build_train_val_test_loaders(cfg)
     base_process = build_progressive_process(cfg)
     model = build_model(cfg, info, device)
+    if hasattr(model, "internal_gradient_checkpointing"):
+        model.internal_gradient_checkpointing = bool(args.gradient_checkpointing)
+    if hasattr(model, "spectral_stem") and hasattr(model.spectral_stem, "chunk_pixels"):
+        model.spectral_stem.chunk_pixels = int(args.spectral_chunk_pixels)
+    print(
+        "DIFFUSION_MEMORY "
+        f"internal_block_checkpoint={bool(getattr(model, 'internal_gradient_checkpointing', False))} "
+        f"spectral_chunk_pixels={int(getattr(getattr(model, 'spectral_stem', None), 'chunk_pixels', 0))}"
+    )
 
     if args.resume:
         # Resume is handled after optimizer creation below.
@@ -551,7 +578,7 @@ def main():
     print(
         "DIFFUSION_GRAD_CHECKPOINT "
         f"enabled={bool(args.gradient_checkpointing)} "
-        "full_resolution_forward=True"
+        "mode=internal_emr_blocks full_resolution_forward=True"
     )
     run_name = args.save_name or f"{args.dataset}_oracle_deform_diffusion_local{args.max_local_px:g}_seed{args.seed}"
     ensure_dir(args.checkpoint_root)

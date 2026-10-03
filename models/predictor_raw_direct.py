@@ -13,6 +13,7 @@ from typing import Dict, Mapping, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .predictor_v2 import (
     EMRInspiredTimeBlock,
@@ -45,6 +46,8 @@ class RawMSIDirectPredictor(nn.Module):
         self.n_msi_bands = int(n_msi_bands)
         self.total_steps = int(total_steps)
         self.residual_prediction = bool(residual_prediction)
+        # Runtime-only memory control; not part of state_dict.
+        self.internal_gradient_checkpointing = False
         c1, c2, c3 = int(base_channels), int(base_channels) * 2, int(base_channels) * 4
 
         self.time_embed = nn.Sequential(
@@ -112,10 +115,22 @@ class RawMSIDirectPredictor(nn.Module):
             raise ValueError(f"t must be scalar or shape [B={batch_size}], got {tuple(t.shape)}")
         return self.time_embed(t.float() / float(self.total_steps) * 1000.0)
 
-    @staticmethod
-    def _apply_blocks(x, blocks, time_emb):
+    def _apply_blocks(self, x, blocks, time_emb):
         for block in blocks:
-            x = block(x, time_emb)
+            if (
+                bool(getattr(self, "internal_gradient_checkpointing", False))
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                x = checkpoint(
+                    block,
+                    x,
+                    time_emb,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                x = block(x, time_emb)
         return x
 
     def forward(self, x_t: torch.Tensor, hr_msi: torch.Tensor, t: torch.Tensor) -> torch.Tensor:

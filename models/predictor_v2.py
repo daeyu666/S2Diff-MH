@@ -46,6 +46,9 @@ class LocalSpectralStem(nn.Module):
         super().__init__()
         if hidden_channels < 2:
             raise ValueError("hidden_channels must be >= 2")
+        # Runtime-only memory controls. They do not create parameters or change
+        # checkpoint/state-dict compatibility.
+        self.chunk_pixels = 0
         self.net = nn.Sequential(
             nn.Conv1d(1, hidden_channels, kernel_size=3, padding=1),
             nn.SiLU(),
@@ -59,7 +62,19 @@ class LocalSpectralStem(nn.Module):
             raise ValueError(f"x must be BxCxHxW, got {tuple(x.shape)}")
         b, c, h, w = x.shape
         spectrum = x.permute(0, 2, 3, 1).reshape(b * h * w, 1, c)
-        refined = self.net(spectrum)
+
+        chunk = int(getattr(self, "chunk_pixels", 0))
+        if chunk > 0 and spectrum.shape[0] > chunk:
+            # Spectral filtering is independent per spatial pixel, so splitting
+            # the giant pixel batch is mathematically equivalent while avoiding
+            # very large Conv1d workspace allocations on 512x512 scenes.
+            parts = []
+            for start in range(0, spectrum.shape[0], chunk):
+                parts.append(self.net(spectrum[start : start + chunk]))
+            refined = torch.cat(parts, dim=0)
+        else:
+            refined = self.net(spectrum)
+
         refined = refined.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()
         return x + refined
 
@@ -136,7 +151,19 @@ class EMRInspiredTimeBlock(nn.Module):
         h = h * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
         full = self.full_branch(h)
         depth = self.depth_branch(h)
-        logits = self.branch_attention(torch.cat([full, depth], dim=1))
+
+        # branch_attention = AdaptiveAvgPool2d(1) -> Conv2d(hidden*2, 2, 1).
+        # Pool each branch before concatenation instead of materializing a
+        # full-resolution 2*hidden tensor. This is mathematically equivalent:
+        # avg(cat(full, depth)) == cat(avg(full), avg(depth)).
+        pooled = torch.cat(
+            [
+                F.adaptive_avg_pool2d(full, 1),
+                F.adaptive_avg_pool2d(depth, 1),
+            ],
+            dim=1,
+        )
+        logits = self.branch_attention[1](pooled)
         weights = torch.softmax(logits, dim=1)
         fused = weights[:, 0:1] * full + weights[:, 1:2] * depth
         return x + self.channel_mlp(fused)

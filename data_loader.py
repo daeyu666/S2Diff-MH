@@ -10,7 +10,9 @@ Final benchmark protocols:
 - Chikusei: center-crop 2304x2048; rows 0:128 test (16 non-overlapping
   128x128 patches), rows 128:256 validation (16 patches), rows 256:2304 train.
 - CAVE: deterministic 16 train / 4 validation / 12 test scenes (20/12
-  train-pool/test convention with 20% of the train pool held out for validation).
+  train-pool/test convention with 20% of the train pool held out for validation);
+  training uses overlapping patches and validation/test use one centered
+  cfg.test_size x cfg.test_size crop per held-out scene.
 - Botswana: center 128x128 test, top-left 128x128 validation, remaining area train.
 - Augsburg synthetic x4: official MDAS geographic train/validation/test files;
   EnMAP 10m is treated as HR-HSI and LR-HSI is generated later by Innovation 1.
@@ -389,7 +391,11 @@ class CAVEDataset(Dataset):
                 for top, left in _grid_coords(512, 512, self.patch_size, int(stride)):
                     self.samples.append((name, top, left, self.patch_size))
             else:
-                self.samples.append((name, 0, 0, 512))
+                if self.patch_size > 512:
+                    raise ValueError(f"CAVE evaluation crop {self.patch_size} exceeds 512")
+                top = (512 - self.patch_size) // 2
+                left = (512 - self.patch_size) // 2
+                self.samples.append((name, top, left, self.patch_size))
 
     def __len__(self):
         return len(self.samples)
@@ -508,15 +514,24 @@ def _build_cave(cfg):
     wavelengths = load_hsi_wavelengths(protocol["wavelength_path"], 31)
     weights, band_names = build_srf_weights(protocol["srf_path"], wavelengths, protocol["bands"], interp_kind=cfg.srf_interp)
     train_set = CAVEDataset(scene_dirs, CAVE_TRAIN_SCENES, weights, "train", cfg.patch_size, cfg.stride, True)
-    val_set = CAVEDataset(scene_dirs, CAVE_VALIDATION_SCENES, weights, "validation", 512, 512, False)
-    test_set = CAVEDataset(scene_dirs, CAVE_TEST_SCENES, weights, "test", 512, 512, False)
+    val_set = CAVEDataset(
+        scene_dirs, CAVE_VALIDATION_SCENES, weights, "validation",
+        cfg.test_size, cfg.test_size, False
+    )
+    test_set = CAVEDataset(
+        scene_dirs, CAVE_TEST_SCENES, weights, "test",
+        cfg.test_size, cfg.test_size, False
+    )
     info = {
         "n_bands": 31,
         "n_msi_bands": 3,
         "srf_weights": weights,
         "srf_band_names": band_names,
         "shape": (512,512,31),
-        "protocol": "CAVE deterministic 16 train / 4 validation / 12 test scenes",
+        "protocol": (
+            "CAVE deterministic 16 train / 4 validation / 12 test scenes; "
+            f"centered {cfg.test_size}x{cfg.test_size} validation/test crop per held-out scene"
+        ),
         "train_samples": len(train_set), "validation_samples": len(val_set), "test_samples": len(test_set),
     }
     return train_set, val_set, test_set, info

@@ -100,8 +100,17 @@ def parse_args():
         "--amp",
         action="store_true",
         help=(
-            "Use CUDA FP16 autocast plus GradScaler for the trainable diffusion "
-            "forward/backward pass. Geometry/state synthesis and evaluation remain FP32."
+            "Use CUDA autocast for the trainable diffusion forward/backward pass. "
+            "Geometry/state synthesis and evaluation remain FP32."
+        ),
+    )
+    p.add_argument(
+        "--amp_dtype",
+        choices=["fp16", "bf16"],
+        default="fp16",
+        help=(
+            "Autocast dtype. Use bf16 for full-resolution CAVE to keep FP16-like "
+            "memory usage with FP32-like exponent range and avoid overflow."
         ),
     )
     p.add_argument(
@@ -343,6 +352,7 @@ def train_one_epoch(
     generator,
     crop_generator,
     amp_enabled,
+    amp_dtype,
     args,
     device,
 ):
@@ -399,7 +409,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
             device_type="cuda",
-            dtype=torch.float16,
+            dtype=amp_dtype,
             enabled=amp_enabled,
         ):
             pred_x0 = _train_diffusion_predict(
@@ -418,9 +428,22 @@ def train_one_epoch(
         sam = sam_fn(pred_loss, gt_loss)
         loss = float(args.lambda_l1) * l1 + float(args.lambda_sam) * sam
         if not torch.isfinite(loss):
-            raise FloatingPointError("non-finite Stage-2D estimated-phi diffusion loss")
+            finite_mask = torch.isfinite(pred_loss)
+            finite_ratio = float(finite_mask.float().mean().item())
+            finite_values = pred_loss[finite_mask]
+            if finite_values.numel() > 0:
+                pred_min = float(finite_values.amin().item())
+                pred_max = float(finite_values.amax().item())
+            else:
+                pred_min = float("nan")
+                pred_max = float("nan")
+            raise FloatingPointError(
+                "Stage-2D estimated-phi diffusion loss is non-finite; "
+                f"amp_dtype={args.amp_dtype} finite_pred_ratio={finite_ratio:.6f} "
+                f"finite_pred_min={pred_min:.6g} finite_pred_max={pred_max:.6g}"
+            )
 
-        if amp_enabled:
+        if scaler.is_enabled():
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -617,11 +640,23 @@ def main():
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     amp_enabled = bool(args.amp and device.type == "cuda")
-    scaler = _make_grad_scaler(amp_enabled)
+    if amp_enabled and args.amp_dtype == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "--amp_dtype bf16 was requested, but this CUDA device/PyTorch build "
+                "does not report BF16 support"
+            )
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
+    # Dynamic loss scaling is needed for FP16, but not for BF16 because BF16
+    # has the same exponent width as FP32.
+    scaler = _make_grad_scaler(amp_enabled and amp_dtype == torch.float16)
     print(
         "DIFFUSION_AMP "
         f"requested={bool(args.amp)} enabled={amp_enabled} "
-        "dtype=float16 objective=float32"
+        f"dtype={args.amp_dtype} scaler_enabled={scaler.is_enabled()} "
+        "objective=float32"
     )
     print(
         "DIFFUSION_GRAD_CHECKPOINT "
@@ -691,6 +726,7 @@ def main():
             generator=generator,
             crop_generator=crop_generator,
             amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
             args=args,
             device=device,
         )

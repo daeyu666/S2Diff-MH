@@ -11,8 +11,8 @@ Final benchmark protocols:
   128x128 patches), rows 128:256 validation (16 patches), rows 256:2304 train.
 - CAVE: deterministic 16 train / 4 validation / 12 test scenes (20/12
   train-pool/test convention with 20% of the train pool held out for validation);
-  training uses overlapping patches and validation/test use one centered
-  cfg.test_size x cfg.test_size crop per held-out scene.
+  training uses overlapping patches and validation/test tile each full 512x512
+  held-out scene into non-overlapping cfg.test_size x cfg.test_size patches.
 - Botswana: center 128x128 test, top-left 128x128 validation, remaining area train.
 - Augsburg synthetic x4: official MDAS geographic train/validation/test files;
   EnMAP 10m is treated as HR-HSI and LR-HSI is generated later by Innovation 1.
@@ -392,10 +392,13 @@ class CAVEDataset(Dataset):
                     self.samples.append((name, top, left, self.patch_size))
             else:
                 if self.patch_size > 512:
-                    raise ValueError(f"CAVE evaluation crop {self.patch_size} exceeds 512")
-                top = (512 - self.patch_size) // 2
-                left = (512 - self.patch_size) // 2
-                self.samples.append((name, top, left, self.patch_size))
+                    raise ValueError(f"CAVE evaluation patch {self.patch_size} exceeds 512")
+                if 512 % self.patch_size != 0:
+                    raise ValueError(
+                        f"CAVE evaluation patch {self.patch_size} must evenly tile 512x512"
+                    )
+                for top, left in _nonoverlap_coords(512, 512, self.patch_size):
+                    self.samples.append((name, top, left, self.patch_size))
 
     def __len__(self):
         return len(self.samples)
@@ -530,7 +533,8 @@ def _build_cave(cfg):
         "shape": (512,512,31),
         "protocol": (
             "CAVE deterministic 16 train / 4 validation / 12 test scenes; "
-            f"centered {cfg.test_size}x{cfg.test_size} validation/test crop per held-out scene"
+            f"full 512x512 held-out scenes tiled into non-overlapping "
+            f"{cfg.test_size}x{cfg.test_size} validation/test patches"
         ),
         "train_samples": len(train_set), "validation_samples": len(val_set), "test_samples": len(test_set),
     }

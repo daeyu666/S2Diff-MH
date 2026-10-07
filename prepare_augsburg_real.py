@@ -24,11 +24,12 @@ def _default_srf(platform: str) -> tuple[str, list[str]]:
     here = os.path.dirname(os.path.abspath(__file__))
     platform = platform.upper()
     suffix = platform[-1].lower()
+    version = "v4" if platform == "S2A" else "v3"
     path = os.path.join(
         here,
         "data",
         "srf",
-        f"sentinel2{suffix}_srf_v4_B2_B3_B4_B8.csv",
+        f"sentinel2{suffix}_srf_{version}_B2_B3_B4_B8.csv",
     )
     cols = [f"{platform} {band}" for band in S2_NATIVE10_BANDS]
     return path, cols

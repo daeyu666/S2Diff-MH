@@ -405,3 +405,90 @@ held-out sample (macro mean; minimum Jacobian retains the worst case). Previousl
 used only the first validation/test patch. The legacy standalone CDRDI final-test diagnostic
 and HSIFN misalignment visualization now reject multi-sample splits rather than report partial
 results as full benchmarks. Model-specific visualization extensions remain separate work.
+
+
+## Augsburg-Real: real Sentinel-2 branch
+
+The real-data branch is deliberately separate from the synthetic Augsburg x4
+benchmark.  It uses the MDAS products as
+
+```text
+reference X : EeteS_EnMAP_10m (10 m EnMAP-like HSI; evaluation reference)
+observed Y_H: EeteS_EnMAP_30m (30 m EnMAP-like LR-HSI)
+observed Y_M: real Sentinel-2 L2A B2/B3/B4/B8 only
+scale       : 30 m -> 10 m = x3
+```
+
+No synthetic blur/noise/warp is added to the observed real inputs.  GeoTIFF
+metadata are used only to harmonise CRS, extent and a common 10 m reference
+grid; no image-content registration is performed before CDRDI.  Reflectance is
+kept in physical scale (default MDAS/L2A quantification divisor 10000), with no
+per-image min-max normalisation.
+
+The x3 progressive process is explicitly
+
+```text
+T=12
+t=1..4  -> scale 1
+t=5..8  -> scale 2
+t=9..12 -> scale 3
+```
+
+rather than relying on the generic scale-ratio scheduler.
+
+The main real branch is
+
+```text
+metadata/QC
+  -> train-only effective 10->30 m PSF calibration
+  -> train-only radiometric calibration
+  -> Real-C self-supervised geometry adaptation
+  -> Real-D2 observation-anchored diffusion adaptation
+  -> Real-E terminal GIGI adaptation
+```
+
+Real-D1 is intentionally absent because the real data have no oracle
+deformation field.  Real-C checkpoint selection uses observable physical
+closure only.  Real-D2 and Real-E keep the reconstructed latent in the real
+Sentinel-2 coordinate frame; the observed LR-HSI is never inverse warped.
+EnMAP10 is used for geometry-aware supervision/evaluation by applying the
+estimated forward geometry between the two reference frames.
+
+### Augsburg-Real code
+
+```text
+augsburg_real.py                         data preparation/cache + x3 patch loader
+augsburg_real_process.py                 explicit [1,2,3] progressive process
+degradations/effective_gaussian.py      calibrated effective inter-resolution operator
+prepare_augsburg_real.py                 metadata-only geospatial preparation
+calibrate_augsburg_real_psf.py           train-only effective 10->30 m PSF fit
+calibrate_augsburg_real_radiometry.py    train-only B2/B3/B4/B8 gain/bias fit
+train_augsburg_real_cdrdi.py             Real-C
+train_augsburg_real_diffusion.py         Real-D2
+train_augsburg_real_gigi.py              Real-E + final test
+```
+
+The real Sentinel platform is not guessed.  `prepare_augsburg_real.py` reads
+GeoTIFF metadata when available; otherwise pass `--s2_platform S2A` or
+`--s2_platform S2B` after checking the product metadata.  The matching
+platform-specific official B2/B3/B4/B8 SRF is mandatory.
+
+Example preparation/calibration sequence:
+
+```bash
+python prepare_augsburg_real.py \
+  --data_root ./data/raw \
+  --real_s2_path /path/to/Sentinel-2.tif \
+  --s2_platform auto
+
+python calibrate_augsburg_real_psf.py \
+  --cache_root ./data/augsburg_real_cache \
+  --device cuda
+
+python calibrate_augsburg_real_radiometry.py \
+  --cache_root ./data/augsburg_real_cache \
+  --device cuda
+```
+
+If the real product is S2B and the S2B V4.0 SRF has not yet been added locally,
+preparation intentionally stops instead of silently falling back to S2A.

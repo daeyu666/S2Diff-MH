@@ -24,10 +24,12 @@ from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, save_check
 
 def parse_args():
     p = argparse.ArgumentParser(description="Augsburg-Real Real-C geometry adaptation")
+    p.add_argument("--stage", choices=["train", "test"], default="train")
     p.add_argument("--cache_root", default="./data/augsburg_real_cache")
     p.add_argument("--psf_json", default="./data/calibration/AugsburgReal_effective_psf.json")
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
-    p.add_argument("--init_checkpoint", required=True, help="Synthetic Augsburg Stage-C checkpoint")
+    p.add_argument("--init_checkpoint", default="", help="Synthetic Augsburg Stage-C checkpoint")
+    p.add_argument("--geometry_checkpoint", default="", help="Trained Augsburg-Real C checkpoint for --stage test")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
     p.add_argument("--save_name", default="AugsburgReal_C_recursive_realclosure")
@@ -242,7 +244,7 @@ def main():
     sigma = _load_sigma(args.psf_json)
     radiometry = _load_radiometry(args.radiometry_json, device)
 
-    train_loader, val_loader, _, info = build_augsburg_real_loaders(
+    train_loader, val_loader, test_loader, info = build_augsburg_real_loaders(
         args.cache_root,
         train_patch_size=args.train_patch_size,
         train_stride=args.train_stride,
@@ -265,12 +267,44 @@ def main():
         max_rotation_deg=args.max_rotation_deg,
         max_local_px=args.max_local_px,
     ).to(device)
-    load_checkpoint(
-        model,
-        args.init_checkpoint,
-        map_location=str(device),
-        load_optimizer=False,
-    )
+    if args.stage == "test":
+        if not args.geometry_checkpoint:
+            raise ValueError("--stage test requires --geometry_checkpoint")
+        load_checkpoint(
+            model,
+            args.geometry_checkpoint,
+            map_location=str(device),
+            load_optimizer=False,
+        )
+        metrics = evaluate(
+            model,
+            test_loader,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            args=args,
+            device=device,
+        )
+        print(
+            "FINAL_REAL_C "
+            f"INIT_NORM={metrics['initial_norm']:.8f} "
+            f"FINAL_NORM={metrics['norm']:.8f} "
+            f"REDUCTION={100*metrics['closure_reduction']:.3f}% "
+            f"RAW={metrics['raw']:.8f} MIN_JAC={metrics['min_jac']:.6f} "
+            f"DX={metrics['dx_abs']:.4f} DY={metrics['dy_abs']:.4f} "
+            f"THETA={metrics['theta_abs']:.4f} LOCAL={metrics['local_mean']:.4f}"
+        )
+        return
+
+    if not args.init_checkpoint and not args.resume:
+        raise ValueError("Real-C training requires --init_checkpoint or --resume")
+    if args.init_checkpoint and not args.resume:
+        load_checkpoint(
+            model,
+            args.init_checkpoint,
+            map_location=str(device),
+            load_optimizer=False,
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,

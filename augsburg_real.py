@@ -320,6 +320,10 @@ def prepare_augsburg_real_cache(
         if not overwrite and all(os.path.exists(p) for p in required):
             with open(metadata_path, "r", encoding="utf-8") as handle:
                 meta = json.load(handle)
+            meta["s2_platform"] = platform
+            meta["s2_platform_detected"] = detected_platform
+            with open(metadata_path, "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, indent=2)
             summary["splits"][split] = meta
             continue
 

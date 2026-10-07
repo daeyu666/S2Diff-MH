@@ -94,6 +94,7 @@ def main():
         real_s2_path=s2_path,
         srf_path=srf_path,
         srf_band_columns=columns,
+        s2_platform_override=platform,
         scl_path=args.scl_path,
         s2_reflectance_scale=args.s2_scale,
         enmap_reflectance_scale=args.enmap_scale,

@@ -6,6 +6,7 @@ from typing import Any
 
 from .base import BaseDegradation
 from .bicubic import BicubicDegradation
+from .effective_gaussian import EffectiveGaussianDegradation
 from .deformation_aware import (
     DeformationAwareProgressiveDegradation,
     bilinear_border_warp_adjoint,
@@ -40,6 +41,7 @@ __all__ = [
     "BaseDegradation",
     "BicubicDegradation",
     "DeformationAwareProgressiveDegradation",
+    "EffectiveGaussianDegradation",
     "GaussianBicubicDegradation",
     "PhysicalDegradation",
     "ProgressiveDegradation",

@@ -26,6 +26,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Augsburg-Real Real-C geometry adaptation")
     p.add_argument("--cache_root", default="./data/augsburg_real_cache")
     p.add_argument("--psf_json", default="./data/calibration/AugsburgReal_effective_psf.json")
+    p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
     p.add_argument("--init_checkpoint", required=True, help="Synthetic Augsburg Stage-C checkpoint")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
@@ -62,6 +63,16 @@ def parse_args():
     p.add_argument("--eval_interval", type=int, default=5)
     p.add_argument("--resume", default="")
     return p.parse_args()
+
+
+def _load_radiometry(path: str, device):
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    gain = torch.tensor(payload["gain"], dtype=torch.float32, device=device).view(1, 4, 1, 1)
+    bias = torch.tensor(payload["bias"], dtype=torch.float32, device=device).view(1, 4, 1, 1)
+    return gain, bias
 
 
 def _load_sigma(path: str) -> float:
@@ -101,12 +112,7 @@ def _local_standardize(x: torch.Tensor, window: int, eps: float = 1e-4) -> torch
     return (x - mu) / torch.sqrt(var + eps * eps)
 
 
-def real_geometry_loss(
-    outputs: Dict[str, object],
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    args,
-):
+def real_geometry_loss(outputs: Dict[str, object], target: torch.Tensor, mask: torch.Tensor, args):
     prediction = outputs["final_prediction"]
     target_n = _local_standardize(target, args.local_window)
     pred_n = _local_standardize(prediction, args.local_window)
@@ -139,9 +145,12 @@ def real_geometry_loss(
     }
 
 
-def _estimate_batch(model, batch, *, p0, srf, steps: int, device):
+def _estimate_batch(model, batch, *, p0, srf, radiometry, steps: int, device):
     lr_hsi = batch["lr_hsi"].to(device, non_blocking=True)
     hr_msi = batch["hr_msi"].to(device, non_blocking=True)
+    if radiometry is not None:
+        gain, bias = radiometry
+        hr_msi = gain * hr_msi + bias
     mask_hr = batch["valid_mask"].to(device, non_blocking=True)
     target = spectral_project(lr_hsi, srf)
     mask = _lr_mask(mask_hr)
@@ -149,13 +158,19 @@ def _estimate_batch(model, batch, *, p0, srf, steps: int, device):
     return target, mask, outputs
 
 
-def train_one_epoch(model, loader, optimizer, *, p0, srf, args, device):
+def train_one_epoch(model, loader, optimizer, *, p0, srf, radiometry, args, device):
     model.train()
     sums = {k: 0.0 for k in ("loss", "norm", "grad", "raw", "reg", "jac")}
     count = 0
     for batch in loader:
         target, mask, outputs = _estimate_batch(
-            model, batch, p0=p0, srf=srf, steps=args.train_steps, device=device
+            model,
+            batch,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            steps=args.train_steps,
+            device=device,
         )
         loss, parts = real_geometry_loss(outputs, target, mask, args)
         if not torch.isfinite(loss):
@@ -168,7 +183,6 @@ def train_one_epoch(model, loader, optimizer, *, p0, srf, args, device):
             error_if_nonfinite=True,
         )
         optimizer.step()
-
         n = int(target.shape[0])
         sums["loss"] += float(loss.detach().item()) * n
         sums["norm"] += float(parts["norm"].detach().item()) * n
@@ -181,12 +195,18 @@ def train_one_epoch(model, loader, optimizer, *, p0, srf, args, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, *, p0, srf, args, device):
+def evaluate(model, loader, *, p0, srf, radiometry, args, device):
     model.eval()
     rows = []
     for batch in loader:
         target, mask, outputs = _estimate_batch(
-            model, batch, p0=p0, srf=srf, steps=args.eval_steps, device=device
+            model,
+            batch,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            steps=args.eval_steps,
+            device=device,
         )
         _, parts = real_geometry_loss(outputs, target, mask, args)
         initial = outputs["initial_prediction"]
@@ -220,6 +240,7 @@ def main():
     set_seed(args.seed)
     device = get_device(args.device)
     sigma = _load_sigma(args.psf_json)
+    radiometry = _load_radiometry(args.radiometry_json, device)
 
     train_loader, val_loader, _, info = build_augsburg_real_loaders(
         args.cache_root,
@@ -287,6 +308,9 @@ def main():
         f"eval_steps={args.eval_steps}"
     )
     print(
+        f"RADIOMETRY train_only_affine={radiometry is not None} file={args.radiometry_json}"
+    )
+    print(
         "LOSS geometry=shared_rigid_plus_bspline local_normalized_closure=True "
         "gradient_closure=True raw_reflectance_closure=True flow_GT=False"
     )
@@ -298,6 +322,7 @@ def main():
             optimizer,
             p0=p0,
             srf=srf,
+            radiometry=radiometry,
             args=args,
             device=device,
         )
@@ -308,7 +333,15 @@ def main():
         if epoch % args.eval_interval != 0 and epoch != args.epochs:
             continue
 
-        va = evaluate(model, val_loader, p0=p0, srf=srf, args=args, device=device)
+        va = evaluate(
+            model,
+            val_loader,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            args=args,
+            device=device,
+        )
         print(
             "REAL_C_VAL "
             f"INIT_NORM={va['initial_norm']:.8f} FINAL_NORM={va['norm']:.8f} "

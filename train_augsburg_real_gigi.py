@@ -36,8 +36,10 @@ from train_augsburg_real_diffusion import (
     _lr_mask,
     _mask_to_msi,
     _masked_l1,
+    _masked_metric_sums,
     _masked_metrics,
     _masked_sam,
+    _metrics_from_sums,
     _radiometry,
     _warp_adjoint_normalized,
 )
@@ -433,7 +435,37 @@ def evaluate(
     diffusion.eval()
     geometry.eval()
     projector.eval()
-    rows = []
+
+    base_sse = 0.0
+    base_values = 0
+    base_sam_sum = 0.0
+    base_sam_count = 0
+    ref_sse = 0.0
+    ref_values = 0
+    ref_sam_sum = 0.0
+    ref_sam_count = 0
+
+    region = {
+        "base_high_sum": 0.0,
+        "base_high_count": 0,
+        "base_low_sum": 0.0,
+        "base_low_count": 0,
+        "ref_high_sum": 0.0,
+        "ref_high_count": 0,
+        "ref_low_sum": 0.0,
+        "ref_low_count": 0,
+    }
+    update = {
+        "high_sum": 0.0,
+        "high_count": 0,
+        "low_sum": 0.0,
+        "low_count": 0,
+    }
+    phy_sum = 0.0
+    phy_weight = 0.0
+    msi_sum = 0.0
+    msi_weight = 0.0
+
     for batch in loader:
         pack = _base_bundle(
             diffusion,
@@ -468,64 +500,153 @@ def evaluate(
             pack["rigid"][:, 2],
             pack["local"],
         )
-        base_psnr, base_sam = _masked_metrics(
+
+        b_sse, b_values, b_sam_sum, b_sam_count = _masked_metric_sums(
             base_ref, pack["gt_ref"], pack["mask_ref"]
         )
-        ref_psnr, ref_sam = _masked_metrics(
+        r_sse, r_values, r_sam_sum, r_sam_count = _masked_metric_sums(
             refined_ref, pack["gt_ref"], pack["mask_ref"]
         )
+        base_sse += b_sse
+        base_values += b_values
+        base_sam_sum += b_sam_sum
+        base_sam_count += b_sam_count
+        ref_sse += r_sse
+        ref_values += r_values
+        ref_sam_sum += r_sam_sum
+        ref_sam_count += r_sam_count
+
         hetero_ref = _heterogeneity_to_reference(
             pack["heterogeneity"], pack["rigid"], pack["local"]
         )
-        base_high, base_low = _masked_region_sam(
-            base_ref,
-            pack["gt_ref"],
-            pack["mask_ref"],
-            hetero_ref,
-            args.region_fraction,
+        valid_ref = (
+            (pack["mask_ref"][:, 0] > 0.5)
+            & torch.isfinite(hetero_ref)
         )
-        high, low = _masked_region_sam(
-            refined_ref,
-            pack["gt_ref"],
-            pack["mask_ref"],
-            hetero_ref,
-            args.region_fraction,
-        )
-        phy = float(
+        if valid_ref.any():
+            h = hetero_ref[valid_ref]
+            lo = torch.quantile(h, float(args.region_fraction))
+            hi = torch.quantile(h, 1.0 - float(args.region_fraction))
+            high_sel = valid_ref & (hetero_ref >= hi)
+            low_sel = valid_ref & (hetero_ref <= lo)
+
+            base_angle = _pixel_sam_deg(base_ref, pack["gt_ref"])
+            ref_angle = _pixel_sam_deg(refined_ref, pack["gt_ref"])
+            for prefix, angle in (("base", base_angle), ("ref", ref_angle)):
+                high_values = angle[high_sel & torch.isfinite(angle)]
+                low_values = angle[low_sel & torch.isfinite(angle)]
+                region[f"{prefix}_high_sum"] += float(
+                    high_values.double().sum().item()
+                )
+                region[f"{prefix}_high_count"] += int(high_values.numel())
+                region[f"{prefix}_low_sum"] += float(
+                    low_values.double().sum().item()
+                )
+                region[f"{prefix}_low_count"] += int(low_values.numel())
+
+        lr_valid = _lr_mask(pack["mask_ref"])
+        phy_value = float(
             _masked_l1(
                 pack["process"].terminal_observation(refined),
                 pack["y_h"],
-                _lr_mask(pack["mask_ref"]),
+                lr_valid,
             ).item()
         )
-        msi = float(
+        lr_weight = float(lr_valid[:, 0].sum().item())
+        phy_sum += phy_value * lr_weight
+        phy_weight += lr_weight
+
+        msi_value = float(
             _masked_l1(
                 _hsi_to_msi(refined, srf),
                 pack["y_m"],
                 pack["mask_msi"],
             ).item()
         )
-        mech = _update_mechanism(
-            details, pack["mask_msi"], args.region_fraction
+        msi_weight_tile = float(pack["mask_msi"][:, 0].sum().item())
+        msi_sum += msi_value * msi_weight_tile
+        msi_weight += msi_weight_tile
+
+        energy = torch.linalg.vector_norm(
+            details["update"].float(), dim=1
         )
-        rows.append(
-            {
-                "base_ref_psnr": base_psnr,
-                "base_ref_sam": base_sam,
-                "base_ref_sam_high": base_high,
-                "base_ref_sam_low": base_low,
-                "ref_psnr": ref_psnr,
-                "ref_sam": ref_sam,
-                "ref_sam_high": high,
-                "ref_sam_low": low,
-                "phy": phy,
-                "msi": msi,
-                **mech,
-            }
+        hetero_msi = details["heterogeneity"]
+        valid_msi = (
+            (pack["mask_msi"][:, 0] > 0.5)
+            & torch.isfinite(hetero_msi)
+            & torch.isfinite(energy)
         )
-    if not rows:
-        raise ValueError("empty evaluation loader")
-    return {k: mean(row[k] for row in rows) for k in rows[0]}
+        if valid_msi.any():
+            h = hetero_msi[valid_msi]
+            lo = torch.quantile(h, float(args.region_fraction))
+            hi = torch.quantile(h, 1.0 - float(args.region_fraction))
+            high_values = energy[
+                valid_msi & (hetero_msi >= hi)
+            ]
+            low_values = energy[
+                valid_msi & (hetero_msi <= lo)
+            ]
+            update["high_sum"] += float(
+                high_values.double().sum().item()
+            )
+            update["high_count"] += int(high_values.numel())
+            update["low_sum"] += float(
+                low_values.double().sum().item()
+            )
+            update["low_count"] += int(low_values.numel())
+
+    if ref_values <= 0 or base_values <= 0:
+        raise ValueError("empty/invalid evaluation loader")
+
+    base_psnr, base_sam = _metrics_from_sums(
+        base_sse, base_values, base_sam_sum, base_sam_count
+    )
+    ref_psnr, ref_sam = _metrics_from_sums(
+        ref_sse, ref_values, ref_sam_sum, ref_sam_count
+    )
+
+    def _safe_mean(total, count):
+        return total / float(count) if count > 0 else float("nan")
+
+    base_high = _safe_mean(
+        region["base_high_sum"], region["base_high_count"]
+    )
+    base_low = _safe_mean(
+        region["base_low_sum"], region["base_low_count"]
+    )
+    ref_high = _safe_mean(
+        region["ref_high_sum"], region["ref_high_count"]
+    )
+    ref_low = _safe_mean(
+        region["ref_low_sum"], region["ref_low_count"]
+    )
+    update_high = _safe_mean(
+        update["high_sum"], update["high_count"]
+    )
+    update_low = _safe_mean(
+        update["low_sum"], update["low_count"]
+    )
+    update_ratio = (
+        update_high / max(update_low, 1e-12)
+        if math.isfinite(update_high) and math.isfinite(update_low)
+        else float("nan")
+    )
+
+    return {
+        "base_ref_psnr": base_psnr,
+        "base_ref_sam": base_sam,
+        "base_ref_sam_high": base_high,
+        "base_ref_sam_low": base_low,
+        "ref_psnr": ref_psnr,
+        "ref_sam": ref_sam,
+        "ref_sam_high": ref_high,
+        "ref_sam_low": ref_low,
+        "phy": phy_sum / max(phy_weight, 1.0),
+        "msi": msi_sum / max(msi_weight, 1.0),
+        "update_high": update_high,
+        "update_low": update_low,
+        "update_ratio": update_ratio,
+    }
 
 
 def _build_frozen(args, info, device, base_process):

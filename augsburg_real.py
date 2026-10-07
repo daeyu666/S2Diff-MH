@@ -357,6 +357,14 @@ def prepare_augsburg_real_cache(
             resampling="bilinear",
         )
 
+        lr_valid = (
+            np.isfinite(lr_hsi).all(axis=2)
+            & (lr_hsi >= -0.05).all(axis=2)
+            & (lr_hsi <= 1.5).all(axis=2)
+        )
+        lr_valid_hr = np.repeat(
+            np.repeat(lr_valid, 3, axis=0), 3, axis=1
+        )[:hr_height3, :hr_width3]
         valid = (
             np.isfinite(gt).all(axis=2)
             & np.isfinite(hr_msi).all(axis=2)
@@ -364,6 +372,7 @@ def prepare_augsburg_real_cache(
             & (gt <= 1.5).all(axis=2)
             & (hr_msi >= -0.05).all(axis=2)
             & (hr_msi <= 1.5).all(axis=2)
+            & lr_valid_hr
         )
         if scl_path:
             valid &= _reproject_mask(

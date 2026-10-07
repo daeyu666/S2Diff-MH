@@ -57,7 +57,23 @@ series.
 The Augsburg-Real branch does not assume that the real L2A stack is Sentinel-2A.
 `prepare_augsburg_real.py` first inspects the GeoTIFF metadata and otherwise
 requires an explicit `--s2_platform S2A|S2B`.  B2/B3/B4/B8 must use the
-official SRF of that platform.  The repository currently freezes the S2A V4.0
-resource above; a detected/declared S2B product must be supplied with the
-corresponding official S2B B2/B3/B4/B8 SRF via `--srf_path` rather than
-silently reusing S2A.
+official SRF of that platform.  The repository freezes S2A V4.0 for the synthetic Augsburg benchmark and
+S2B V3.0 for the fixed 7 May 2018 Augsburg-Real acquisition. The two resources
+are never interchanged silently.
+
+
+## Augsburg-Real / Sentinel-2B
+
+- The real MDAS Sentinel-2 acquisition on 7 May 2018 is treated as Sentinel-2B.
+  This is consistent with the R065 acquisition phase: a documented S2B R065
+  acquisition occurs on 16 June 2018 (40 days later), while a documented S2A
+  R065 acquisition occurs on 26 June 2017 (315 days earlier, i.e. the opposite
+  5-day A/B phase).
+- Frozen file: `sentinel2b_srf_v3_B2_B3_B4_B8.csv`.
+- Source representation:
+  `tnigon/hs_process/hs_process/data/sentinel-2b_band_response.csv`,
+  containing ESA Sentinel-2B average SRF columns
+  `S2B_SR_AV_B2/B3/B4/B8`.
+- That representation traces to the official ESA
+  `S2-SRF_COPE-GSEG-EOPG-TN-15-0007_3.0.xlsx`.
+- Only native-10m B2/B3/B4/B8 are retained for Augsburg-Real.

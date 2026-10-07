@@ -428,6 +428,29 @@ def _grid_coords(h: int, w: int, patch: int, stride: int) -> List[Tuple[int, int
     ]
 
 
+def _partition_tiles(h: int, w: int, max_patch: int) -> List[Tuple[int, int, int, int]]:
+    """Cover an x3-compatible region exactly once with non-overlapping tiles."""
+    if max_patch < 3 or max_patch % 3:
+        raise ValueError("Augsburg-Real eval_patch_size must be divisible by 3")
+    if h % 3 or w % 3:
+        raise ValueError("Augsburg-Real evaluation region must be divisible by 3")
+    rows = []
+    top = 0
+    while top < h:
+        ph = min(max_patch, h - top)
+        if ph % 3:
+            raise RuntimeError("evaluation tile height lost x3 compatibility")
+        left = 0
+        while left < w:
+            pw = min(max_patch, w - left)
+            if pw % 3:
+                raise RuntimeError("evaluation tile width lost x3 compatibility")
+            rows.append((top, left, ph, pw))
+            left += pw
+        top += ph
+    return rows
+
+
 class AugsburgRealDataset(Dataset):
     """Patch dataset over prepared Augsburg-Real arrays."""
 
@@ -462,11 +485,22 @@ class AugsburgRealDataset(Dataset):
             raise ValueError("Augsburg-Real patch_size and stride must be divisible by 3")
         self.patch_size = patch
         self.augment = bool(augment and split == "train")
-        self.samples: List[Tuple[int, int]] = []
-        for top, left in _grid_coords(self.gt.shape[0], self.gt.shape[1], patch, stride):
-            mask = self.valid[top:top + patch, left:left + patch]
+        self.samples: List[Tuple[int, int, int, int]] = []
+        if split == "train":
+            candidates = [
+                (top, left, patch, patch)
+                for top, left in _grid_coords(
+                    self.gt.shape[0], self.gt.shape[1], patch, stride
+                )
+            ]
+        else:
+            candidates = _partition_tiles(
+                self.gt.shape[0], self.gt.shape[1], patch
+            )
+        for top, left, ph, pw in candidates:
+            mask = self.valid[top:top + ph, left:left + pw]
             if float(mask.mean()) >= float(min_valid_fraction):
-                self.samples.append((top, left))
+                self.samples.append((top, left, ph, pw))
         if not self.samples:
             raise RuntimeError(
                 f"No Augsburg-Real {split} patches meet min_valid_fraction={min_valid_fraction}"
@@ -476,13 +510,13 @@ class AugsburgRealDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        top, left = self.samples[index]
-        p = self.patch_size
-        lt, ll, lp = top // 3, left // 3, p // 3
-        gt = np.asarray(self.gt[top:top+p, left:left+p]).copy()
-        hr_msi = np.asarray(self.hr_msi[top:top+p, left:left+p]).copy()
-        lr_hsi = np.asarray(self.lr_hsi[lt:lt+lp, ll:ll+lp]).copy()
-        mask = np.asarray(self.valid[top:top+p, left:left+p]).copy()
+        top, left, ph, pw = self.samples[index]
+        lt, ll = top // 3, left // 3
+        lph, lpw = ph // 3, pw // 3
+        gt = np.asarray(self.gt[top:top+ph, left:left+pw]).copy()
+        hr_msi = np.asarray(self.hr_msi[top:top+ph, left:left+pw]).copy()
+        lr_hsi = np.asarray(self.lr_hsi[lt:lt+lph, ll:ll+lpw]).copy()
+        mask = np.asarray(self.valid[top:top+ph, left:left+pw]).copy()
 
         if self.augment:
             if np.random.rand() < 0.5:

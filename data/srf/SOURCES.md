@@ -50,3 +50,14 @@ series.
   `MarcYin/spectral_library` Sentinel-2A MSI SRF representation, whose
   provenance manifest points to the official workbook.
 - Dataset DOI: https://doi.org/10.14459/2022mp1657312
+
+
+### Augsburg-Real platform rule
+
+The Augsburg-Real branch does not assume that the real L2A stack is Sentinel-2A.
+`prepare_augsburg_real.py` first inspects the GeoTIFF metadata and otherwise
+requires an explicit `--s2_platform S2A|S2B`.  B2/B3/B4/B8 must use the
+official SRF of that platform.  The repository currently freezes the S2A V4.0
+resource above; a detected/declared S2B product must be supplied with the
+corresponding official S2B B2/B3/B4/B8 SRF via `--srf_path` rather than
+silently reusing S2A.

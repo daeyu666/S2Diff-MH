@@ -490,5 +490,6 @@ python calibrate_augsburg_real_radiometry.py \
   --device cuda
 ```
 
-If the real product is S2B and the S2B V4.0 SRF has not yet been added locally,
-preparation intentionally stops instead of silently falling back to S2A.
+For the fixed MDAS acquisition on 7 May 2018, Augsburg-Real uses the frozen
+Sentinel-2B B2/B3/B4/B8 SRF resource. Synthetic Augsburg continues to use the
+separate Sentinel-2A V4.0 resource; the two protocols are not mixed.

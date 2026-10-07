@@ -3,7 +3,7 @@ import json
 import numpy as np
 import torch
 
-from augsburg_real import AugsburgRealDataset
+from augsburg_real import AugsburgRealDataset, _partition_tiles
 from augsburg_real_process import build_augsburg_real_process
 from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from degradations.effective_gaussian import EffectiveGaussianDegradation
@@ -94,3 +94,18 @@ def test_effective_operator_works_with_deformation_aware_x3_process():
     lifted = process.terminal_state(y, target_size=(96, 96))
     assert lifted.shape == x.shape
     process.assert_terminal_closure(x)
+
+
+def test_eval_tiles_cover_full_region_once():
+    tiles = _partition_tiles(300, 360, 192)
+    assert tiles == [
+        (0, 0, 192, 192),
+        (0, 192, 192, 168),
+        (192, 0, 108, 192),
+        (192, 192, 108, 168),
+    ]
+    canvas = np.zeros((300, 360), dtype=np.int32)
+    for top, left, ph, pw in tiles:
+        assert ph % 3 == 0 and pw % 3 == 0
+        canvas[top:top+ph, left:left+pw] += 1
+    assert np.all(canvas == 1)

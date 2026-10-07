@@ -34,11 +34,13 @@ from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, save_check
 
 def parse_args():
     p = argparse.ArgumentParser(description="Augsburg-Real Real-D2 diffusion adaptation")
+    p.add_argument("--stage", choices=["train", "test"], default="train")
     p.add_argument("--cache_root", default="./data/augsburg_real_cache")
     p.add_argument("--psf_json", default="./data/calibration/AugsburgReal_effective_psf.json")
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
     p.add_argument("--geometry_checkpoint", required=True)
-    p.add_argument("--init_checkpoint", required=True, help="Synthetic Augsburg D2 checkpoint")
+    p.add_argument("--init_checkpoint", default="", help="Synthetic Augsburg D2 checkpoint")
+    p.add_argument("--diffusion_checkpoint", default="", help="Trained Augsburg-Real D2 checkpoint for --stage test")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
     p.add_argument("--save_name", default="AugsburgReal_D2_estimated_geometry")
@@ -348,7 +350,7 @@ def main():
     sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
     radiometry = _radiometry(args.radiometry_json, device)
 
-    train_loader, val_loader, _, info = build_augsburg_real_loaders(
+    train_loader, val_loader, test_loader, info = build_augsburg_real_loaders(
         args.cache_root,
         train_patch_size=args.train_patch_size,
         train_stride=args.train_stride,
@@ -383,12 +385,42 @@ def main():
         parameter.requires_grad_(False)
 
     model = build_model(_config(args), info, device)
-    load_checkpoint(
-        model,
-        args.init_checkpoint,
-        map_location=str(device),
-        load_optimizer=False,
-    )
+    if args.stage == "test":
+        if not args.diffusion_checkpoint:
+            raise ValueError("--stage test requires --diffusion_checkpoint")
+        load_checkpoint(
+            model,
+            args.diffusion_checkpoint,
+            map_location=str(device),
+            load_optimizer=False,
+        )
+        metrics = evaluate(
+            model,
+            geometry_model,
+            test_loader,
+            base_process=base_process,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            args=args,
+            device=device,
+        )
+        print(
+            f"FINAL_REAL_D2 REF_PSNR={metrics['ref_psnr']:.6f} "
+            f"REF_SAM={metrics['ref_sam']:.6f} "
+            f"PHY_L1={metrics['phy']:.8f} MSI_L1={metrics['msi']:.8f}"
+        )
+        return
+
+    if not args.init_checkpoint and not args.resume:
+        raise ValueError("Real-D2 training requires --init_checkpoint or --resume")
+    if args.init_checkpoint and not args.resume:
+        load_checkpoint(
+            model,
+            args.init_checkpoint,
+            map_location=str(device),
+            load_optimizer=False,
+        )
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,

@@ -109,10 +109,13 @@ class DeformationAwareProgressiveDegradation:
         local_field: torch.Tensor,
         eps: float = 1e-8,
     ):
-        if base_process.operator.mode != "physical":
-            raise ValueError("Stage-2 deformation-aware trajectory requires physical degradation")
+        if base_process.operator.mode not in ("physical", "effective_gaussian"):
+            raise ValueError(
+                "Stage-2 deformation-aware trajectory requires a physical-style "
+                "degradation with an adjoint"
+            )
         if not hasattr(base_process.operator, "adjoint_at"):
-            raise TypeError("physical operator must expose adjoint_at")
+            raise TypeError("physical-style operator must expose adjoint_at")
         if rigid.ndim != 2 or rigid.shape[1] != 3:
             raise ValueError("rigid must have shape Bx3 containing dx,dy,theta_deg")
         if local_field.ndim != 4 or local_field.shape[1] != 2:

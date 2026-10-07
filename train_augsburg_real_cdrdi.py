@@ -199,7 +199,13 @@ def train_one_epoch(model, loader, optimizer, *, p0, srf, radiometry, args, devi
 @torch.no_grad()
 def evaluate(model, loader, *, p0, srf, radiometry, args, device):
     model.eval()
-    rows = []
+    keys = (
+        "initial_norm", "norm", "grad", "raw",
+        "dx_abs", "dy_abs", "theta_abs", "local_mean",
+    )
+    sums = {key: 0.0 for key in keys}
+    total_weight = 0.0
+    min_jac = float("inf")
     for batch in loader:
         target, mask, outputs = _estimate_batch(
             model,
@@ -217,23 +223,32 @@ def evaluate(model, loader, *, p0, srf, radiometry, args, device):
         initial_norm = float(_charbonnier(target_n - initial_n, mask).item())
         rigid = outputs["final_rigid"]
         local = outputs["final_local_field"]
-        rows.append(
-            {
-                "initial_norm": initial_norm,
-                "norm": float(parts["norm"].item()),
-                "grad": float(parts["grad"].item()),
-                "raw": float(parts["raw"].item()),
-                "min_jac": float(parts["min_jac"].item()),
-                "dx_abs": float(rigid[:, 0].abs().mean().item()),
-                "dy_abs": float(rigid[:, 1].abs().mean().item()),
-                "theta_abs": float(rigid[:, 2].abs().mean().item()),
-                "local_mean": float(torch.linalg.vector_norm(local, dim=1).mean().item()),
-            }
-        )
-    if not rows:
-        raise ValueError("empty validation loader")
-    out = {k: mean(row[k] for row in rows) for k in rows[0]}
-    out["closure_reduction"] = 1.0 - out["norm"] / max(out["initial_norm"], 1e-12)
+        weight = float(mask[:, 0].sum().item())
+        if weight <= 0.0:
+            continue
+        values = {
+            "initial_norm": initial_norm,
+            "norm": float(parts["norm"].item()),
+            "grad": float(parts["grad"].item()),
+            "raw": float(parts["raw"].item()),
+            "dx_abs": float(rigid[:, 0].abs().mean().item()),
+            "dy_abs": float(rigid[:, 1].abs().mean().item()),
+            "theta_abs": float(rigid[:, 2].abs().mean().item()),
+            "local_mean": float(
+                torch.linalg.vector_norm(local, dim=1).mean().item()
+            ),
+        }
+        for key, value in values.items():
+            sums[key] += value * weight
+        total_weight += weight
+        min_jac = min(min_jac, float(parts["min_jac"].item()))
+    if total_weight <= 0.0:
+        raise ValueError("empty/invalid validation loader")
+    out = {key: sums[key] / total_weight for key in keys}
+    out["min_jac"] = min_jac
+    out["closure_reduction"] = (
+        1.0 - out["norm"] / max(out["initial_norm"], 1e-12)
+    )
     return out
 
 

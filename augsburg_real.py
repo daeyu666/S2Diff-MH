@@ -260,6 +260,7 @@ def prepare_augsburg_real_cache(
     real_s2_path: str = "",
     srf_path: str,
     srf_band_columns: Sequence[str],
+    s2_platform_override: str = "",
     scl_path: str = "",
     s2_reflectance_scale: float = 10000.0,
     enmap_reflectance_scale: float = 10000.0,
@@ -276,8 +277,13 @@ def prepare_augsburg_real_cache(
 
     with rasterio.open(real_s2_path) as s2_src:
         s2_indexes, s2_names = resolve_s2_band_indexes(s2_src)
-        platform = infer_s2_platform(s2_src)
+        detected_platform = infer_s2_platform(s2_src)
         s2_source_count = int(s2_src.count)
+    platform = (
+        str(s2_platform_override).upper()
+        if s2_platform_override
+        else detected_platform
+    )
 
     srf_weights, wavelengths = build_s2_srf_weights(
         root,
@@ -291,6 +297,7 @@ def prepare_augsburg_real_cache(
         "root": root,
         "real_s2_path": real_s2_path,
         "s2_platform": platform,
+        "s2_platform_detected": detected_platform,
         "s2_source_count": s2_source_count,
         "s2_band_indexes_1based": s2_indexes,
         "s2_band_names": s2_names,

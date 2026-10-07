@@ -5,6 +5,7 @@ import torch
 
 from augsburg_real import AugsburgRealDataset
 from augsburg_real_process import build_augsburg_real_process
+from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from degradations.effective_gaussian import EffectiveGaussianDegradation
 
 
@@ -76,3 +77,20 @@ def test_dataset_rejects_non_x3_patch(tmp_path):
         assert "divisible by 3" in str(exc)
     else:
         raise AssertionError("expected x3 patch validation failure")
+
+
+def test_effective_operator_works_with_deformation_aware_x3_process():
+    base = build_augsburg_real_process(effective_sigma=1.2, diffusion_steps=12)
+    rigid = torch.zeros(1, 3)
+    local = torch.zeros(1, 2, 96, 96)
+    process = DeformationAwareProgressiveDegradation(
+        base,
+        rigid=rigid,
+        local_field=local,
+    )
+    x = torch.rand(1, 7, 96, 96)
+    y = process.terminal_observation(x)
+    assert y.shape == (1, 7, 32, 32)
+    lifted = process.terminal_state(y, target_size=(96, 96))
+    assert lifted.shape == x.shape
+    process.assert_terminal_closure(x)

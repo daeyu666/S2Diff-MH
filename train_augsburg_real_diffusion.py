@@ -168,16 +168,53 @@ def _masked_sam(pred, target, mask, eps=1e-12):
     return torch.acos(cos).mean()
 
 
-def _masked_metrics(pred, target, mask, eps=1e-12):
+def _masked_metric_sums(pred, target, mask, eps=1e-12):
     if mask.shape[1] == 1:
         mask_band = mask.expand(-1, pred.shape[1], -1, -1)
     else:
         mask_band = mask
     diff = (pred - target)[mask_band]
-    mse = float((diff * diff).mean().item()) if diff.numel() else float("nan")
-    psnr = -10.0 * math.log10(max(mse, eps)) if math.isfinite(mse) else float("nan")
-    sam_rad = float(_masked_sam(pred, target, mask).item())
-    return psnr, sam_rad * 180.0 / math.pi
+    sse = float((diff.double() * diff.double()).sum().item())
+    n_values = int(diff.numel())
+
+    p = pred.float()
+    t = target.float()
+    valid = mask[:, 0] > 0.5
+    pn = torch.linalg.vector_norm(p, dim=1)
+    tn = torch.linalg.vector_norm(t, dim=1)
+    valid = valid & (pn > eps) & (tn > eps)
+    if valid.any():
+        dot = (p * t).sum(dim=1)
+        cos = (
+            dot[valid] / (pn[valid] * tn[valid]).clamp_min(eps)
+        ).clamp(-1.0, 1.0)
+        angles = torch.acos(cos)
+        sam_sum = float(angles.double().sum().item())
+        sam_count = int(angles.numel())
+    else:
+        sam_sum = 0.0
+        sam_count = 0
+    return sse, n_values, sam_sum, sam_count
+
+
+def _metrics_from_sums(sse, n_values, sam_sum, sam_count, eps=1e-12):
+    if n_values <= 0:
+        return float("nan"), float("nan")
+    mse = sse / float(n_values)
+    psnr = -10.0 * math.log10(max(mse, eps))
+    sam = (
+        sam_sum / float(sam_count) * 180.0 / math.pi
+        if sam_count > 0
+        else float("nan")
+    )
+    return psnr, sam
+
+
+def _masked_metrics(pred, target, mask, eps=1e-12):
+    return _metrics_from_sums(
+        *_masked_metric_sums(pred, target, mask, eps=eps),
+        eps=eps,
+    )
 
 
 def _config(args):
@@ -300,7 +337,15 @@ def evaluate(
 ):
     model.eval()
     geometry_model.eval()
-    rows = []
+    ref_sse = 0.0
+    ref_values = 0
+    ref_sam_sum = 0.0
+    ref_sam_count = 0
+    phy_sum = 0.0
+    phy_weight = 0.0
+    msi_sum = 0.0
+    msi_weight = 0.0
+
     for batch in loader:
         gt_ref = batch["gt"].to(device)
         y_h = batch["lr_hsi"].to(device)
@@ -325,22 +370,43 @@ def evaluate(
         pred_ref = forward_warp(
             pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
         )
-        psnr, sam = _masked_metrics(pred_ref, gt_ref, mask_ref)
-        phy = float(
+        sse, n_values, sam_sum, sam_count = _masked_metric_sums(
+            pred_ref, gt_ref, mask_ref
+        )
+        ref_sse += sse
+        ref_values += n_values
+        ref_sam_sum += sam_sum
+        ref_sam_count += sam_count
+
+        lr_valid = _lr_mask(mask_ref)
+        phy_value = float(
             _masked_l1(
-                process.terminal_observation(pred), y_h, _lr_mask(mask_ref)
+                process.terminal_observation(pred), y_h, lr_valid
             ).item()
         )
+        lr_weight = float(lr_valid[:, 0].sum().item())
+        phy_sum += phy_value * lr_weight
+        phy_weight += lr_weight
+
         mask_msi = _mask_to_msi(mask_ref, rigid, local)
-        msi = float(
+        msi_value = float(
             _masked_l1(spectral_project(pred, srf), y_m, mask_msi).item()
         )
-        rows.append(
-            {"ref_psnr": psnr, "ref_sam": sam, "phy": phy, "msi": msi}
-        )
-    if not rows:
-        raise ValueError("empty validation loader")
-    return {k: mean(row[k] for row in rows) for k in rows[0]}
+        hr_weight = float(mask_msi[:, 0].sum().item())
+        msi_sum += msi_value * hr_weight
+        msi_weight += hr_weight
+
+    if ref_values <= 0:
+        raise ValueError("empty/invalid validation loader")
+    psnr, sam = _metrics_from_sums(
+        ref_sse, ref_values, ref_sam_sum, ref_sam_count
+    )
+    return {
+        "ref_psnr": psnr,
+        "ref_sam": sam,
+        "phy": phy_sum / max(phy_weight, 1.0),
+        "msi": msi_sum / max(msi_weight, 1.0),
+    }
 
 
 def main():

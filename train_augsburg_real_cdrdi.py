@@ -262,7 +262,8 @@ def real_geometry_loss(outputs: Dict[str, object], target: torch.Tensor, mask: t
     }
 
 
-def _estimate_batch(model, batch, *, p0, srf, radiometry, steps: int, device, augment_shift_px=0.0):
+def _estimate_batch(model, batch, *, p0, srf, radiometry, steps: int, device,
+                    augment_shift_px=0.0, update_mode="both"):
     lr_hsi = batch["lr_hsi"].to(device, non_blocking=True)
     hr_msi = batch["hr_msi"].to(device, non_blocking=True)
     if radiometry is not None:
@@ -277,7 +278,7 @@ def _estimate_batch(model, batch, *, p0, srf, radiometry, steps: int, device, au
         local = torch.zeros(batch_size, 2, height, width, device=device, dtype=hr_msi.dtype)
         hr_msi = forward_warp(hr_msi, delta[:, 0], delta[:, 1], angles, local)
     mask = _lr_mask(mask_hr)
-    outputs = model(target, hr_msi, p0, steps=steps)
+    outputs = model(target, hr_msi, p0, steps=steps, update_mode=update_mode)
     return target, mask, outputs
 
 

@@ -34,6 +34,10 @@ def parse_args():
     p.add_argument("--from_scratch", action="store_true", help="Required for strictly Wald-only CDRDI training")
     p.add_argument("--augment_shift_px", type=float, default=0.0,
                    help="Training-only random x/y shift of real MSI in 30 m Wald pixels; no flow labels")
+    p.add_argument("--initial_dx_px", type=float, default=-0.5,
+                   help="Wald physical initial x translation, in native 30m MSI pixels")
+    p.add_argument("--initial_dy_px", type=float, default=0.0,
+                   help="Wald physical initial y translation, in native 30m MSI pixels")
     p.add_argument("--geometry_checkpoint", default="", help="Trained Augsburg-Real C checkpoint for --stage test")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
@@ -145,6 +149,8 @@ def _assert_wald_checkpoint_settings(extra: dict, args, *, sigma: float) -> None
         "max_translation": args.max_translation,
         "max_rotation_deg": args.max_rotation_deg,
         "max_local_px": args.max_local_px,
+        "initial_dx_px": args.initial_dx_px,
+        "initial_dy_px": args.initial_dy_px,
     }
     for key, value in expected.items():
         observed = config.get(key)
@@ -161,8 +167,8 @@ def _assert_wald_checkpoint_settings(extra: dict, args, *, sigma: float) -> None
 def _selection_score(metrics: dict, args) -> float:
     norm = lambda x, cap: x / max(float(cap), 1e-6)
     motion = (
-        norm(metrics["dx_abs"], args.max_translation)
-        + norm(metrics["dy_abs"], args.max_translation)
+        norm(metrics["dx_residual_abs"], args.max_translation)
+        + norm(metrics["dy_residual_abs"], args.max_translation)
         + norm(metrics["theta_abs"], args.max_rotation_deg)
         + norm(metrics["local_mean"], args.max_local_px)
     )
@@ -226,9 +232,11 @@ def real_geometry_loss(outputs: Dict[str, object], target: torch.Tensor, mask: t
     jac = jacobian_determinant(local)
     jac_penalty = torch.relu(float(args.jac_margin) - jac).mean()
     rigid = outputs["final_rigid"]
+    # The calibrated lag is an initialization, not a ground-truth flow label.
+    # Regularize learned corrections instead of penalizing the necessary -0.5px offset.
     normalized_rigid = torch.stack(
-        (rigid[:, 0] / max(args.max_translation, 1e-6),
-         rigid[:, 1] / max(args.max_translation, 1e-6),
+        ((rigid[:, 0] - args.initial_dx_px) / max(args.max_translation, 1e-6),
+         (rigid[:, 1] - args.initial_dy_px) / max(args.max_translation, 1e-6),
          rigid[:, 2] / max(args.max_rotation_deg, 1e-6)), dim=1,
     )
     rigid_penalty = normalized_rigid.square().mean()
@@ -316,8 +324,9 @@ def train_one_epoch(model, loader, optimizer, *, p0, srf, radiometry, args, devi
 def evaluate(model, loader, *, p0, srf, radiometry, args, device):
     model.eval()
     keys = (
-        "initial_norm", "norm", "grad", "raw",
-        "dx_abs", "dy_abs", "theta_abs", "local_mean",
+        "unaligned_norm", "initial_norm", "norm", "grad", "raw",
+        "dx_mean", "dy_mean", "dx_abs", "dy_abs",
+        "dx_residual_abs", "dy_residual_abs", "theta_abs", "local_mean",
     )
     sums = {key: 0.0 for key in keys}
     total_weight = 0.0
@@ -334,21 +343,29 @@ def evaluate(model, loader, *, p0, srf, radiometry, args, device):
         )
         _, parts = real_geometry_loss(outputs, target, mask, args)
         initial = outputs["initial_prediction"]
+        unaligned = outputs["unaligned_prediction"]
         initial_n = _local_standardize(initial, args.local_window)
+        unaligned_n = _local_standardize(unaligned, args.local_window)
         target_n = _local_standardize(target, args.local_window)
         initial_norm = float(_charbonnier(target_n - initial_n, mask).item())
+        unaligned_norm = float(_charbonnier(target_n - unaligned_n, mask).item())
         rigid = outputs["final_rigid"]
         local = outputs["final_local_field"]
         weight = float(mask[:, 0].sum().item())
         if weight <= 0.0:
             continue
         values = {
+            "unaligned_norm": unaligned_norm,
             "initial_norm": initial_norm,
             "norm": float(parts["norm"].item()),
             "grad": float(parts["grad"].item()),
             "raw": float(parts["raw"].item()),
+            "dx_mean": float(rigid[:, 0].mean().item()),
+            "dy_mean": float(rigid[:, 1].mean().item()),
             "dx_abs": float(rigid[:, 0].abs().mean().item()),
             "dy_abs": float(rigid[:, 1].abs().mean().item()),
+            "dx_residual_abs": float((rigid[:, 0] - args.initial_dx_px).abs().mean().item()),
+            "dy_residual_abs": float((rigid[:, 1] - args.initial_dy_px).abs().mean().item()),
             "theta_abs": float(rigid[:, 2].abs().mean().item()),
             "local_mean": float(
                 torch.linalg.vector_norm(local, dim=1).mean().item()
@@ -362,8 +379,14 @@ def evaluate(model, loader, *, p0, srf, radiometry, args, device):
         raise ValueError("empty/invalid validation loader")
     out = {key: sums[key] / total_weight for key in keys}
     out["min_jac"] = min_jac
-    out["closure_reduction"] = (
+    out["seed_reduction"] = (
+        1.0 - out["initial_norm"] / max(out["unaligned_norm"], 1e-12)
+    )
+    out["residual_reduction"] = (
         1.0 - out["norm"] / max(out["initial_norm"], 1e-12)
+    )
+    out["closure_reduction"] = (
+        1.0 - out["norm"] / max(out["unaligned_norm"], 1e-12)
     )
     return out
 
@@ -376,6 +399,11 @@ def main():
     if is_wald:
         if not 0.0 <= args.augment_shift_px <= 0.75:
             raise ValueError("Wald augment_shift_px must be in [0,0.75] 30m MSI pixels")
+        if (abs(args.initial_dx_px) > args.max_translation
+            or abs(args.initial_dy_px) > args.max_translation):
+            raise ValueError("Wald initial rigid offset exceeds max_translation")
+        if abs(args.initial_dx_px) > 1.5 or abs(args.initial_dy_px) > 1.5:
+            raise ValueError("Wald initial rigid offset must remain within +/-1.5 30m pixels")
         if args.psf_json == "./data/calibration/AugsburgReal_effective_psf.json":
             args.psf_json = os.path.join(args.cache_root, "wald_psf.json")
         if args.radiometry_json == "./data/calibration/AugsburgReal_radiometry.json":
@@ -396,8 +424,12 @@ def main():
             raise ValueError("Wald-CDRDI selection_min_jac must be >= 0.5")
         if args.resume:
             _wald_checkpoint_guard(args.resume, stage="resume")
-    elif args.from_scratch and args.init_checkpoint:
-        raise ValueError("--from_scratch and --init_checkpoint are mutually exclusive")
+    else:
+        # Legacy Real-C must retain its original zero-initialized geometry.
+        args.initial_dx_px = 0.0
+        args.initial_dy_px = 0.0
+        if args.from_scratch and args.init_checkpoint:
+            raise ValueError("--from_scratch and --init_checkpoint are mutually exclusive")
     if args.stage == "test" and is_wald and not args.geometry_checkpoint:
         raise ValueError("--stage test requires a Wald --geometry_checkpoint")
     sigma = _load_sigma(args.psf_json)
@@ -429,6 +461,8 @@ def main():
         max_translation=args.max_translation,
         max_rotation_deg=args.max_rotation_deg,
         max_local_px=args.max_local_px,
+        initial_dx_px=args.initial_dx_px,
+        initial_dy_px=args.initial_dy_px,
     ).to(device)
     if args.stage == "test":
         if not args.geometry_checkpoint:
@@ -450,11 +484,14 @@ def main():
         )
         print(
             "FINAL_REAL_C "
+            f"IDENTITY_NORM={metrics['unaligned_norm']:.8f} "
             f"INIT_NORM={metrics['initial_norm']:.8f} "
             f"FINAL_NORM={metrics['norm']:.8f} "
+            f"SEED_REDUCTION={100*metrics['seed_reduction']:.3f}% "
+            f"RESIDUAL_REDUCTION={100*metrics['residual_reduction']:.3f}% "
             f"REDUCTION={100*metrics['closure_reduction']:.3f}% "
             f"RAW={metrics['raw']:.8f} MIN_JAC={metrics['min_jac']:.6f} "
-            f"DX={metrics['dx_abs']:.4f} DY={metrics['dy_abs']:.4f} "
+            f"DX={metrics['dx_mean']:.4f} DY={metrics['dy_mean']:.4f} "
             f"THETA={metrics['theta_abs']:.4f} LOCAL={metrics['local_mean']:.4f}"
         )
         return
@@ -481,8 +518,10 @@ def main():
         os.path.join(args.log_root, args.save_name + ".csv"),
         [
             "epoch", "train_loss", "train_norm", "train_grad", "train_raw",
-            "val_initial_norm", "val_norm", "val_grad", "val_raw",
-            "val_closure_reduction", "val_min_jac", "dx_abs", "dy_abs",
+            "val_unaligned_norm", "val_initial_norm", "val_norm", "val_grad", "val_raw",
+            "val_seed_reduction", "val_residual_reduction", "val_closure_reduction",
+            "val_min_jac", "dx_mean", "dy_mean", "dx_abs", "dy_abs",
+            "dx_residual_abs", "dy_residual_abs",
             "theta_abs", "local_mean", "val_selection_score",
             "selection_accepted", "best_val_score",
         ],
@@ -505,6 +544,7 @@ def main():
         f"calibration={args.radiometry_json} train_patch={args.train_patch_size} "
         f"train_stride={args.train_stride} eval_patch={args.eval_patch_size} "
         f"geometry_caps=({args.max_translation},{args.max_rotation_deg},{args.max_local_px}) "
+        f"init_dx_px={args.initial_dx_px} init_dy_px={args.initial_dy_px} "
         f"augmentation={args.augment_shift_px} MSI_30m_pixels "
     )
     print(
@@ -549,10 +589,13 @@ def main():
         )
         print(
             "REAL_C_VAL "
+            f"IDENTITY_NORM={va['unaligned_norm']:.8f} "
             f"INIT_NORM={va['initial_norm']:.8f} FINAL_NORM={va['norm']:.8f} "
+            f"SEED_REDUCTION={100*va['seed_reduction']:.3f}% "
+            f"RESIDUAL_REDUCTION={100*va['residual_reduction']:.3f}% "
             f"REDUCTION={100*va['closure_reduction']:.3f}% RAW={va['raw']:.8f} "
-            f"MIN_JAC={va['min_jac']:.6f} DX={va['dx_abs']:.4f} "
-            f"DY={va['dy_abs']:.4f} THETA={va['theta_abs']:.4f} "
+            f"MIN_JAC={va['min_jac']:.6f} DX={va['dx_mean']:.4f} "
+            f"DY={va['dy_mean']:.4f} THETA={va['theta_abs']:.4f} "
             f"LOCAL={va['local_mean']:.4f}"
         )
         score = _selection_score(va, args) if is_wald else va["norm"]
@@ -568,13 +611,20 @@ def main():
                 "train_norm": tr["norm"],
                 "train_grad": tr["grad"],
                 "train_raw": tr["raw"],
+                "val_unaligned_norm": va["unaligned_norm"],
                 "val_initial_norm": va["initial_norm"],
                 "val_norm": va["norm"],
                 "val_grad": va["grad"],
                 "val_raw": va["raw"],
+                "val_seed_reduction": va["seed_reduction"],
+                "val_residual_reduction": va["residual_reduction"],
                 "val_closure_reduction": va["closure_reduction"],
                 "val_min_jac": va["min_jac"],
+                "dx_mean": va["dx_mean"],
+                "dy_mean": va["dy_mean"],
                 "dx_abs": va["dx_abs"],
+                "dx_residual_abs": va["dx_residual_abs"],
+                "dy_residual_abs": va["dy_residual_abs"],
                 "dy_abs": va["dy_abs"],
                 "theta_abs": va["theta_abs"],
                 "local_mean": va["local_mean"],
@@ -602,6 +652,8 @@ def main():
                         "max_translation": args.max_translation,
                         "max_rotation_deg": args.max_rotation_deg,
                         "max_local_px": args.max_local_px,
+                        "initial_dx_px": args.initial_dx_px,
+                        "initial_dy_px": args.initial_dy_px,
                     },
                     "observable_monitor": "local_normalized_closure",
                     "effective_sigma": sigma,

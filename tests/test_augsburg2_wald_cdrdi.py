@@ -9,6 +9,11 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+import torch
+import torch.nn.functional as F
+
+from cdrdi_geometry import forward_warp
+from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
 from train_augsburg_real_cdrdi import (
     _assert_wald_checkpoint_settings,
     _selection_score,
@@ -26,6 +31,8 @@ class WaldCDRDITests(unittest.TestCase):
             max_translation=1.0,
             max_rotation_deg=0.5,
             max_local_px=0.5,
+            initial_dx_px=-0.5,
+            initial_dy_px=0.0,
             selection_lambda_geometry=0.005,
             selection_min_jac=0.5,
             selection_max_motion_fraction=0.9,
@@ -37,6 +44,7 @@ class WaldCDRDITests(unittest.TestCase):
         return {
             "norm": 0.1, "min_jac": 0.9,
             "dx_abs": 0.5, "dy_abs": 0.1,
+            "dx_residual_abs": 0.0, "dy_residual_abs": 0.1,
             "theta_abs": 0.1, "local_mean": 0.05,
         }
 
@@ -79,6 +87,7 @@ class WaldCDRDITests(unittest.TestCase):
                 "base_channels": 32, "control_grid": 5,
                 "max_translation": 1.0,
                 "max_rotation_deg": 0.5, "max_local_px": 0.5,
+                "initial_dx_px": -0.5, "initial_dy_px": 0.0,
             },
             "effective_sigma": 1.2,
             "radiometry_json": args.radiometry_json,
@@ -90,6 +99,41 @@ class WaldCDRDITests(unittest.TestCase):
             ), sigma=1.2)
         with self.assertRaisesRegex(ValueError, "PSF"):
             _assert_wald_checkpoint_settings(extra, args, sigma=1.3)
+        with self.assertRaisesRegex(ValueError, "initial_dx_px"):
+            _assert_wald_checkpoint_settings(extra, SimpleNamespace(
+                **{**vars(args), "initial_dx_px": 0.0}
+            ), sigma=1.2)
+
+    def test_initial_minus_half_pixel_shift_matches_sampler_sign(self):
+        torch.manual_seed(5)
+        msi = torch.rand(1, 4, 18, 18)
+        delta_x = torch.tensor([-0.5])
+        zeros = torch.zeros(1)
+        local = torch.zeros(1, 2, 18, 18)
+
+        class SimplePool:
+            @staticmethod
+            def degrade(x):
+                return F.avg_pool2d(x, 3, 3)
+
+        target = SimplePool.degrade(forward_warp(msi, delta_x, zeros, zeros, local))
+        solver = LearnedPhysicalResidualSolver(
+            4, base_channels=8, max_translation=1.0,
+            max_rotation_deg=0.5, max_local_px=0.5,
+            initial_dx_px=-0.5,
+        ).eval()
+        with torch.no_grad():
+            result = solver(target, msi, SimplePool(), steps=1)
+        initial_error = (result["initial_prediction"] - target).abs().max().item()
+        zero_error = (result["unaligned_prediction"] - target).abs().mean().item()
+        self.assertLess(initial_error, 1e-6)
+        self.assertGreater(zero_error, 1e-4)
+        self.assertAlmostEqual(result["final_rigid"][0, 0].item(), -0.5, delta=0.1)
+
+    def test_legacy_default_starts_at_zero(self):
+        model = LearnedPhysicalResidualSolver(4, base_channels=8)
+        self.assertEqual(model.initial_dx_px, 0.0)
+        self.assertEqual(model.initial_dy_px, 0.0)
 
 
 if __name__ == "__main__":

@@ -294,7 +294,14 @@ class LearnedPhysicalResidualSolver(nn.Module):
         spatial_operator,
         *,
         steps: int = 1,
+        update_mode: str = "both",
     ) -> Dict[str, object]:
+        # Ablation acts on every recursive proposal, BEFORE the next residual
+        # is computed.  All modes preserve the calibrated physical seed.
+        if update_mode not in ("both", "rigid_only", "local_only", "seed_only"):
+            raise ValueError(
+                "update_mode must be both, rigid_only, local_only, or seed_only"
+            )
         if steps < 1:
             raise ValueError("steps must be >=1")
         if target_lr_msi.ndim != 4 or hr_msi.ndim != 4:
@@ -340,7 +347,17 @@ class LearnedPhysicalResidualSolver(nn.Module):
                 sample_y,
                 (h, w),
             )
-            delta_rigid, delta_control = self.update_net(features)
+            if update_mode == "seed_only":
+                # Skip learned updates entirely; the initial -0.5 px state
+                # is propagated unchanged as an explicit fixed-seed control.
+                delta_rigid = torch.zeros_like(rigid)
+                delta_control = torch.zeros_like(control)
+            else:
+                delta_rigid, delta_control = self.update_net(features)
+                if update_mode == "rigid_only":
+                    delta_control = torch.zeros_like(delta_control)
+                elif update_mode == "local_only":
+                    delta_rigid = torch.zeros_like(delta_rigid)
             rigid, control = self._update_state(
                 rigid, control, delta_rigid, delta_control, (h, w)
             )

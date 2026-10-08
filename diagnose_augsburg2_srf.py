@@ -159,6 +159,90 @@ def _geometry_lag_diagnostics(hproj, msi, mask):
     return result
 
 
+def _heldout_fractional_lag_test(hproj, msi, train, heldout, valid, step=0.5):
+    """Fit a shared 30m-grid offset on TRAIN and report its effect on HOLDOUT.
+
+    Compare candidate shifts on precisely the same eroded mask to avoid
+    gaining correlation by excluding difficult pixels or selecting edges.
+    Each candidate obtains its own training-only affine radiometry fit.
+    This is only a diagnostic; it neither warps cached MSI nor edits SRF.
+    """
+    from scipy.ndimage import map_coordinates, minimum_filter
+
+    h, w, channels = hproj.shape
+    if hproj.shape != msi.shape or channels != 4:
+        raise ValueError("Lag diagnostic needs matched HxWx4 projection and MSI")
+    # Safe for bilinear sampling anywhere within +/- 1 LR pixel.
+    safe = minimum_filter(valid.astype(np.uint8), size=3, mode="constant",
+                          cval=0).astype(bool)
+    tr, ho = train & safe, heldout & safe
+    if int(tr.sum()) < 100 or int(ho.sum()) < 100:
+        print(f"SRF_LAG_HOLD_SKIPPED train={int(tr.sum())} holdout={int(ho.sum())}")
+        return {"status": "insufficient_safe_pixels",
+                "train_pixels": int(tr.sum()), "holdout_pixels": int(ho.sum())}
+
+    ys, xs = np.indices((h, w), dtype=np.float64)
+    offsets = np.arange(-1., 1. + step / 2., step, dtype=np.float64)
+    predictions = {}
+    best = {"dy": 0., "dx": 0., "train_mean_corr": -float("inf")}
+    for dy in offsets:
+        for dx in offsets:
+            shifted = np.stack([
+                map_coordinates(msi[..., band], [ys + dy, xs + dx],
+                                order=1, mode="nearest", prefilter=False)
+                for band in range(4)
+            ], axis=-1)
+            mean_corr = float(np.mean([
+                _pearson(shifted[..., band][tr], hproj[..., band][tr])
+                for band in range(4)
+            ]))
+            if not np.isfinite(mean_corr):
+                continue
+            predictions[(float(dy), float(dx))] = shifted
+            if mean_corr > best["train_mean_corr"]:
+                best = {"dy": float(dy), "dx": float(dx),
+                        "train_mean_corr": mean_corr}
+    if not predictions:
+        raise ValueError("No finite candidates for 30m subpixel lag diagnosis")
+
+    aligned = predictions[(best["dy"], best["dx"])]
+    unaligned = predictions[(0., 0.)]
+    band_report = []
+    for b, name in enumerate(NAMES):
+        ref = hproj[..., b]
+        x0 = unaligned[..., b]
+        x1 = aligned[..., b]
+        g0, z0 = _fit_affine(x0[tr], ref[tr])
+        g1, z1 = _fit_affine(x1[tr], ref[tr])
+        base = _metrics(x0[ho], ref[ho], g0, z0)
+        moved = _metrics(x1[ho], ref[ho], g1, z1)
+        record = {
+            "band": name, "baseline": base, "candidate": moved,
+            "holdout_corr_gain": float(moved["corr"] - base["corr"]),
+            "holdout_rmse_reduction": float(
+                (base["rmse_after_affine"] - moved["rmse_after_affine"])
+                / max(base["rmse_after_affine"], 1e-12)
+            ),
+        }
+        band_report.append(record)
+        print(
+            f"SRF_LAG_HOLD {name} SHIFT_30M=({best['dy']:.2f},{best['dx']:.2f}) "
+            f"CORR_0={base['corr']:.6f} CORR_SHIFT={moved['corr']:.6f} "
+            f"CORR_GAIN={record['holdout_corr_gain']:.6f} "
+            f"RMSE_0={base['rmse_after_affine']:.8f} "
+            f"RMSE_SHIFT={moved['rmse_after_affine']:.8f} "
+            f"RMSE_REDUCTION={record['holdout_rmse_reduction']:.5f}"
+        )
+    result = {
+        "status": "ok", "selected_on": "stable_train_pixels",
+        "evaluated_on": "disjoint_spatial_holdout_same_eroded_mask",
+        "best_global_shift_lr_pixels": best,
+        "train_pixels": int(tr.sum()), "holdout_pixels": int(ho.sum()),
+        "bands": band_report,
+    }
+    return result
+
+
 def _warped_srf(original_csv, column, wavelengths, widths, center, shift_nm, width_factor):
     # Physical, smooth shift/stretch of measured instrument response, never
     # independently adjust 242 individual SRF coefficients.
@@ -221,6 +305,9 @@ def main():
         hsi, msi, valid, args.train_fraction, args.stable_fraction
     )
     lag = _geometry_lag_diagnostics(ref, msi, valid)
+    heldout_lag = _heldout_fractional_lag_test(
+        ref, msi, train, val, valid, step=0.5
+    )
     csv_path, columns, protocol = _resolve_official_csv(args)
     with open(os.path.join(full, "meta.json"), "r", encoding="utf-8") as f:
         full_meta = json.load(f)
@@ -265,6 +352,7 @@ def main():
         "region2_s2_source": s2_source,
         "region2_s2_band_indexes": full_meta.get("s2_indexes"),
         "registration_shift_diagnostic": lag,
+        "registration_fractional_holdout_diagnostic": heldout_lag,
         "original": [],
         "candidates": [],
     }
@@ -325,6 +413,18 @@ def main():
     candidate_gains = [r["gain"] for r in report["original"]]
     candidate_biases = [r["bias"] for r in report["original"]]
     if args.mode == "fit":
+        if heldout_lag.get("status") == "ok":
+            geometry_warning_bands = [
+                row["band"] for row in heldout_lag["bands"]
+                if row["holdout_corr_gain"] > 0.005
+                and row["holdout_rmse_reduction"] > 0.005
+            ]
+            if len(geometry_warning_bands) >= 2:
+                raise ValueError(
+                    "Holdout test supports a common spatial offset in "
+                    f"{geometry_warning_bands}. Resolve geometry/radiometry "
+                    "before fitting SRF; active SRF has not been changed."
+                )
         if region_platform in ("S2A", "S2B", "S2C") and cached_platform != region_platform:
             raise ValueError(
                 "Cannot fit: Region-2 platform does not match the cached SRF satellite"

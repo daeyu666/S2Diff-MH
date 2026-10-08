@@ -69,8 +69,15 @@ def make_command(args):
             "--guard_relative_gain", "0.0001",
         ]
     if args.stage == "train":
-        common.append("--from_scratch")
+        if args.resume_last:
+            common += ["--resume", os.path.join(
+                args.checkpoint_root, f"Augsburg2_Wald_D2_{branch}_last.pth"
+            )]
+        else:
+            common.append("--from_scratch")
     else:
+        if args.resume_last:
+            raise ValueError("--resume_last only applies to --stage train")
         common += [
             "--diffusion_checkpoint", os.path.join(
                 args.checkpoint_root, f"Augsburg2_Wald_D2_{branch}.pth"
@@ -99,6 +106,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dry_run", action="store_true")
+    p.add_argument("--resume_last", action="store_true",
+                   help="Resume from branch-specific _last checkpoint without restarting")
     return p.parse_args()
 
 
@@ -114,6 +123,12 @@ def main():
                 "Frozen strictly Wald-trained CDRDI checkpoint is required: "
                 + args.geometry_checkpoint
             )
+        if args.stage == "train" and args.resume_last:
+            resume_path = os.path.join(
+                args.checkpoint_root, f"Augsburg2_Wald_D2_{args.branch}_last.pth"
+            )
+            if not os.path.isfile(resume_path):
+                raise FileNotFoundError(resume_path)
         if args.stage == "test":
             check_path = os.path.join(
                 args.checkpoint_root, f"Augsburg2_Wald_D2_{args.branch}.pth"

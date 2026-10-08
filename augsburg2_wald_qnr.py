@@ -150,10 +150,27 @@ def evaluate_cache(wald_root, fused, radiometry_json,
     from train_augsburg_real_cdrdi import _wald_metadata
     if not _wald_metadata(str(root)):
         raise ValueError("Expected strict Augsburg-2 Wald provenance in train/validation/test")
+    # Match UAFL's require_wald checks for PSF/SRF origin and dimensions.
+    with (root/"wald_psf.json").open(encoding="utf-8") as f:
+        psf = json.load(f)
+    if int(psf.get("scale_ratio", -1)) != 3:
+        raise ValueError("Expected Wald x3 operator metadata")
+    cached_srf = np.load(root/"srf_weights.npy")
+    if cached_srf.shape != (4, 242) or not np.isfinite(cached_srf).all():
+        raise ValueError("Invalid observed sensor SRF shape")
+
+    # Match UAFL's read_radiometry contract.  Calibration is frozen, has
+    # not used an EnMAP10 reference, and must not be re-estimated here.
     with Path(radiometry_json).open(encoding="utf-8") as f:
         radiometry = json.load(f)
-    gain = np.asarray(radiometry["gain"], dtype=np.float64)
-    bias = np.asarray(radiometry["bias"], dtype=np.float64)
+    if (radiometry.get("dataset") != "Augsburg-2-Wald"
+        or radiometry.get("uses_EnMAP10_reference") is not False):
+        raise ValueError("Require train-only Augsburg2_Wald_radiometry.json (no EnMAP10)")
+    gain = np.asarray(radiometry["gain"], dtype=np.float32)
+    bias = np.asarray(radiometry["bias"], dtype=np.float32)
+    if (gain.shape != (4,) or bias.shape != (4,)
+        or not np.isfinite(gain).all() or not np.isfinite(bias).all()):
+        raise ValueError("Radiometry requires 4 finite gains and biases")
     return projected_qnr(
         np.load(fused,mmap_mode="r"),
         np.load(root/"full"/"lr_hsi.npy",mmap_mode="r"),

@@ -49,8 +49,8 @@ def parse_args():
                    help="UIQI window on original 10m grid (matches UAFL)")
     p.add_argument("--qnr_min_valid_fraction", type=float, default=0.8,
                    help="Minimum valid fraction per non-overlapping UIQI window")
-    p.add_argument("--pan_hr", default="", help="Optional real 10m PAN npy; requires --pan_lr")
-    p.add_argument("--pan_lr", default="", help="Optional MTF-matched 30m PAN npy; requires --pan_hr")
+    p.add_argument("--qnr_support_fraction", type=float, default=0.01,
+                   help="SRF relative-to-peak threshold for MSI-covered HSI bands")
     return p.parse_args()
 
 
@@ -202,19 +202,18 @@ def main():
             args.wald_root, output_path, args.radiometry_json,
             window_hr=args.qnr_window_hr,
             min_valid_fraction=args.qnr_min_valid_fraction,
-            pan_hr=args.pan_hr or None,
-            pan_lr=args.pan_lr or None,
+            support_fraction=args.qnr_support_fraction,
         )
         qnr_json = os.path.join(args.save_root, "Augsburg2_Wald_full_QNR.json")
         with open(qnr_json, "w", encoding="utf-8") as f:
             json.dump(qnr, f, ensure_ascii=False, indent=2)
         print(
-            f"S2DIFF_MH_WALD_STANDARD_FORM_QNR "
+            f"S2DIFF_MH_WALD_HSI_MSI_QNR "
             f"QNR={qnr['QNR']:.6f} "
             f"Dlambda={qnr['Dlambda']:.6f} "
             f"Ds={qnr['Ds']:.6f} "
-            f"PAN_ORIGIN={qnr['pan_origin']} "
-            f"GENUINE_PAN={qnr['is_genuine_pan']} QNR_JSON={qnr_json}"
+            f"SPECTRAL_REFERENCE=242_band_LR_HSI "
+            f"SPATIAL_REFERENCE=original_HR_MSI QNR_JSON={qnr_json}"
         )
 
     if args.write_tif:

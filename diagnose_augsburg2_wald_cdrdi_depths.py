@@ -51,6 +51,8 @@ def parse_args():
     p.add_argument("--local_window", type=int, default=5)
     p.add_argument("--depths", default="0,1,3,6,9",
                    help="Comma-separated depths. A single max-depth pass supplies all intermediate states")
+    p.add_argument("--modes", default="both",
+                   help="Comma-separated per-iteration modes: both,rigid_only,local_only,seed_only")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--output_csv", default="./logs/augsburg_real/Augsburg2_Wald_C_depth_diagnostic.csv")
@@ -64,6 +66,14 @@ def parse_depths(value: str):
     if not depths or depths[0] < 0 or depths[-1] > 64:
         raise ValueError("--depths must specify integers from 0 through 64")
     return depths
+
+
+def parse_modes(value: str):
+    allowed = ("both", "rigid_only", "local_only", "seed_only")
+    modes = list(dict.fromkeys(m.strip() for m in value.split(",") if m.strip()))
+    if not modes or any(mode not in allowed for mode in modes):
+        raise ValueError("modes must be chosen from: " + ",".join(allowed))
+    return modes
 
 
 def _closure_values(target, prediction, mask, *, window):
@@ -107,7 +117,7 @@ def _new_record():
 
 
 def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
-                          local_window=5, tile_positions=None):
+                          local_window=5, tile_positions=None, update_mode="both"):
     """Evaluate identity, seed (depth 0), and recursively updated states.
 
     All rows use the exact same LR observation, MSI, ROI mask, and tile weighting.
@@ -134,6 +144,7 @@ def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
             target, mask, outputs = _estimate_batch(
                 model, batch, p0=p0, srf=srf, radiometry=radiometry,
                 steps=eval_steps, device=device, augment_shift_px=0.0,
+                update_mode=update_mode,
             )
             weight = float(mask[:, 0].sum().item())
             if weight <= 0:
@@ -180,6 +191,7 @@ def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
                 if tile_positions is not None:
                     top, left, ph, pw = tile_positions[tile_index]
                     tiles_out.append({
+                        "mode": update_mode,
                         "tile": tile_index, "top": top, "left": left,
                         "height": ph, "width": pw, "depth": d,
                         "norm": close["norm"], "raw": close["raw"],
@@ -225,6 +237,7 @@ def _write_csv(path, rows):
 def main():
     args = parse_args()
     depths = parse_depths(args.depths)
+    modes = parse_modes(args.modes)
     if 0 not in depths:
         raise ValueError("--depths must include 0 for the -0.5px seed comparison")
     if args.eval_patch_size % 3:
@@ -287,47 +300,81 @@ def main():
         f"wald_sigma={sigma} valid_tiles={len(dataset)} "
         "augmentation=False spatial_split=validation"
     )
-    rows, tile_rows = collect_depth_metrics(
-        model, loader, p0=p0, srf=srf, radiometry=radiometry,
-        depths=depths, device=device, local_window=args.local_window,
-        tile_positions=dataset.samples if args.per_tile_csv else None,
-    )
-    for depth in ("identity", *depths):
-        m = rows[depth]
-        print(
-            f"CDRDI_DEPTH step={depth} NORM={m['norm']:.8f} RAW={m['raw']:.8f} "
-            f"GRAD={m['grad']:.8f} "
-            f"REDUCTION={m['reduction_vs_identity_pct']:+.3f}% "
-            f"RESIDUAL_REDUCTION={m['reduction_vs_seed_pct']:+.3f}% "
-            f"DX={m['dx']:+.4f} DY={m['dy']:+.4f} "
-            f"DELTA_DX={m['delta_dx']:+.4f} DELTA_DY={m['delta_dy']:+.4f} "
-            f"THETA={m['theta']:+.4f} LOCAL_MEAN={m['local_mean']:.4f} "
-            f"LOCAL_MAX={m['local_max']:.4f} MIN_JAC={m['min_jac']:.5f} "
-            f"WIN_RATE={m['win_rate_vs_seed']:.2f}%"
+    all_rows = {}
+    combined = []
+    all_tile_rows = []
+    for mode in modes:
+        rows, tile_rows = collect_depth_metrics(
+            model, loader, p0=p0, srf=srf, radiometry=radiometry,
+            depths=depths, device=device, local_window=args.local_window,
+            tile_positions=dataset.samples if args.per_tile_csv else None,
+            update_mode=mode,
         )
-    ordered = [rows[depth] for depth in ("identity", *depths)]
-    _write_csv(args.output_csv, ordered)
+        all_rows[mode] = rows
+        all_tile_rows.extend(tile_rows)
+        for depth in ("identity", *depths):
+            m = rows[depth]
+            # Keep the original CDRDI_DEPTH prefix for a single default run.
+            tag = "CDRDI_DEPTH" if modes == ["both"] else "CDRDI_BRANCH"
+            mode_info = "" if modes == ["both"] else f"mode={mode} "
+            print(
+                f"{tag} {mode_info}step={depth} NORM={m['norm']:.8f} RAW={m['raw']:.8f} "
+                f"GRAD={m['grad']:.8f} "
+                f"REDUCTION={m['reduction_vs_identity_pct']:+.3f}% "
+                f"RESIDUAL_REDUCTION={m['reduction_vs_seed_pct']:+.3f}% "
+                f"DX={m['dx']:+.4f} DY={m['dy']:+.4f} "
+                f"DELTA_DX={m['delta_dx']:+.4f} DELTA_DY={m['delta_dy']:+.4f} "
+                f"THETA={m['theta']:+.4f} LOCAL_MEAN={m['local_mean']:.4f} "
+                f"LOCAL_MAX={m['local_max']:.4f} MIN_JAC={m['min_jac']:.5f} "
+                f"WIN_RATE={m['win_rate_vs_seed']:.2f}%"
+            )
+            combined.append({"mode": mode, **m})
+        positive = [d for d in depths if d > 0]
+        best_depth = min(depths, key=lambda d: rows[d]["norm"])
+        harmful = [d for d in positive if rows[d]["norm"] >= rows[0]["norm"]]
+        first_harmful = min(harmful) if harmful else None
+        print(
+            f"CDRDI_DEPTH_SUMMARY mode={mode} best_depth={best_depth} "
+            f"first_harmful_tested_depth={first_harmful} "
+            f"seed_reduction={rows[0]['reduction_vs_identity_pct']:+.3f}% "
+            f"best_residual_reduction={rows[best_depth]['reduction_vs_seed_pct']:+.3f}%"
+        )
+        if best_depth == 0:
+            print(f"DIAGNOSIS mode={mode} result=NO_TESTED_RECURSIVE_DEPTH_BEATS_SEED")
+        elif first_harmful is not None:
+            print(f"DIAGNOSIS mode={mode} result=RECURSION_CAN_OVER_CORRECT")
+        else:
+            print(f"DIAGNOSIS mode={mode} result=ALL_TESTED_DEPTHS_BEAT_SEED")
+
+    # Modes are evaluated independently on the exact same deterministic
+    # validation data. Baseline equality is a mandatory fairness assertion.
+    baseline = all_rows[modes[0]]
+    for mode in modes[1:]:
+        for control in ("identity", 0):
+            if abs(all_rows[mode][control]["norm"] - baseline[control]["norm"]) > 1e-7:
+                raise RuntimeError(
+                    f"Ablation mismatch: {mode} and {modes[0]} differ at baseline {control}"
+                )
+        for d in depths:
+            if all_rows[mode][d]["valid_lr_pixels"] != baseline[d]["valid_lr_pixels"]:
+                raise RuntimeError(f"Ablation used different validation pixels: {mode} depth={d}")
+    _write_csv(args.output_csv, combined)
     print(f"CDRDI_DEPTH_CSV={os.path.abspath(args.output_csv)}")
     if args.per_tile_csv:
-        _write_csv(args.per_tile_csv, tile_rows)
+        _write_csv(args.per_tile_csv, all_tile_rows)
         print(f"CDRDI_TILE_CSV={os.path.abspath(args.per_tile_csv)}")
 
-    positive = [d for d in depths if d > 0]
-    best_depth = min(depths, key=lambda d: rows[d]["norm"])
-    harmful = [d for d in positive if rows[d]["norm"] >= rows[0]["norm"]]
-    first_harmful = min(harmful) if harmful else None
-    print(
-        f"CDRDI_DEPTH_SUMMARY best_depth={best_depth} "
-        f"first_harmful_tested_depth={first_harmful} "
-        f"seed_reduction={rows[0]['reduction_vs_identity_pct']:+.3f}% "
-        f"best_residual_reduction={rows[best_depth]['reduction_vs_seed_pct']:+.3f}%"
-    )
-    if best_depth == 0:
-        print("DIAGNOSIS=NO_TESTED_RECURSIVE_DEPTH_BEATS_SEED")
-    elif first_harmful is not None:
-        print("DIAGNOSIS=SOME_DEPTHS_BEAT_SEED_BUT_RECURSION_CAN_OVER_CORRECT")
-    else:
-        print("DIAGNOSIS=ALL_TESTED_DEPTHS_BEAT_SEED_CHECK_FULL_RECONSTRUCTION")
+    if len(modes) > 1:
+        for d in (depth for depth in depths if depth > 0):
+            ranked = sorted(modes, key=lambda mode: all_rows[mode][d]["norm"])
+            best = ranked[0]
+            print(
+                f"CDRDI_BRANCH_RANK step={d} best_mode={best} "
+                f"best_norm={all_rows[best][d]['norm']:.8f} "
+                f"best_residual_reduction={all_rows[best][d]['reduction_vs_seed_pct']:+.3f}% "
+                f"ranking={','.join(ranked)}"
+            )
+        print("CDRDI_ABLATION_NOTE=branch ablation is diagnostic only; do not select using test data")
 
 
 if __name__ == "__main__":

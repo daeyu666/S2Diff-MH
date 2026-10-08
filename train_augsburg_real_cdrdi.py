@@ -137,6 +137,27 @@ def _wald_checkpoint_guard(path: str, *, stage: str) -> dict:
     return extra
 
 
+def _assert_wald_checkpoint_settings(extra: dict, args, *, sigma: float) -> None:
+    config = extra.get("geometry_config", {})
+    expected = {
+        "base_channels": args.base_channels,
+        "control_grid": args.control_grid,
+        "max_translation": args.max_translation,
+        "max_rotation_deg": args.max_rotation_deg,
+        "max_local_px": args.max_local_px,
+    }
+    for key, value in expected.items():
+        observed = config.get(key)
+        if observed is None or abs(float(observed) - float(value)) > 1e-7:
+            raise ValueError(
+                f"Wald-CDRDI checkpoint {key}={observed} does not match requested {value}"
+            )
+    if abs(float(extra.get("effective_sigma", -1)) - float(sigma)) > 1e-7:
+        raise ValueError("Wald-CDRDI checkpoint PSF does not match Wald PSF file")
+    if os.path.normpath(extra.get("radiometry_json", "")) != os.path.normpath(args.radiometry_json):
+        raise ValueError("Wald-CDRDI checkpoint radiometry file does not match training")
+
+
 def _selection_score(metrics: dict, args) -> float:
     norm = lambda x, cap: x / max(float(cap), 1e-6)
     motion = (
@@ -353,6 +374,8 @@ def main():
     device = get_device(args.device)
     is_wald = _wald_metadata(args.cache_root)
     if is_wald:
+        if not 0.0 <= args.augment_shift_px <= 0.75:
+            raise ValueError("Wald augment_shift_px must be in [0,0.75] 30m MSI pixels")
         if args.psf_json == "./data/calibration/AugsburgReal_effective_psf.json":
             args.psf_json = os.path.join(args.cache_root, "wald_psf.json")
         if args.radiometry_json == "./data/calibration/AugsburgReal_radiometry.json":
@@ -375,9 +398,13 @@ def main():
             _wald_checkpoint_guard(args.resume, stage="resume")
     elif args.from_scratch and args.init_checkpoint:
         raise ValueError("--from_scratch and --init_checkpoint are mutually exclusive")
-    if args.stage == "test" and is_wald:
-        _wald_checkpoint_guard(args.geometry_checkpoint, stage="test")
+    if args.stage == "test" and is_wald and not args.geometry_checkpoint:
+        raise ValueError("--stage test requires a Wald --geometry_checkpoint")
     sigma = _load_sigma(args.psf_json)
+    if is_wald and (args.resume or args.stage == "test"):
+        check_path = args.resume if args.resume else args.geometry_checkpoint
+        extra = _wald_checkpoint_guard(check_path, stage="resume" if args.resume else "test")
+        _assert_wald_checkpoint_settings(extra, args, sigma=sigma)
     radiometry = _load_radiometry(args.radiometry_json, device)
 
     train_loader, val_loader, test_loader, info = build_augsburg_real_loaders(
@@ -478,7 +505,7 @@ def main():
         f"calibration={args.radiometry_json} train_patch={args.train_patch_size} "
         f"train_stride={args.train_stride} eval_patch={args.eval_patch_size} "
         f"geometry_caps=({args.max_translation},{args.max_rotation_deg},{args.max_local_px}) "
-        f"augmentation={args.augment_shift_px}mSI_pixels "
+        f"augmentation={args.augment_shift_px} MSI_30m_pixels "
     )
     print(
         "AUGSBURG_REAL_C supervision=observable_physical_closure_only "

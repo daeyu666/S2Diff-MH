@@ -529,6 +529,37 @@ class AugsburgRealDataset(Dataset):
         lr_hsi = np.asarray(self.lr_hsi[lt:lt+lph, ll:ll+lpw]).copy()
         mask = np.asarray(self.valid[top:top+ph, left:left+pw]).copy()
 
+        if self.split != "train":
+            # Progressive stages [1,2,3] require every HR spatial dimension
+            # to be divisible by lcm(2,3)=6. Official geographic regions can
+            # end on an x3-compatible but odd LR boundary (e.g. val width
+            # 639 -> final tile width 63). Pad only the evaluation edge tile;
+            # padded pixels are excluded from all metrics by valid_mask=0.
+            pad_h = (-gt.shape[0]) % 6
+            pad_w = (-gt.shape[1]) % 6
+            if pad_h or pad_w:
+                gt = np.pad(
+                    gt,
+                    ((0, pad_h), (0, pad_w), (0, 0)),
+                    mode="edge",
+                )
+                hr_msi = np.pad(
+                    hr_msi,
+                    ((0, pad_h), (0, pad_w), (0, 0)),
+                    mode="edge",
+                )
+                lr_hsi = np.pad(
+                    lr_hsi,
+                    ((0, pad_h // 3), (0, pad_w // 3), (0, 0)),
+                    mode="edge",
+                )
+                mask = np.pad(
+                    mask,
+                    ((0, pad_h), (0, pad_w)),
+                    mode="constant",
+                    constant_values=0,
+                )
+
         if self.augment:
             if np.random.rand() < 0.5:
                 gt = np.flip(gt, 0)

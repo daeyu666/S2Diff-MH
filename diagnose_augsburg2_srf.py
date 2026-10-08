@@ -165,9 +165,13 @@ def _heldout_fractional_lag_test(hproj, msi, train, heldout, valid, step=0.5):
     Compare candidate shifts on precisely the same eroded mask to avoid
     gaining correlation by excluding difficult pixels or selecting edges.
     Each candidate obtains its own training-only affine radiometry fit.
+    A competing *zero-lag Gaussian blur* is optimized exclusively on the
+    training subset, then evaluated on the same spatial holdout. This
+    distinguishes (part of) subpixel resampling's smoothing benefit from
+    genuine translation; it cannot identify exact sensor geolocation error.
     This is only a diagnostic; it neither warps cached MSI nor edits SRF.
     """
-    from scipy.ndimage import map_coordinates, minimum_filter
+    from scipy.ndimage import gaussian_filter, map_coordinates, minimum_filter
 
     h, w, channels = hproj.shape
     if hproj.shape != msi.shape or channels != 4:
@@ -207,21 +211,67 @@ def _heldout_fractional_lag_test(hproj, msi, train, heldout, valid, step=0.5):
 
     aligned = predictions[(best["dy"], best["dx"])]
     unaligned = predictions[(0., 0.)]
+    # Symmetric smoothing without a change of pixel coordinates: if this
+    # achieves essentially the same holdout gain as a half-pixel shift,
+    # translation cannot be inferred from correlation improvements alone.
+    # Select the blur width ONLY on the training subset. Keep the same mask
+    # as zero-shift / shifted candidates.
+    blur_candidates = [
+        (0., 0.), (0., .35), (0., .5), (0., .75), (0., 1.),
+        (.35, .35), (.5, .5), (.75, .75), (1., 1.),
+    ]
+    best_blur = None
+    best_blur_train_corr = -float("inf")
+    blurred = unaligned
+    for sigma_y, sigma_x in blur_candidates:
+        candidate = (
+            msi if sigma_y == 0. and sigma_x == 0.
+            else gaussian_filter(
+                msi, sigma=(sigma_y, sigma_x, 0.), mode="nearest"
+            )
+        )
+        corr = float(np.mean([
+            _pearson(candidate[..., b][tr], hproj[..., b][tr])
+            for b in range(4)
+        ]))
+        if np.isfinite(corr) and corr > best_blur_train_corr:
+            best_blur_train_corr = corr
+            best_blur = {"sigma_y": sigma_y, "sigma_x": sigma_x,
+                         "train_mean_corr": corr}
+            blurred = candidate
+    if best_blur is None:
+        raise RuntimeError("No finite zero-displacement blur candidate")
+    print(
+        f"SRF_BLUR_SELECTED SIGMA_30M=({best_blur['sigma_y']:.2f},"
+        f"{best_blur['sigma_x']:.2f}) TRAIN_MEAN_CORR="
+        f"{best_blur_train_corr:.6f}"
+    )
     band_report = []
     for b, name in enumerate(NAMES):
         ref = hproj[..., b]
         x0 = unaligned[..., b]
         x1 = aligned[..., b]
+        xb = blurred[..., b]
         g0, z0 = _fit_affine(x0[tr], ref[tr])
         g1, z1 = _fit_affine(x1[tr], ref[tr])
+        gb, zb = _fit_affine(xb[tr], ref[tr])
         base = _metrics(x0[ho], ref[ho], g0, z0)
         moved = _metrics(x1[ho], ref[ho], g1, z1)
+        blur = _metrics(xb[ho], ref[ho], gb, zb)
         record = {
             "band": name, "baseline": base, "candidate": moved,
+            "blur_control": blur,
             "holdout_corr_gain": float(moved["corr"] - base["corr"]),
             "holdout_rmse_reduction": float(
                 (base["rmse_after_affine"] - moved["rmse_after_affine"])
                 / max(base["rmse_after_affine"], 1e-12)
+            ),
+            "shift_minus_blur_corr": float(
+                moved["corr"] - blur["corr"]
+            ),
+            "shift_minus_blur_rmse_reduction": float(
+                (blur["rmse_after_affine"] - moved["rmse_after_affine"])
+                / max(blur["rmse_after_affine"], 1e-12)
             ),
         }
         band_report.append(record)
@@ -233,10 +283,24 @@ def _heldout_fractional_lag_test(hproj, msi, train, heldout, valid, step=0.5):
             f"RMSE_SHIFT={moved['rmse_after_affine']:.8f} "
             f"RMSE_REDUCTION={record['holdout_rmse_reduction']:.5f}"
         )
+        print(
+            f"SRF_BLUR_CONTROL {name} "
+            f"SHIFT_30M=({best['dy']:.2f},{best['dx']:.2f}) "
+            f"BLUR_SIGMA_30M=({best_blur['sigma_y']:.2f},"
+            f"{best_blur['sigma_x']:.2f}) "
+            f"CORR_BLUR={blur['corr']:.6f} "
+            f"CORR_SHIFT={moved['corr']:.6f} "
+            f"SHIFT_VS_BLUR_CORR_GAIN={record['shift_minus_blur_corr']:.6f} "
+            f"RMSE_BLUR={blur['rmse_after_affine']:.8f} "
+            f"RMSE_SHIFT={moved['rmse_after_affine']:.8f} "
+            f"SHIFT_VS_BLUR_RMSE_REDUCTION="
+            f"{record['shift_minus_blur_rmse_reduction']:.5f}"
+        )
     result = {
         "status": "ok", "selected_on": "stable_train_pixels",
         "evaluated_on": "disjoint_spatial_holdout_same_eroded_mask",
         "best_global_shift_lr_pixels": best,
+        "best_zero_lag_blur_lr_pixels": best_blur,
         "train_pixels": int(tr.sum()), "holdout_pixels": int(ho.sum()),
         "bands": band_report,
     }

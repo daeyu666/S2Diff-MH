@@ -1,100 +1,75 @@
-# Augsburg-2 original-scale no-reference QNR (matched UAFL implementation)
+# Augsburg-2 full-resolution original HSI–MSI QNR
 
-The underlying formula is migrated **unchanged** from
-`daeyu666/comparison_experiments/comparison/UAFL/augsburg2_wald_qnr.py`.
-The benchmark is **MSI-projected modified QNR**, **not** classical
-single-PAN QNR, QNR*, or 242-band spectral fidelity.
+### Full-resolution QNR / Dλ / Ds: original HSI–MSI observations
 
-## Input and measurement definitions
+This is **HSI–MSI QNR**, with **LR-HSI as spectral reference** and
+**observed HR-MSI as spatial reference**. No PAN image (real or synthetic) is
+created. It is the standard QNR spectral/spatial distortion principle adapted
+to hypersharpening; do not conflate its cross-sensor spatial component with
+classical single-PAN pansharpening QNR.
 
-- F: 10m fused 242-band HSI (S2Diff-MH output)
-- H: observed 30m EnMAP-like HSI; **not EnMAP10 reference**
-- M: genuine Sentinel-2 10m B2/B3/B4/B8 (original unregistered geometry)
-- R: frozen 4×242 Sentinel-2 SRF from Wald cache
-- high-projection A=R(F); low-projection B=R(H)
-- M_low: 3×3 area-average of the 10m observed MSI to 30m
-- M is adjusted with the existing training-only Wald radiometry gain/bias
-  (exact same calibration as model input), **never refitted on full-region test**
+Inputs, all from the same Augsburg-2 Region-2 10m/30m Wald cache:
 
-Local Q is masked UIQI on nonoverlapping 48×48 high-resolution windows
-(16×16 low-resolution windows). Windows with valid fraction under 80%
-are excluded and local scores weighted by valid pixel counts. A low
-valid pixel requires all 3×3 high pixels valid.
+- \`F\`: fused 10m HSI, **242 bands**.
+- \`H\`: originally **observed** 30m HSI, **242 bands**.
+- \`M\`: originally **observed** 10m four-channel Sentinel-2 MSI, after the
+  **pre-existing train-only** gain/bias calibration; **no geometric warp**.
+- \`M_L\`: area-averaged original 10m MSI on the 30m grid (factor 3).
+- \`R\`: frozen SRF, **only for selecting HSI bands spectrally covered by
+  each MSI channel**, not for projecting HSI into four bands.
 
-\[
-D_{\lambda}=\frac{1}{6}\sum_{i<j}^{4}|Q(A_i,A_j)-Q(B_i,B_j)|
-\]
+With valid-masked local \`Q=UIQI\`:
 
-\[
-D_s=\frac{1}{16}\sum_{i=1}^{4}\sum_{j=1}^{4}|Q(A_i,M_j)-Q(B_i,(M_{\downarrow 3})_j)|
-\]
+\`\`\`text
+Dlambda = mean over all 242 choose 2 = 29161 HSI-band pairs (i<j)
+          |Q(F_i,F_j) - Q(H_i,H_j)|
 
-\[
-\mathrm{QNR}=\max(0,1-D_{\lambda})\max(0,1-D_s)
-\]
+For MSI band k:
+  S_k = {HSI band i: SRF[k,i] >= 0.01 * max(SRF[k,:])}
+  d_k = mean over i in S_k
+        |Q(F_i,M_k) - Q(H_i,M_L,k)|
 
-No synthetic 10m HSI reference enters these metrics. Only the four S2
-spectral projections are assessed. Residual sensor misregistration,
-differences in real MSI radiometry, and choice of local UIQI window
-can change scores. High QNR alone does not prove faithful recovery of
-the full 242-band HSI.
+Ds = mean(d_1,d_2,d_3,d_4)
+QNR = max(0, 1-Dlambda) * max(0, 1-Ds)
+\`\`\`
 
-## Run tests
+The 1%-of-peak SRF coverage rule is an explicit, fixed setting. It follows
+the HSI–MSI hypersharpening principle that spatial distortion is evaluated
+against MSI only for HSI wavelengths sensed by that MSI band. All 242 HSI
+bands, including SWIR, contribute to **Dλ**. UIQI is averaged over masked,
+non-overlapping 48x48 10m windows and 16x16 30m windows, with a minimum
+80% valid-pixel fraction and valid-pixel weighting. The lower mask requires
+all 3x3 contributing HR pixels valid.
 
-```bash
-git pull
-python -m unittest discover -s tests -p "test_augsburg2_wald_qnr.py"
-```
+The calculation requires no 10m HSI ground truth. It does **not** establish
+full-resolution ground-truth spectral accuracy. Residual cross-sensor
+misregistration can affect the spatial term. It must not be compared with
+the old, superseded four-band projected QNR or synthetic-PAN QNR outputs.
+Recompute both methods' JSONs after updating.
 
-## Auto-evaluate after full-resolution **Wald A (Identity)** inference
+Standalone computation (already existing fused .npy; **no retraining**):
 
-```bash
-python infer_augsburg2_wald.py \
-  --wald_root ./data/augsburg2_wald \
-  --checkpoint ./checkpoints/augsburg_real/Augsburg2_Wald_D2_A.pth \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_radiometry.json \
-  --save_root ./outputs/augsburg2_wald
-```
-
-Creates:
-- `outputs/augsburg2_wald/Augsburg2_Wald_full_HSI.npy`
-- `outputs/augsburg2_wald/Augsburg2_Wald_full_QNR.json`
-- console: `S2DIFF_MH_WALD_ORIGINAL_MSI_QNR QNR=... Dlambda=... Ds=...`
-
-To skip auto metric calculation: `--skip_qnr`.
-Optional `--qnr_window_hr 48 --qnr_min_valid_fraction 0.8`.
-
-**Do not** feed Wald B/C checkpoints to the existing full-resolution
-Identity inference script. Their 30m geometry needs scale-correct conversion
-to 10m. The script explicitly rejects such misuse.
-
-## Evaluate an already-saved 10m HSI without rerunning diffusion
-
-```bash
+\`\`\`bash
 python augsburg2_wald_qnr.py \
   --wald_root ./data/augsburg2_wald \
-  --fused ./outputs/augsburg2_wald/Augsburg2_Wald_full_HSI.npy \
   --radiometry_json ./data/calibration/Augsburg2_Wald_radiometry.json \
-  --window_hr 48 \
-  --min_valid_fraction 0.8 \
+  --fused ./outputs/augsburg2_wald/Augsburg2_Wald_full_HSI.npy \
   --output_json ./outputs/augsburg2_wald/Augsburg2_Wald_full_QNR.json
-```
+\`\`\`
 
-The `full/meta.json` must identify `sub_area_2`, and the fused
-prediction must match the **same exact georeferenced 10m grid**.
-Wald cache labels and calibration provenance are validated.
+Full inference automatically computes QNR unless \`--skip_qnr\` is set.
+\`--qnr_support_fraction 0.01\` controls the spectral-coverage rule.
+\`--qnr_window_hr 48\` and \`--qnr_min_valid_fraction 0.8\` fix the
+same window policy in both repositories.
 
-## Compare with UAFL original-resolution evaluation
+Our original-scale inference currently accepts **Wald A/Identity** only.
+Do not run frozen B/C with an identity-only full physics operator; native
+10m motion for B/C needs its proper pixel-unit scale conversion.
 
+The cross-repository numerical comparison script
+`compare_augsburg2_wald_qnr.py` verifies matching calculation metadata.
+
+Regression check:
 ```bash
-python compare_augsburg2_wald_qnr.py \
-  --uafl_json ../comparison_experiments/comparison/UAFL/outputs/augsburg2_wald/UAFL_Wald_full_QNR.json \
-  --s2diff_json ./outputs/augsburg2_wald/Augsburg2_Wald_full_QNR.json
+python -m unittest discover -s tests -p "test_augsburg2_wald_qnr.py"
 ```
-
-The comparison rejects incompatible spectral projection definitions,
-window parameters or valid-pixel counts. Both JSONs must be computed
-with the same raw HSI/MSI/SRF, radiometry and grid. Even matching
-metadata cannot substitute for manually verifying both use the same
-underlying Wald cache. Neither method should be selected or tuned using
-these original-scale scores.

@@ -81,3 +81,31 @@ def test_fractional_lag_is_selected_from_train_and_confirmed_on_holdout():
     assert abs(out["best_global_shift_lr_pixels"]["dy"]) < 1e-6
     assert all(row["holdout_corr_gain"] > .2 for row in out["bands"])
     assert all(row["holdout_rmse_reduction"] > .1 for row in out["bands"])
+    assert "best_zero_lag_blur_lr_pixels" in out
+    assert all("blur_control" in row for row in out["bands"])
+    assert all(np.isfinite(row["shift_minus_blur_corr"]) for row in out["bands"])
+    assert all(np.isfinite(row["shift_minus_blur_rmse_reduction"]) for row in out["bands"])
+
+
+
+def test_zero_lag_blur_control_is_fitted_on_train_spatial_subset():
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(200)
+    msi = rng.normal(size=(48, 70, 4)).astype(np.float32)
+    ref = gaussian_filter(msi, sigma=(0., .8, 0.), mode="nearest")
+    valid = np.ones((48, 70), dtype=bool)
+    tr = np.zeros((48, 70), dtype=bool)
+    ho = np.zeros((48, 70), dtype=bool)
+    tr[:, :46] = True
+    ho[:, 50:] = True
+
+    out = _heldout_fractional_lag_test(ref, msi, tr, ho, valid)
+    assert out["status"] == "ok"
+    blur = out["best_zero_lag_blur_lr_pixels"]
+    assert blur["sigma_x"] > 0.
+    assert all(np.isfinite(row["blur_control"]["corr"]) for row in out["bands"])
+    assert np.mean([
+        row["blur_control"]["corr"] - row["baseline"]["corr"]
+        for row in out["bands"]
+    ]) > .01

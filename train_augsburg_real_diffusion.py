@@ -1,9 +1,11 @@
 """Real-D2: observation-anchored diffusion adaptation for Augsburg-Real.
 
 The output latent remains in the real Sentinel-2 reference coordinate system.
-The EnMAP10 reference is transferred into that latent frame only for training
-supervision via the normalized adjoint of the Real-C estimated forward warp.
-Observed LR-HSI is never inverse warped.
+In estimated mode, EnMAP10 supervision is mapped into the MSI latent frame via
+the normalized adjoint of the Real-C estimated warp. Identity mode is an
+explicit georeferenced no-geometry baseline: reference, diffusion latent and
+real MSI remain on the metadata-harmonized 10 m grid. Neither mode artificially
+warps observed LR-HSI.
 """
 
 from __future__ import annotations
@@ -38,8 +40,11 @@ def parse_args():
     p.add_argument("--cache_root", default="./data/augsburg_real_cache")
     p.add_argument("--psf_json", default="./data/calibration/AugsburgReal_effective_psf.json")
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
-    p.add_argument("--geometry_checkpoint", required=True)
-    p.add_argument("--init_checkpoint", default="", help="Synthetic Augsburg D2 checkpoint")
+    p.add_argument("--geometry_mode", choices=["estimated", "identity"], default="estimated",
+                   help="estimated: Real-C inferred geometry; identity: georeferenced baseline")
+    p.add_argument("--geometry_checkpoint", default="",
+                   help="Required for estimated geometry mode; unused for identity")
+    p.add_argument("--init_checkpoint", default="", help="Synthetic Augsburg D2 or Stage-A checkpoint")
     p.add_argument("--diffusion_checkpoint", default="", help="Trained Augsburg-Real D2 checkpoint for --stage test")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
@@ -245,7 +250,8 @@ def train_one_epoch(
     device,
 ):
     model.train()
-    geometry_model.eval()
+    if geometry_model is not None:
+        geometry_model.eval()
     sums = {k: 0.0 for k in ("loss", "l1", "sam", "ref", "phy", "msi")}
     count = 0
     for batch in loader:
@@ -257,17 +263,24 @@ def train_one_epoch(
         mask_ref = batch["valid_mask"].to(device, non_blocking=True) > 0.5
 
         with torch.no_grad():
-            rigid, local = _estimate_geometry(
-                geometry_model,
-                y_h,
-                y_m,
-                p0=p0,
-                srf=srf,
-                steps=args.geometry_steps,
-            )
-            process = _estimated_process(base_process, rigid, local)
-            gt_msi = _warp_adjoint_normalized(gt_ref, rigid, local)
-            mask_msi = _mask_to_msi(mask_ref, rigid, local)
+            if args.geometry_mode == "estimated":
+                rigid, local = _estimate_geometry(
+                    geometry_model,
+                    y_h,
+                    y_m,
+                    p0=p0,
+                    srf=srf,
+                    steps=args.geometry_steps,
+                )
+                process = _estimated_process(base_process, rigid, local)
+                gt_msi = _warp_adjoint_normalized(gt_ref, rigid, local)
+                mask_msi = _mask_to_msi(mask_ref, rigid, local)
+            else:
+                process = base_process
+                gt_msi = gt_ref
+                mask_msi = mask_ref
+                rigid = None
+                local = None
             timesteps = base_process.sample_timesteps(
                 gt_ref.shape[0],
                 boundary_probability=args.boundary_probability,
@@ -284,8 +297,10 @@ def train_one_epoch(
         pred = model_predict(model, x_t, timesteps, y_m)
         l1 = _masked_l1(pred, gt_msi, mask_msi)
         sam = _masked_sam(pred, gt_msi, mask_msi)
-        pred_ref = forward_warp(
-            pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
+        pred_ref = (
+            forward_warp(
+                pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
+            ) if args.geometry_mode == "estimated" else pred
         )
         ref = _masked_l1(pred_ref, gt_ref, mask_ref)
         phy = _masked_l1(
@@ -336,7 +351,8 @@ def evaluate(
     device,
 ):
     model.eval()
-    geometry_model.eval()
+    if geometry_model is not None:
+        geometry_model.eval()
     ref_sse = 0.0
     ref_values = 0
     ref_sam_sum = 0.0
@@ -351,15 +367,20 @@ def evaluate(
         y_h = batch["lr_hsi"].to(device)
         y_m = _apply_radiometry(batch["hr_msi"].to(device), radiometry)
         mask_ref = batch["valid_mask"].to(device) > 0.5
-        rigid, local = _estimate_geometry(
-            geometry_model,
-            y_h,
-            y_m,
-            p0=p0,
-            srf=srf,
-            steps=args.geometry_steps,
-        )
-        process = _estimated_process(base_process, rigid, local)
+        if args.geometry_mode == "estimated":
+            rigid, local = _estimate_geometry(
+                geometry_model,
+                y_h,
+                y_m,
+                p0=p0,
+                srf=srf,
+                steps=args.geometry_steps,
+            )
+            process = _estimated_process(base_process, rigid, local)
+        else:
+            rigid = None
+            local = None
+            process = base_process
         pred = reconstruct_from_terminal_lr(
             model,
             process,
@@ -367,8 +388,10 @@ def evaluate(
             target_size=tuple(gt_ref.shape[-2:]),
             hr_msi=y_m,
         )
-        pred_ref = forward_warp(
-            pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
+        pred_ref = (
+            forward_warp(
+                pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
+            ) if args.geometry_mode == "estimated" else pred
         )
         sse, n_values, sam_sum, sam_count = _masked_metric_sums(
             pred_ref, gt_ref, mask_ref
@@ -388,7 +411,10 @@ def evaluate(
         phy_sum += phy_value * lr_weight
         phy_weight += lr_weight
 
-        mask_msi = _mask_to_msi(mask_ref, rigid, local)
+        mask_msi = (
+            _mask_to_msi(mask_ref, rigid, local)
+            if args.geometry_mode == "estimated" else mask_ref
+        )
         msi_value = float(
             _masked_l1(spectral_project(pred, srf), y_m, mask_msi).item()
         )
@@ -432,23 +458,27 @@ def main():
     )
     p0 = base_process.operator.to(device)
 
-    geometry_model = LearnedPhysicalResidualSolver(
-        4,
-        base_channels=args.geometry_base_channels,
-        control_grid=args.control_grid,
-        max_translation=args.max_translation,
-        max_rotation_deg=args.max_rotation_deg,
-        max_local_px=args.max_local_px,
-    ).to(device)
-    load_checkpoint(
-        geometry_model,
-        args.geometry_checkpoint,
-        map_location=str(device),
-        load_optimizer=False,
-    )
-    geometry_model.eval()
-    for parameter in geometry_model.parameters():
-        parameter.requires_grad_(False)
+    geometry_model = None
+    if args.geometry_mode == "estimated":
+        if not args.geometry_checkpoint:
+            raise ValueError("--geometry_mode estimated requires --geometry_checkpoint")
+        geometry_model = LearnedPhysicalResidualSolver(
+            4,
+            base_channels=args.geometry_base_channels,
+            control_grid=args.control_grid,
+            max_translation=args.max_translation,
+            max_rotation_deg=args.max_rotation_deg,
+            max_local_px=args.max_local_px,
+        ).to(device)
+        load_checkpoint(
+            geometry_model,
+            args.geometry_checkpoint,
+            map_location=str(device),
+            load_optimizer=False,
+        )
+        geometry_model.eval()
+        for parameter in geometry_model.parameters():
+            parameter.requires_grad_(False)
 
     model = build_model(_config(args), info, device)
     if args.stage == "test":
@@ -518,10 +548,11 @@ def main():
         best = stored
 
     print(
-        "AUGSBURG_REAL_D2 output_frame=real_S2 "
-        "reference_supervision=normalized_warp_adjoint "
+        f"AUGSBURG_REAL_D2 geometry_mode={args.geometry_mode} "
+        "output_frame=metadata_harmonized_real_S2 "
+        f"reference_supervision={'normalized_warp_adjoint' if args.geometry_mode == 'estimated' else 'direct_georeferenced'} "
         f"scale=3 stages={base_process.stages} sigma={sigma:.6f} "
-        f"geometry_steps={args.geometry_steps}"
+        f"geometry_steps={args.geometry_steps if args.geometry_mode == 'estimated' else 0}"
     )
     print(
         "OBSERVED_LR_HSI inverse_warp=False terminal_observation=real_EnMAP30"
@@ -558,8 +589,13 @@ def main():
                 "scale_ratio": 3,
                 "stages": [1, 2, 3],
                 "geometry_checkpoint": args.geometry_checkpoint,
+                "geometry_mode": args.geometry_mode,
                 "output_frame": "real_S2",
-                "reference_metric_frame": "forward_warp_to_EnMAP10",
+                "reference_metric_frame": (
+                    "forward_warp_to_EnMAP10"
+                    if args.geometry_mode == "estimated"
+                    else "metadata_harmonized_EnMAP10"
+                ),
                 "kind": "last",
             },
         )
@@ -599,8 +635,13 @@ def main():
                     "scale_ratio": 3,
                     "stages": [1, 2, 3],
                     "geometry_checkpoint": args.geometry_checkpoint,
+                    "geometry_mode": args.geometry_mode,
                     "output_frame": "real_S2",
-                    "reference_metric_frame": "forward_warp_to_EnMAP10",
+                    "reference_metric_frame": (
+                        "forward_warp_to_EnMAP10"
+                        if args.geometry_mode == "estimated"
+                        else "metadata_harmonized_EnMAP10"
+                    ),
                 },
             )
             print(

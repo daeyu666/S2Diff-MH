@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 from srf_utils import estimate_band_widths, interp_srf_to_hsi_wavelengths
+from augsburg_real import infer_s2_platform, _require_rasterio
 
 NAMES = ("B2", "B3", "B4", "B8")
 
@@ -221,6 +222,32 @@ def main():
     )
     lag = _geometry_lag_diagnostics(ref, msi, valid)
     csv_path, columns, protocol = _resolve_official_csv(args)
+    with open(os.path.join(full, "meta.json"), "r", encoding="utf-8") as f:
+        full_meta = json.load(f)
+    s2_source = full_meta.get("s2_source", "")
+    region_platform = "UNKNOWN"
+    if s2_source and os.path.isfile(s2_source):
+        rasterio, _, _ = _require_rasterio()
+        with rasterio.open(s2_source) as source_ds:
+            region_platform = infer_s2_platform(source_ds)
+    cached_platform = protocol.get("s2_platform", "UNKNOWN")
+    if region_platform in ("S2A", "S2B", "S2C") and cached_platform != region_platform:
+        warnings.warn(
+            f"Region-2 source is {region_platform} but cache SRF is {cached_platform}. "
+            "Resolve platform SRF mismatch before considering an empirical SRF fit.",
+            stacklevel=1,
+        )
+    print(
+        f"SRF_SENSOR_CHECK REGION_PLATFORM={region_platform} "
+        f"CACHE_PLATFORM={cached_platform} "
+        f"BAND_NAMES={full_meta.get('s2_band_names', [])} "
+        f"S2_SOURCE={s2_source}"
+    )
+    if full_meta.get("s2_band_names") != list(NAMES):
+        raise ValueError(
+            f"Region-2 S2 band order must be B2/B3/B4/B8, got "
+            f"{full_meta.get('s2_band_names')}"
+        )
     report = {
         "source": "Augsburg-2 30m HSI vs area-aggregated real 10m S2",
         "uses_enmap10": False,
@@ -234,6 +261,9 @@ def main():
         "srf_csv": csv_path, "srf_columns": columns,
         "cache_platform": protocol.get("s2_platform", "UNKNOWN"),
         "cache_platform_detected": protocol.get("s2_platform_detected", "UNKNOWN"),
+        "region2_s2_platform_detected": region_platform,
+        "region2_s2_source": s2_source,
+        "region2_s2_band_indexes": full_meta.get("s2_indexes"),
         "registration_shift_diagnostic": lag,
         "original": [],
         "candidates": [],
@@ -295,6 +325,10 @@ def main():
     candidate_gains = [r["gain"] for r in report["original"]]
     candidate_biases = [r["bias"] for r in report["original"]]
     if args.mode == "fit":
+        if region_platform in ("S2A", "S2B", "S2C") and cached_platform != region_platform:
+            raise ValueError(
+                "Cannot fit: Region-2 platform does not match the cached SRF satellite"
+            )
         # A small grid is intentional. An unrestricted 4x242 SRF is
         # non-identifiable in the presence of geometry/radiometry mismatch.
         shifts = np.arange(

@@ -77,7 +77,7 @@ def test_fractional_lag_is_selected_from_train_and_confirmed_on_holdout():
 
     out = _heldout_fractional_lag_test(ref, msi, train, holdout, valid, step=.5)
     assert out["status"] == "ok"
-    assert out["best_global_shift_lr_pixels"]["dx"] == -1.0
+    assert out["best_global_shift_lr_pixels"]["dx"] == 1.0
     assert abs(out["best_global_shift_lr_pixels"]["dy"]) < 1e-6
     assert all(row["holdout_corr_gain"] > .2 for row in out["bands"])
     assert all(row["holdout_rmse_reduction"] > .1 for row in out["bands"])

@@ -212,3 +212,31 @@ def test_sim_control_hardlinks_shared_hsi_arrays(tmp_path):
     assert np.array_equal(np.load(src), np.load(dst))
     assert src.stat().st_ino == dst.stat().st_ino
     assert src.stat().st_nlink >= 2
+
+
+def test_augsburg2_wald_resolutions_and_no_enmap10_required():
+    from prepare_augsburg2_wald import downsample_hsi_wald, mean_downsample_msi
+
+    hsi30 = np.ones((48, 72, 7), dtype=np.float32)
+    s210 = np.ones((144, 216, 4), dtype=np.float32)
+    lr90 = downsample_hsi_wald(hsi30, sigma=1.2)
+    msi30 = mean_downsample_msi(s210)
+    assert lr90.shape == (16, 24, 7)
+    assert msi30.shape == (48, 72, 4)
+    assert float(msi30.min()) == 1.
+    assert np.isfinite(lr90).all()
+
+
+def test_augsburg2_full_tiles_cover_region2_and_align_to_x3_grid():
+    from infer_augsburg2_wald import positions
+
+    y_starts = positions(300, 96, 48)
+    x_starts = positions(360, 96, 48)
+    assert y_starts[-1] == 204
+    assert x_starts[-1] == 264
+    assert all(v % 3 == 0 for v in y_starts + x_starts)
+    canvas = np.zeros((300, 360), dtype=np.int32)
+    for y in y_starts:
+        for x in x_starts:
+            canvas[y:y + 96, x:x + 96] += 1
+    assert canvas.min() >= 1

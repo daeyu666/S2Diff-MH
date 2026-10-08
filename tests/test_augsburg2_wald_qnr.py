@@ -82,7 +82,7 @@ class HsiMsiQNRTests(unittest.TestCase):
 
     def test_matrix_uiqi_has_diagonal_one_for_identical_images(self):
         rng = np.random.default_rng(13)
-        x = rng.normal(size=(48, 48, 4))
+        x = rng.uniform(0.1, 0.9, size=(48, 48, 4))
         q = _windowed_uiqi_matrix(x, x, np.ones((48, 48), dtype=bool), 48)
         np.testing.assert_allclose(q, q.T, atol=1e-10)
         np.testing.assert_allclose(np.diag(q), np.ones(4), atol=1e-9)

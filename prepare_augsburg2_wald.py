@@ -39,6 +39,8 @@ def parse_args():
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--output_root", default="./data/augsburg2_wald")
     p.add_argument("--subarea", default="sub_area_2")
+    p.add_argument("--training_area", choices=["region2", "deep"], default="region2",
+                   help="region2 reproduces same-scene Wald training; deep uses official separate geographic training")
     p.add_argument("--sigma", type=float, default=1.2,
                    help="Fixed RR degradation sigma in 30m pixels, not fitted using EnMAP10")
     p.add_argument("--overwrite", action="store_true")
@@ -96,15 +98,28 @@ def prepare_rr(args):
         source_meta = os.path.join(source_dir, "meta.json")
         with open(source_meta, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        hsi30 = np.load(os.path.join(source_dir, "lr_hsi.npy"), mmap_mode="r")
-        s2_10 = np.load(os.path.join(source_dir, "hr_msi.npy"), mmap_mode="r")
-        validity10 = np.load(
-            os.path.join(source_dir, "valid_mask.npy"), mmap_mode="r"
-        )
-        # Original mask includes EnMAP10 validity. Use only finite-range checks
-        # on directly observed EnMAP30 and real S2 to avoid accessing EnMAP10.
-        h, w = (int(hsi30.shape[0]) // 3 * 3,
-                int(hsi30.shape[1]) // 3 * 3)
+        if split == "train" and args.training_area == "region2":
+            # Wald training on the very same real observations used for
+            # full-resolution inference, but without any 10m HSI label.
+            source_dir = os.path.join(args.output_root, "full")
+            hsi30 = np.load(os.path.join(source_dir, "lr_hsi.npy"), mmap_mode="r")
+            s2_10 = np.load(os.path.join(source_dir, "hr_msi.npy"), mmap_mode="r")
+            supervision_source = "sub_area_2_observed_EnMAP30"
+        else:
+            hsi30 = np.load(os.path.join(source_dir, "lr_hsi.npy"), mmap_mode="r")
+            s2_10 = np.load(os.path.join(source_dir, "hr_msi.npy"), mmap_mode="r")
+            supervision_source = meta["lr_source"]
+        # Never read the cached EnMAP10 arrays, or the old validity mask
+        # (which was originally partly derived from EnMAP10).
+        h = int(hsi30.shape[0])
+        w = int(hsi30.shape[1])
+        if split == "train":
+            h, w = h // 3 * 3, w // 3 * 3
+        else:
+            # Avoid tiny right/bottom edge tiles in validation and RR test.
+            # With eval_patch_size=48, exact 48-multiple dimensions cover
+            # the validation region without tiny stage-2-incompatible tiles.
+            h, w = h // 48 * 48, w // 48 * 48
         if h < 6 or w < 6:
             raise ValueError(f"Wald reduced-resolution region is too small: {split}")
         gt = np.asarray(hsi30[:h, :w]).copy().astype(np.float32)
@@ -126,7 +141,8 @@ def prepare_rr(args):
             json.dump({
                 "split": split,
                 "protocol": "Wald reduced-resolution; no 10m HSI labels",
-                "supervision_source": meta["lr_source"],
+                "supervision_source": supervision_source,
+                "training_area": args.training_area,
                 "msi_source": "real_Sentinel_2_Wald_30m",
                 "target": "30m_EnMAP_like",
                 "gt_source": "observed_30m_HSI_only",
@@ -214,8 +230,8 @@ def main():
     if args.sigma < 0:
         raise ValueError("--sigma must be nonnegative")
     os.makedirs(args.output_root, exist_ok=True)
-    prepare_rr(args)
     prepare_full(args)
+    prepare_rr(args)
     path = os.path.join(args.output_root, "wald_psf.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({

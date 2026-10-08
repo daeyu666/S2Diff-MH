@@ -138,3 +138,43 @@ def test_validation_edge_tile_is_padded_to_multiple_of_six(tmp_path):
     assert sample["valid_mask"].shape == (1, 192, 66)
     assert float(sample["valid_mask"][:, :, :63].min()) == 1.0
     assert float(sample["valid_mask"][:, :, 63:].max()) == 0.0
+
+
+def test_identity_real_d2_eval_avoids_geometry_model():
+    """Smoke-test identity path with no Real-C checkpoint or deformation field."""
+    import math
+    from types import SimpleNamespace
+
+    from train_augsburg_real_diffusion import evaluate
+
+    class ZeroPredictor(torch.nn.Module):
+        requires_msi = False
+
+        def forward(self, x, timesteps):
+            return x
+
+    base = build_augsburg_real_process(effective_sigma=0.8, diffusion_steps=6)
+    gt = torch.rand(1, 8, 12, 12) * 0.5 + 0.1
+    lr = base.terminal_observation(gt)
+    msi = torch.rand(1, 4, 12, 12) * 0.5 + 0.1
+    srf = torch.rand(4, 8)
+    srf = srf / srf.sum(dim=1, keepdim=True)
+    batch = {
+        "gt": gt,
+        "lr_hsi": lr,
+        "hr_msi": msi,
+        "valid_mask": torch.ones(1, 1, 12, 12),
+    }
+    metrics = evaluate(
+        ZeroPredictor(),
+        None,
+        [batch],
+        base_process=base,
+        p0=base.operator,
+        srf=srf,
+        radiometry=None,
+        args=SimpleNamespace(geometry_mode="identity"),
+        device=torch.device("cpu"),
+    )
+    for name in ("ref_psnr", "ref_sam", "phy", "msi"):
+        assert math.isfinite(metrics[name]), name

@@ -148,8 +148,15 @@ class LearnedPhysicalResidualSolver(nn.Module):
         max_translation: float = 4.0,
         max_rotation_deg: float = 2.0,
         max_local_px: float = 4.0,
+        initial_dx_px: float = 0.0,
+        initial_dy_px: float = 0.0,
     ):
         super().__init__()
+        self.initial_dx_px = float(initial_dx_px)
+        self.initial_dy_px = float(initial_dy_px)
+        if (abs(self.initial_dx_px) > float(max_translation)
+            or abs(self.initial_dy_px) > float(max_translation)):
+            raise ValueError("Initial rigid translation exceeds the configured translation cap")
         self.control_grid = int(control_grid)
         self.max_translation = float(max_translation)
         self.max_rotation_deg = float(max_rotation_deg)
@@ -301,11 +308,22 @@ class LearnedPhysicalResidualSolver(nn.Module):
         h, w = hr_msi.shape[-2:]
         rigid = hr_msi.new_zeros((batch, 3))
         control = hr_msi.new_zeros((batch, 2, self.control_grid, self.control_grid))
-
+        # Identity remains a fixed control for measuring the full improvement.
+        # Non-zero physical initialization is a solver state, not a warp of
+        # the input MSI or a synthetic flow supervision label.
+        if self.initial_dx_px != 0.0 or self.initial_dy_px != 0.0:
+            with torch.no_grad():
+                unaligned_prediction = spatial_operator.degrade(hr_msi)
+            rigid[:, 0] = self.initial_dx_px
+            rigid[:, 1] = self.initial_dy_px
+        else:
+            unaligned_prediction = None
         current, local, sample_x, sample_y = self._measurement(
             hr_msi, spatial_operator, rigid, control
         )
         initial_prediction = current
+        if unaligned_prediction is None:
+            unaligned_prediction = initial_prediction
         predictions: List[torch.Tensor] = []
         local_fields: List[torch.Tensor] = []
         rigid_states: List[torch.Tensor] = []
@@ -337,6 +355,7 @@ class LearnedPhysicalResidualSolver(nn.Module):
             sampling_y_states.append(sample_y)
 
         return {
+            "unaligned_prediction": unaligned_prediction,
             "initial_prediction": initial_prediction,
             "predictions": predictions,
             "local_fields": local_fields,

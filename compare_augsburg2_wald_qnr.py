@@ -1,8 +1,7 @@
 """Compare strictly equivalent UAFL and S2Diff-MH original-scale Wald QNR JSON.
 
-The number follows the classical QNR equations with a defined PAN
-source. Augsburg defaults to a *synthetic MSI-derived PAN*, not real PAN.
-Do not call it a 242-band spectral fidelity index. Metric-definition and valid-domain metadata
+Compares full-resolution HSI-MSI QNR with *all* 242 LR-HSI spectral
+bands and observed 4-band real HR-MSI spatial reference. No PAN/proxy. Metric-definition and valid-domain metadata
 MUST match before numerical comparison.
 """
 import argparse
@@ -11,12 +10,13 @@ import math
 
 
 COMPARE_FIELDS = (
-    "index_name", "qnr_equations", "pan_origin", "is_genuine_pan",
-    "low_resolution_multispectral_reference",
+    "index_name", "qnr_equations",
     "spectral_pair_count", "spatial_pair_count",
+    "spatial_support_counts", "srf_support_fraction_of_peak",
     "high_window", "low_window", "window_min_valid_fraction",
     "high_valid_pixels", "low_valid_pixels",
-    "spectral_domain", "source_HSI", "source_MSI",
+    "spectral_reference", "spatial_reference",
+    "source_HSI", "source_MSI", "pan_used", "srf_projection_used",
     "full_HR_HSI_ground_truth_used",
 )
 
@@ -30,10 +30,12 @@ def compare_qnr(a, b):
             )
     if a.get("full_HR_HSI_ground_truth_used") is not False:
         raise ValueError("Not a valid no-10m-HSI-reference QNR comparison")
-    if a.get("qnr_equations") != "Alparone-2008-classical-formula-p=q=alpha=beta=1":
-        raise ValueError("Only standard-form QNR reports can be compared")
-    if a.get("spectral_pair_count") != 6 or a.get("spatial_pair_count") != 4:
-        raise ValueError("Classical QNR requires 6 spectral and 4 PAN-spatial comparisons")
+    if a.get("qnr_equations") != "QNR-HSI-MSI-spectral-all242-spatial-SRF-covered-p=q=alpha=beta=1":
+        raise ValueError("Requires HSI-MSI QNR, not old MSI-projected or PAN scores")
+    if a.get("spectral_pair_count") != 29161:
+        raise ValueError("Spectral distortion must cover all 242 HSI bands")
+    if a.get("pan_used") is not False or a.get("srf_projection_used") is not False:
+        raise ValueError("Original HSI/MSI observations must be used without PAN/projection")
     for name, row in (("UAFL", a), ("S2Diff-MH", b)):
         if any(k not in row or not math.isfinite(float(row[k]))
                for k in ("QNR", "Dlambda", "Ds")):
@@ -51,7 +53,7 @@ def main():
     with open(args.s2diff_json, encoding="utf-8") as f:
         ours = json.load(f)
     diff = compare_qnr(uafl, ours)
-    print(f"METRIC={uafl['index_name']} GENUINE_PAN={uafl['is_genuine_pan']}")
+    print(f"METRIC={uafl['index_name']} PAN_USED={uafl['pan_used']}")
     print(
         f"UAFL QNR={uafl['QNR']:.6f} "
         f"Dlambda={uafl['Dlambda']:.6f} Ds={uafl['Ds']:.6f}"

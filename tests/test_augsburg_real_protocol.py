@@ -178,3 +178,37 @@ def test_identity_real_d2_eval_avoids_geometry_model():
     )
     for name in ("ref_psnr", "ref_sam", "phy", "msi"):
         assert math.isfinite(metrics[name]), name
+
+
+def test_sim_control_selects_canonical_s2_band_indices():
+    from prepare_augsburg_sim_control import _select_sim_indexes
+    assert _select_sim_indexes(4) == [1, 2, 3, 4]
+    assert _select_sim_indexes(12) == [2, 3, 4, 8]
+    try:
+        _select_sim_indexes(5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Expected invalid simulated-MSI band count to fail")
+
+
+def test_sim_control_product_paths_match_official_split_files():
+    from prepare_augsburg_sim_control import _simulated_path
+    assert _simulated_path(
+        "/data/sr_deep_model_data/EeteS_EnMAP_10m_deep_valid.tif"
+    ) == "/data/sr_deep_model_data/EeteS_Sentinel_2_10m_deep_valid.tif"
+    assert _simulated_path(
+        "/data/sub_area_1/EeteS_EnMAP_10m_sub_area1.tif"
+    ) == "/data/sub_area_1/EeteS_Sentinel_2_10m_sub_area1.tif"
+
+
+def test_sim_control_hardlinks_shared_hsi_arrays(tmp_path):
+    from prepare_augsburg_sim_control import _shared
+    src = tmp_path / "real" / "gt.npy"
+    src.parent.mkdir()
+    np.save(src, np.ones((6, 6, 2), np.float32))
+    dst = tmp_path / "simulated" / "gt.npy"
+    _shared(str(src), str(dst), mode="hardlink", overwrite=False)
+    assert np.array_equal(np.load(src), np.load(dst))
+    assert src.stat().st_ino == dst.stat().st_ino
+    assert src.stat().st_nlink >= 2

@@ -599,6 +599,7 @@ def build_augsburg_real_loaders(
     min_valid_fraction: float = 0.80,
     batch_size: int = 2,
     num_workers: int = 0,
+    train_augment: bool = True,
 ):
     train = AugsburgRealDataset(
         cache_root,
@@ -607,7 +608,7 @@ def build_augsburg_real_loaders(
         train_stride=train_stride,
         eval_patch_size=eval_patch_size,
         min_valid_fraction=min_valid_fraction,
-        augment=True,
+        augment=train_augment,
     )
     val = AugsburgRealDataset(
         cache_root,

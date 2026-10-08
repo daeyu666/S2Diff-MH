@@ -15,6 +15,7 @@ import csv
 import json
 import math
 import os
+from types import SimpleNamespace
 from statistics import mean
 
 import torch
@@ -32,6 +33,10 @@ from innovation1 import model_predict, reconstruct_from_terminal_lr
 from main import build_model
 from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
 from train_cdrdi_diffusion_estimated import observation_anchored_batch_state
+from train_augsburg_real_cdrdi import (
+    _wald_metadata, _wald_checkpoint_guard,
+    _assert_wald_checkpoint_settings, _checkpoint_extra,
+)
 from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, save_checkpoint, set_seed
 
 
@@ -41,10 +46,17 @@ def parse_args():
     p.add_argument("--cache_root", default="./data/augsburg_real_cache")
     p.add_argument("--psf_json", default="./data/calibration/AugsburgReal_effective_psf.json")
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
-    p.add_argument("--geometry_mode", choices=["estimated", "identity"], default="estimated",
-                   help="estimated: Real-C inferred geometry; identity: georeferenced baseline")
+    p.add_argument("--geometry_mode", choices=["estimated", "identity", "wald_fixed", "wald_cdrdi"], default="estimated",
+                   help="strict Wald A=identity, B=wald_fixed, C=wald_cdrdi (frozen rigid+closure guard)")
     p.add_argument("--geometry_checkpoint", default="",
-                   help="Required for estimated geometry mode; unused for identity")
+                   help="Required for estimated and wald_cdrdi modes; NEVER synthetic/EnMAP10 for Wald")
+    p.add_argument("--fixed_dx_px", type=float, default=-0.5,
+                   help="Wald B fixed horizontal offset in native Wald 30m MSI pixels")
+    p.add_argument("--fixed_dy_px", type=float, default=0.0,
+                   help="Wald B fixed vertical offset in native Wald 30m MSI pixels")
+    p.add_argument("--guard_min_jac", type=float, default=0.5)
+    p.add_argument("--guard_relative_gain", type=float, default=1e-4)
+    p.add_argument("--guard_window", type=int, default=5)
     p.add_argument("--init_checkpoint", default="", help="Synthetic Augsburg D2 or Stage-A checkpoint")
     p.add_argument("--from_scratch", action="store_true",
                    help="Initialize without any pretraining checkpoint; required for strict Augsburg-2 Wald protocol")
@@ -117,6 +129,117 @@ def _estimate_geometry(model, lr_hsi, hr_msi, *, p0, srf, steps):
     target = spectral_project(lr_hsi, srf)
     out = model(target, hr_msi, p0, steps=steps)
     return out["final_rigid"].detach(), out["final_local_field"].detach()
+
+
+def _geometry_required(args) -> bool:
+    return args.geometry_mode != "identity"
+
+
+def _fixed_wald_geometry(hr_msi, *, dx, dy):
+    """Constant physical lag in the MSI30 pixel grid; no input pre-warp."""
+    batch, _, h, w = hr_msi.shape
+    rigid = hr_msi.new_zeros((batch, 3))
+    rigid[:, 0] = float(dx)
+    rigid[:, 1] = float(dy)
+    local = hr_msi.new_zeros((batch, 2, h, w))
+    return rigid, local
+
+
+def _batch_geometry(args, geometry_model, y_h, y_m, mask_ref, *, p0, srf):
+    """Return B/legacy/C geometry on the same unaltered observed MSI input."""
+    if args.geometry_mode == "identity":
+        return None, None
+    if args.geometry_mode == "wald_fixed":
+        return _fixed_wald_geometry(
+            y_m, dx=args.fixed_dx_px, dy=args.fixed_dy_px
+        )
+    if args.geometry_mode == "wald_cdrdi":
+        if geometry_model is None:
+            raise ValueError("wald_cdrdi requires a frozen Wald-only geometry checkpoint")
+        target = spectral_project(y_h, srf)
+        # Output latent is in the MSI30 frame; observed HSI90 is never warped.
+        out = geometry_model(
+            target, y_m, p0, steps=args.geometry_steps,
+            update_mode="rigid_only",
+            update_policy="closure_backtrack",
+            acceptance_mask=_lr_mask(mask_ref),
+            acceptance_window=args.guard_window,
+            acceptance_min_jac=args.guard_min_jac,
+            acceptance_relative_gain=args.guard_relative_gain,
+        )
+        local = out["final_local_field"].detach()
+        if bool((local.abs().amax() > 1e-7).item()):
+            raise RuntimeError("Wald C mode must not introduce a local warp")
+        return out["final_rigid"].detach(), local
+    if args.geometry_mode == "estimated":
+        if geometry_model is None:
+            raise ValueError("estimated geometry requires a checkpoint")
+        return _estimate_geometry(
+            geometry_model, y_h, y_m, p0=p0, srf=srf,
+            steps=args.geometry_steps
+        )
+    raise ValueError(f"Unsupported geometry mode: {args.geometry_mode}")
+
+
+def _wald_d2_provenance(args, *, sigma):
+    """Guard all Wald split metadata and frozen C model provenance."""
+    if not _wald_metadata(args.cache_root):
+        raise ValueError("Strict Wald requires all three splits to be genuine Wald 30m observations")
+    if args.geometry_mode not in ("identity", "wald_fixed", "wald_cdrdi"):
+        raise ValueError("Wald A/B/C only supports identity, wald_fixed and wald_cdrdi")
+    if args.init_checkpoint or (args.from_scratch and args.resume):
+        raise ValueError("Wald-D2 must train from scratch or resume its own Wald-only checkpoint")
+    if args.stage == "train" and not (args.from_scratch or args.resume):
+        raise ValueError("Wald-D2 training requires --from_scratch or --resume")
+    if args.geometry_mode == "wald_fixed":
+        if abs(args.fixed_dx_px) > 1.5 or abs(args.fixed_dy_px) > 1.5:
+            raise ValueError("Fixed Wald shift exceeds conservative 30m range")
+    if args.geometry_mode == "wald_cdrdi":
+        if not args.geometry_checkpoint:
+            raise ValueError("C mode requires --geometry_checkpoint from strictly Wald-trained CDRDI")
+        extra = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-D2")
+        config = extra["geometry_config"]
+        if (abs(float(config["initial_dx_px"]) - float(args.fixed_dx_px)) > 1e-7
+            or abs(float(config["initial_dy_px"]) - float(args.fixed_dy_px)) > 1e-7):
+            raise ValueError("A/B/C geometry seed must match the frozen CDRDI initial offset")
+        _assert_wald_checkpoint_settings(extra, SimpleNamespace(
+            base_channels=int(config["base_channels"]),
+            control_grid=int(config["control_grid"]),
+            max_translation=float(config["max_translation"]),
+            max_rotation_deg=float(config["max_rotation_deg"]),
+            max_local_px=float(config["max_local_px"]),
+            initial_dx_px=float(config["initial_dx_px"]),
+            initial_dy_px=float(config["initial_dy_px"]),
+            radiometry_json=args.radiometry_json,
+        ), sigma=sigma)
+    elif args.geometry_checkpoint:
+        raise ValueError("Wald A/B must not supply a geometry checkpoint")
+    if args.guard_window != 5 or abs(args.guard_min_jac - 0.5) > 1e-6:
+        raise ValueError("Wald C guard must reproduce validated window=5, min_jac=0.5")
+    if args.guard_relative_gain < 0 or args.guard_relative_gain >= 1:
+        raise ValueError("Invalid Wald C guard threshold")
+
+
+def _wald_d2_extra_guard(checkpoint, args, *, msi_source, sigma):
+    """Never silently resume or test an unrelated branch/checkpoint."""
+    extra = _checkpoint_extra(checkpoint)
+    if (extra.get("msi_source") != msi_source
+        or extra.get("stage") != "Augsburg2-Wald-D2"
+        or extra.get("geometry_mode") != args.geometry_mode
+        or extra.get("geometry_checkpoint", "") != args.geometry_checkpoint
+        or abs(float(extra.get("effective_sigma", -1)) - sigma) > 1e-7
+        or extra.get("radiometry_json") != args.radiometry_json):
+        raise ValueError("Wald-D2 checkpoint differs in dataset, branch, PSF or calibration")
+    if args.geometry_mode != "identity" and (
+        abs(float(extra.get("fixed_dx_px", 99)) - args.fixed_dx_px) > 1e-7
+        or abs(float(extra.get("fixed_dy_px", 99)) - args.fixed_dy_px) > 1e-7
+    ):
+        raise ValueError("Wald-D2 checkpoint has inconsistent fixed geometry seed")
+    if args.geometry_mode == "wald_cdrdi" and (
+        int(extra.get("geometry_steps", -1)) != int(args.geometry_steps)
+        or float(extra.get("guard_relative_gain", -1)) != float(args.guard_relative_gain)
+    ):
+        raise ValueError("Wald-D2 checkpoint has inconsistent guarded CDRDI settings")
 
 
 def _estimated_process(base_process, rigid, local):

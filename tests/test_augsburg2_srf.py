@@ -5,7 +5,7 @@ import pandas as pd
 
 from diagnose_augsburg2_srf import (
     _fit_affine, _geometry_lag_diagnostics, _metrics,
-    _stable_masks, _warped_srf,
+    _stable_masks, _warped_srf, _heldout_fractional_lag_test,
 )
 from srf_utils import estimate_band_widths
 
@@ -58,3 +58,26 @@ def test_spatial_lag_diagnostic_flags_displacement():
     assert len(lags) == 4
     assert all(row["lag_corr_gain"] > .8 for row in lags)
     assert all(abs(row["best_lag"]["dx"]) == 1 for row in lags)
+
+
+def test_fractional_lag_is_selected_from_train_and_confirmed_on_holdout():
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(10)
+    ref = gaussian_filter(
+        rng.normal(size=(40, 52, 4)).astype(np.float32),
+        sigma=(1.0, 1.0, 0.0),
+    )
+    msi = np.roll(ref, shift=1, axis=1)
+    valid = np.ones((40, 52), dtype=bool)
+    train = np.zeros((40, 52), dtype=bool)
+    holdout = np.zeros((40, 52), dtype=bool)
+    train[:, :34] = True
+    holdout[:, 37:] = True
+
+    out = _heldout_fractional_lag_test(ref, msi, train, holdout, valid, step=.5)
+    assert out["status"] == "ok"
+    assert out["best_global_shift_lr_pixels"]["dx"] == -1.0
+    assert abs(out["best_global_shift_lr_pixels"]["dy"]) < 1e-6
+    assert all(row["holdout_corr_gain"] > .2 for row in out["bands"])
+    assert all(row["holdout_rmse_reduction"] > .1 for row in out["bands"])

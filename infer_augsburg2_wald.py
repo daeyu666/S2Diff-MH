@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from augsburg2_wald_qnr import evaluate_cache
 from augsburg_real_process import build_augsburg_real_process
 from cdrdi_geometry import spectral_project
 from config import TrainConfig
@@ -30,7 +31,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Run full-resolution Augsburg-2 Wald diffusion fusion")
     p.add_argument("--wald_root", default="./data/augsburg2_wald")
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
+    p.add_argument("--radiometry_json", default="./data/calibration/Augsburg2_Wald_radiometry.json")
     p.add_argument("--save_root", default="./outputs/augsburg2_wald")
     p.add_argument("--tile_size", type=int, default=96)
     p.add_argument("--tile_stride", type=int, default=48)
@@ -42,6 +43,12 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--write_tif", action="store_true")
+    p.add_argument("--skip_qnr", action="store_true",
+                   help="Disable UAFL-identical MSI-projected modified QNR; default evaluates it")
+    p.add_argument("--qnr_window_hr", type=int, default=48,
+                   help="UIQI window on original 10m grid (matches UAFL)")
+    p.add_argument("--qnr_min_valid_fraction", type=float, default=0.8,
+                   help="Minimum valid fraction per non-overlapping UIQI window")
     return p.parse_args()
 
 
@@ -72,6 +79,8 @@ def main():
         sigma = float(json.load(f)["terminal_sigma_hr_pixels"])
     with open(os.path.join(args.wald_root, "full", "meta.json"), "r", encoding="utf-8") as f:
         full_meta = json.load(f)
+    if full_meta.get("region") != "sub_area_2":
+        raise ValueError("Strict Augsburg-2 full-resolution no-reference evaluation requires sub_area_2")
 
     lr = np.load(os.path.join(args.wald_root, "full", "lr_hsi.npy"), mmap_mode="r")
     msi = np.load(os.path.join(args.wald_root, "full", "hr_msi.npy"), mmap_mode="r")
@@ -106,11 +115,27 @@ def main():
     except TypeError:
         checkpoint_state = torch.load(args.checkpoint, map_location="cpu")
     extra = checkpoint_state.get("extra", {}) if isinstance(checkpoint_state, dict) else {}
-    if extra.get("msi_source") != "real_Sentinel_2_Wald_30m":
+    if (extra.get("stage") != "Augsburg2-Wald-D2"
+        or extra.get("msi_source") != "real_Sentinel_2_Wald_30m"
+        or extra.get("reference_supervision_source") != "observed_30m_HSI_only"):
         raise ValueError(
-            "Expected a Wald-trained checkpoint with msi_source="
-            "'real_Sentinel_2_Wald_30m'. Do not use EnMAP10-supervised Real-D2."
+            "Full inference requires strictly Wald-D2 trained on observed 30m HSI, "
+            "never legacy EnMAP10 supervision"
         )
+    # Current full inference constructs an identity physics process. Reusing
+    # B/C checkpoints here would silently ignore their nonzero geometry.
+    # Future B/C full inference must explicitly transform 30m-pixel motion
+    # into 10m-pixel units and use a geometry-aware process.
+    if extra.get("geometry_mode") != "identity":
+        raise ValueError(
+            "Full inference currently supports Wald A/identity only. "
+            "B/C checkpoints require geometrically consistent 30m->10m "
+            "motion scaling; refusing to evaluate them with identity physics."
+        )
+    if os.path.normpath(extra.get("radiometry_json", "")) != os.path.normpath(args.radiometry_json):
+        raise ValueError("Full inference radiometry differs from the Wald-D2 checkpoint")
+    if abs(float(extra.get("effective_sigma", -1)) - sigma) > 1e-7:
+        raise ValueError("Full inference PSF does not match the Wald-D2 checkpoint")
     load_checkpoint(model, args.checkpoint, map_location=str(device), load_optimizer=False)
     model.eval()
 
@@ -168,6 +193,24 @@ def main():
         predicted_msi = spectral_project(ph, srf)
         phy = (predicted_lr - lh).abs()[valid_lr.expand_as(predicted_lr)].mean().item()
         msi_l1 = (predicted_msi - hm).abs()[valid_hr.expand_as(predicted_msi)].mean().item()
+
+    qnr = None
+    if not args.skip_qnr:
+        qnr = evaluate_cache(
+            args.wald_root, output_path, args.radiometry_json,
+            window_hr=args.qnr_window_hr,
+            min_valid_fraction=args.qnr_min_valid_fraction,
+        )
+        qnr_json = os.path.join(args.save_root, "Augsburg2_Wald_full_QNR.json")
+        with open(qnr_json, "w", encoding="utf-8") as f:
+            json.dump(qnr, f, ensure_ascii=False, indent=2)
+        print(
+            f"S2DIFF_MH_WALD_ORIGINAL_MSI_QNR "
+            f"QNR={qnr['QNR']:.6f} "
+            f"Dlambda={qnr['Dlambda']:.6f} "
+            f"Ds={qnr['Ds']:.6f} QNR_JSON={qnr_json} "
+            "METRIC=MSI_projected_modified_QNR_NOT_full_242_band_quality"
+        )
 
     if args.write_tif:
         from affine import Affine

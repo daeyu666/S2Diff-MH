@@ -163,8 +163,16 @@ def prepare_full(args):
     region = os.path.join(root, args.subarea)
     suffix = args.subarea.replace("sub_area_", "sub_area")
     hsi_path = os.path.join(region, f"EeteS_EnMAP_30m_{suffix}.tif")
-    s2_candidates = [os.path.join(region, "Sentinel-2.tif"),
-                     os.path.join(region, "Sentinel_2.tif")]
+    # Official MDAS region files use Sentinel_2_sub_area2.tif.
+    # Never substitute EeteS_Sentinel_2_10m_... (simulated MSI).
+    s2_candidates = [
+        os.path.join(region, f"Sentinel_2_{suffix}.tif"),
+        os.path.join(region, f"Sentinel-2_{suffix}.tif"),
+        os.path.join(region, "Sentinel_2.tif"),
+        os.path.join(region, "Sentinel-2.tif"),
+        os.path.join(root, "entire_city", "Sentinel-2.tif"),
+        os.path.join(root, "entire_city", "Sentinel_2.tif"),
+    ]
     s2_path = next((p for p in s2_candidates if os.path.isfile(p)), None)
     if not os.path.isfile(hsi_path):
         raise FileNotFoundError(
@@ -178,19 +186,24 @@ def prepare_full(args):
 
     rasterio, _, _ = _require_rasterio()
     from affine import Affine
-    crs, transform, width, height = _target_profile(s2_path)
-    h_hr, w_hr = (height // 3 * 3, width // 3 * 3)
+    # Derive *both* common grids from the 30m HSI reference geometry.
+    # The previous implementation used the MSI profile as target and then
+    # multiplied its pixel size by 3 for LR. That can silently enlarge the
+    # region or misalign the two sensors.
+    crs, lr_transform, lr_width, lr_height = _target_profile(hsi_path)
+    hr_transform = lr_transform * Affine.scale(1.0 / 3.0, 1.0 / 3.0)
+    h_hr, w_hr = 3 * lr_height, 3 * lr_width
     with rasterio.open(s2_path) as src:
         s2_indexes, band_names = resolve_s2_band_indexes(src)
     msi = _reproject_multiband(
-        s2_path, target_crs=crs, target_transform=transform,
+        s2_path, target_crs=crs, target_transform=hr_transform,
         target_width=w_hr, target_height=h_hr,
         indexes=s2_indexes, scale=10000., resampling="bilinear",
     )
     lr = _reproject_multiband(
         hsi_path, target_crs=crs,
-        target_transform=transform * Affine.scale(3, 3),
-        target_width=w_hr // 3, target_height=h_hr // 3,
+        target_transform=lr_transform,
+        target_width=lr_width, target_height=lr_height,
         scale=10000., resampling="bilinear",
     )
     if lr.shape[-1] != 242 or msi.shape[-1] != 4:
@@ -219,7 +232,7 @@ def prepare_full(args):
             "region": args.subarea, "lr_shape": list(lr.shape),
             "msi_shape": list(msi.shape), "s2_indexes": s2_indexes,
             "s2_band_names": band_names, "valid_fraction": float(mask.mean()),
-            "transform_6": list(tuple(transform)[:6]), "crs": str(crs),
+            "transform_6": list(tuple(hr_transform)[:6]), "crs": str(crs),
             "radiometry": "train_only_calibration_may_be_applied_at_inference",
         }, f, indent=2)
     print(f"WALD_FULL region={args.subarea} LR_HSI={lr.shape} HR_MSI={msi.shape} valid={mask.mean():.5f}")

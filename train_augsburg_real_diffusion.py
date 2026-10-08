@@ -441,6 +441,19 @@ def main():
     set_seed(args.seed)
     device = get_device(args.device)
     sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
+    train_meta = _load_json(os.path.join(args.cache_root, "train", "meta.json"))
+    msi_source = train_meta.get("msi_source", "real_Sentinel_2")
+    if msi_source == "official_EeteS_simulated_Sentinel_2":
+        if args.radiometry_json:
+            raise ValueError(
+                "Simulated-MSI control requires --radiometry_json '' "
+                "(do not apply real-S2 radiometry to simulated MSI)"
+            )
+        if args.geometry_mode != "identity":
+            raise ValueError(
+                "Simulated-MSI control requires --geometry_mode identity "
+                "(Real-C was trained against a different real MSI source)"
+            )
     radiometry = _radiometry(args.radiometry_json, device)
 
     train_loader, val_loader, test_loader, info = build_augsburg_real_loaders(
@@ -563,8 +576,8 @@ def main():
         print(f"RESUMED epoch={start_epoch} validated_best_{args.monitor}={best:.6f}")
 
     print(
-        f"AUGSBURG_REAL_D2 geometry_mode={args.geometry_mode} "
-        "output_frame=metadata_harmonized_real_S2 "
+        f"AUGSBURG_REAL_D2 msi_source={msi_source} geometry_mode={args.geometry_mode} "
+        "output_frame=metadata_harmonized_S2_grid "
         f"reference_supervision={'normalized_warp_adjoint' if args.geometry_mode == 'estimated' else 'direct_georeferenced'} "
         f"scale=3 stages={base_process.stages} sigma={sigma:.6f} "
         f"geometry_steps={args.geometry_steps if args.geometry_mode == 'estimated' else 0}"
@@ -599,7 +612,8 @@ def main():
             "stages": [1, 2, 3],
             "geometry_checkpoint": args.geometry_checkpoint,
             "geometry_mode": args.geometry_mode,
-            "output_frame": "real_S2",
+            "msi_source": msi_source,
+            "output_frame": "metadata_harmonized_S2_grid",
             "reference_metric_frame": (
                 "forward_warp_to_EnMAP10"
                 if args.geometry_mode == "estimated"
@@ -648,7 +662,8 @@ def main():
                     "stages": [1, 2, 3],
                     "geometry_checkpoint": args.geometry_checkpoint,
                     "geometry_mode": args.geometry_mode,
-                    "output_frame": "real_S2",
+                    "msi_source": msi_source,
+                    "output_frame": "metadata_harmonized_S2_grid",
                     "reference_metric_frame": (
                         "forward_warp_to_EnMAP10"
                         if args.geometry_mode == "estimated"

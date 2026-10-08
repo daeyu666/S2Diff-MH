@@ -496,6 +496,9 @@ def main():
     ensure_dir(args.checkpoint_root)
     ensure_dir(args.log_root)
     checkpoint = os.path.join(args.checkpoint_root, args.save_name + ".pth")
+    last_checkpoint = os.path.join(
+        args.checkpoint_root, args.save_name + "_last.pth"
+    )
     logger = CSVLogger(
         os.path.join(args.log_root, args.save_name + ".csv"),
         [
@@ -541,6 +544,24 @@ def main():
             f"epoch={epoch:03d}/{args.epochs} loss={tr['loss']:.7f} "
             f"l1={tr['l1']:.7f} sam={tr['sam']:.7f} ref={tr['ref']:.7f} "
             f"phy={tr['phy']:.7f} msi={tr['msi']:.7f}"
+        )
+        save_checkpoint(
+            model,
+            optimizer,
+            epoch,
+            best,
+            last_checkpoint,
+            extra={
+                "stage": "AugsburgReal-D2",
+                "monitor": args.monitor,
+                "effective_sigma": sigma,
+                "scale_ratio": 3,
+                "stages": [1, 2, 3],
+                "geometry_checkpoint": args.geometry_checkpoint,
+                "output_frame": "real_S2",
+                "reference_metric_frame": "forward_warp_to_EnMAP10",
+                "kind": "last",
+            },
         )
         if epoch % args.eval_interval != 0 and epoch != args.epochs:
             continue

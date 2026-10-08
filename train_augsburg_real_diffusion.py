@@ -46,6 +46,8 @@ def parse_args():
     p.add_argument("--geometry_checkpoint", default="",
                    help="Required for estimated geometry mode; unused for identity")
     p.add_argument("--init_checkpoint", default="", help="Synthetic Augsburg D2 or Stage-A checkpoint")
+    p.add_argument("--from_scratch", action="store_true",
+                   help="Initialize without any pretraining checkpoint; required for strict Augsburg-2 Wald protocol")
     p.add_argument("--diffusion_checkpoint", default="", help="Trained Augsburg-Real D2 checkpoint for --stage test")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
@@ -443,6 +445,16 @@ def main():
     sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
     train_meta = _load_json(os.path.join(args.cache_root, "train", "meta.json"))
     msi_source = train_meta.get("msi_source", "real_Sentinel_2")
+    if msi_source == "real_Sentinel_2_Wald_30m":
+        if args.geometry_mode != "identity":
+            raise ValueError("Wald control uses identity geometry; do not reuse Real-C")
+        if args.init_checkpoint:
+            raise ValueError(
+                "Strict Wald protocol must not load an EnMAP10-supervised Augsburg checkpoint; "
+                "use --from_scratch or --resume a Wald-only checkpoint"
+            )
+        if not args.from_scratch and not args.resume:
+            raise ValueError("Wald protocol requires --from_scratch or --resume")
     if msi_source == "official_EeteS_simulated_Sentinel_2":
         if args.radiometry_json:
             raise ValueError(
@@ -522,8 +534,10 @@ def main():
         )
         return
 
-    if not args.init_checkpoint and not args.resume:
-        raise ValueError("Real-D2 training requires --init_checkpoint or --resume")
+    if not args.init_checkpoint and not args.resume and not args.from_scratch:
+        raise ValueError("Real-D2 training requires --init_checkpoint, --resume, or --from_scratch")
+    if args.init_checkpoint and args.from_scratch:
+        raise ValueError("--from_scratch is incompatible with --init_checkpoint")
     if args.init_checkpoint and not args.resume:
         load_checkpoint(
             model,
@@ -575,8 +589,14 @@ def main():
                                 else max(best, logged_best))
         print(f"RESUMED epoch={start_epoch} validated_best_{args.monitor}={best:.6f}")
 
+    reference_frame = (
+        "Wald_EnMAP30"
+        if msi_source == "real_Sentinel_2_Wald_30m"
+        else "metadata_harmonized_EnMAP10"
+    )
     print(
         f"AUGSBURG_REAL_D2 msi_source={msi_source} geometry_mode={args.geometry_mode} "
+        f"reference_frame={reference_frame} "
         "output_frame=metadata_harmonized_S2_grid "
         f"reference_supervision={'normalized_warp_adjoint' if args.geometry_mode == 'estimated' else 'direct_georeferenced'} "
         f"scale=3 stages={base_process.stages} sigma={sigma:.6f} "
@@ -617,7 +637,7 @@ def main():
             "reference_metric_frame": (
                 "forward_warp_to_EnMAP10"
                 if args.geometry_mode == "estimated"
-                else "metadata_harmonized_EnMAP10"
+                else reference_frame
             ),
             "kind": "last",
         }
@@ -667,7 +687,7 @@ def main():
                     "reference_metric_frame": (
                         "forward_warp_to_EnMAP10"
                         if args.geometry_mode == "estimated"
-                        else "metadata_harmonized_EnMAP10"
+                        else reference_frame
                     ),
                 },
             )

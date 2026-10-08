@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--from_scratch", action="store_true",
                    help="Initialize without any pretraining checkpoint; required for strict Augsburg-2 Wald protocol")
     p.add_argument("--diffusion_checkpoint", default="", help="Trained Augsburg-Real D2 checkpoint for --stage test")
+    p.add_argument("--metrics_json", default="",
+                   help="Optional test-only JSON metrics output for held-out Wald A/B/C comparison")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
     p.add_argument("--save_name", default="AugsburgReal_D2_estimated_geometry")
@@ -691,10 +693,27 @@ def main():
             device=device,
         )
         print(
-            f"FINAL_REAL_D2 REF_PSNR={metrics['ref_psnr']:.6f} "
+            f"FINAL_REAL_D2 geometry_mode={args.geometry_mode} "
+            f"REF_PSNR={metrics['ref_psnr']:.6f} "
             f"REF_SAM={metrics['ref_sam']:.6f} "
             f"PHY_L1={metrics['phy']:.8f} MSI_L1={metrics['msi']:.8f}"
         )
+        if args.metrics_json:
+            ensure_dir(os.path.dirname(os.path.abspath(args.metrics_json)))
+            with open(args.metrics_json, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "stage": "Augsburg2-Wald-D2" if is_wald else "AugsburgReal-D2",
+                    "geometry_mode": args.geometry_mode,
+                    "reference": "observed_30m_HSI_only" if is_wald else "legacy",
+                    "msi_source": msi_source,
+                    "effective_sigma": sigma,
+                    "radiometry_json": args.radiometry_json,
+                    "diffusion_checkpoint": args.diffusion_checkpoint,
+                    "geometry_checkpoint": args.geometry_checkpoint,
+                    "split": "test",
+                    "metrics": metrics,
+                }, handle, indent=2)
+            print(f"TEST_METRICS_JSON={os.path.abspath(args.metrics_json)}")
         return
 
     if not args.init_checkpoint and not args.resume and not args.from_scratch:

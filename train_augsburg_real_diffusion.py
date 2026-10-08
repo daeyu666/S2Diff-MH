@@ -671,6 +671,11 @@ def main():
         for parameter in geometry_model.parameters():
             parameter.requires_grad_(False)
 
+    # Branch C constructs a geometry network before the diffusion model.
+    # Reset RNG here so A/B/C receive IDENTICAL raw D2 initial weights,
+    # irrespective of geometry checkpoint/model construction side effects.
+    if is_wald:
+        set_seed(args.seed)
     model = build_model(_config(args), info, device)
     if args.stage == "test":
         if not args.diffusion_checkpoint:

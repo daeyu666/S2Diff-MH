@@ -13,12 +13,19 @@ metrics. Keep the benchmark's full-region pixel-weighted evaluation mask.
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-from augsburg_real import build_augsburg_real_loaders
+from augsburg_real import (
+    _reproject_multiband,
+    _target_profile,
+    build_augsburg_real_loaders,
+)
 from augsburg_real_process import build_augsburg_real_process
 from cdrdi_geometry import spectral_project
 from innovation1 import reconstruct_from_terminal_lr
@@ -43,6 +50,8 @@ def parse_args():
     p.add_argument("--psf_json", default="./data/calibration/AugsburgReal_effective_psf.json")
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
     p.add_argument("--diffusion_checkpoint", default="")
+    p.add_argument("--compare_simulated_msi", action="store_true",
+                   help="Compare official same-source EeteS simulated 10m MSI to real S2; validation only")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--eval_patch_size", type=int, default=192)
@@ -161,7 +170,47 @@ def main():
     d2_sam_n = 0
     tiles = 0
 
-    for batch in val_loader:
+    sim_msi = None
+    sim_vs_gt = ChannelStats(4)
+    sim_corr = CorrStats(4)
+    real_vs_sim = ChannelStats(4)
+    real_sim_corr = CorrStats(4)
+    if args.compare_simulated_msi:
+        metadata_path = os.path.join(args.cache_root, "validation", "meta.json")
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        gt_path = metadata["gt_source"]
+        sim_path = gt_path.replace("EnMAP_10m", "Sentinel_2_10m")
+        if sim_path == gt_path or not os.path.isfile(sim_path):
+            raise FileNotFoundError(
+                "Official simulated MSI validation product not found: " + sim_path
+            )
+        import rasterio
+        with rasterio.open(sim_path) as src:
+            n_sim_bands = int(src.count)
+        if n_sim_bands == 4:
+            sim_indexes = [1, 2, 3, 4]
+        elif n_sim_bands == 12:
+            sim_indexes = [2, 3, 4, 8]
+        else:
+            raise ValueError(
+                f"Expected official simulated MSI with 4 or 12 bands, got {n_sim_bands}"
+            )
+        crs, transform, width, height = _target_profile(gt_path)
+        sim_msi = _reproject_multiband(
+            sim_path,
+            target_crs=crs,
+            target_transform=transform,
+            target_width=width,
+            target_height=height,
+            indexes=sim_indexes,
+            scale=10000.,
+            resampling="bilinear",
+        )
+        if tuple(sim_msi.shape[:2]) != tuple(val_loader.dataset.gt.shape[:2]):
+            raise RuntimeError("Simulated MSI comparison grid differs from validation cache")
+        print(f"SIMULATED_MSI_SOURCE={sim_path} source_bands={n_sim_bands} selected={sim_indexes}")
+    for sample_index, batch in enumerate(val_loader):
         gt = batch["gt"].to(device)
         y_h = batch["lr_hsi"].to(device)
         y_m = _apply_radiometry(batch["hr_msi"].to(device), radiometry)
@@ -172,6 +221,26 @@ def main():
         gt_proj = spectral_project(gt, srf)
         gt_msi.update(gt_proj, y_m, hr_valid)
         gt_corr.update(gt_proj, y_m, hr_valid)
+
+        if sim_msi is not None:
+            top, left, ph, pw = val_loader.dataset.samples[sample_index]
+            sim_patch = np.asarray(sim_msi[top:top+ph, left:left+pw, :])
+            pad_h = gt.shape[-2] - ph
+            pad_w = gt.shape[-1] - pw
+            if pad_h or pad_w:
+                sim_patch = np.pad(
+                    sim_patch,
+                    ((0, pad_h), (0, pad_w), (0, 0)),
+                    mode="edge",
+                )
+            sim_t = torch.from_numpy(
+                np.ascontiguousarray(sim_patch)
+            ).permute(2, 0, 1).unsqueeze(0).to(device).float()
+            sim_valid = hr_valid & torch.isfinite(sim_t).all(dim=1, keepdim=True)
+            sim_vs_gt.update(gt_proj, sim_t, sim_valid)
+            sim_corr.update(gt_proj, sim_t, sim_valid)
+            real_vs_sim.update(y_m, sim_t, sim_valid)
+            real_sim_corr.update(y_m, sim_t, sim_valid)
 
         if model is not None:
             pred = reconstruct_from_terminal_lr(
@@ -194,6 +263,23 @@ def main():
         f"{name}={float(corr):.6f}"
         for name, corr in zip(["B2", "B3", "B4", "B8"], gt_corr.values())
     ))
+
+    if sim_msi is not None:
+        sim_vs_gt.report("SIM_GT_MSI", ["B2", "B3", "B4", "B8"])
+        print("SIM_GT_S2_CORR " + " ".join(
+            f"{name}={float(corr):.6f}"
+            for name, corr in zip(["B2", "B3", "B4", "B8"], sim_corr.values())
+        ))
+        real_vs_sim.report("REAL_SIM_MSI", ["B2", "B3", "B4", "B8"])
+        print("REAL_SIM_S2_CORR " + " ".join(
+            f"{name}={float(corr):.6f}"
+            for name, corr in zip(["B2", "B3", "B4", "B8"], real_sim_corr.values())
+        ))
+        print(
+            "NOTE: SIM_GT_MSI uses the frozen S2B SRF projection of EnMAP10 "
+            "for the GT side; exact agreement with the S2eteS simulator is "
+            "not assumed. Per-band correlation is gain/bias-insensitive."
+        )
 
     if model is not None:
         d2_phy.report("D2_PHY")

@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from cdrdi_geometry import (
     cubic_bspline_field,
     forward_warp,
+    jacobian_determinant,
     sampling_coordinates,
     zero_mean_control,
 )
@@ -287,6 +288,97 @@ class LearnedPhysicalResidualSolver(nn.Module):
         control = self._bound_control(control + delta_control, hr_size)
         return rigid, control
 
+    @staticmethod
+    def _observable_closure_per_sample(
+        target: torch.Tensor,
+        predicted: torch.Tensor,
+        mask: torch.Tensor,
+        window: int,
+    ) -> torch.Tensor:
+        """Match Wald Real-C's locally standardized masked Charbonnier metric.
+
+        Return one score for each batch element; never mix tile decisions.
+        Only used at no-grad evaluation/inference time.
+        """
+        if window < 1 or window % 2 == 0:
+            raise ValueError("acceptance_window must be a positive odd integer")
+        if target.shape != predicted.shape:
+            raise ValueError("Wald target/prediction shape mismatch")
+        if mask.ndim != 4 or mask.shape[0] != target.shape[0] or mask.shape[-2:] != target.shape[-2:]:
+            raise ValueError("acceptance_mask must be Bx1xLRHxLRW or BxCxLRHxLRW")
+        if mask.shape[1] not in (1, target.shape[1]):
+            raise ValueError("acceptance_mask has an invalid spectral dimension")
+
+        def normalize(x):
+            pad = window // 2
+            mu = F.avg_pool2d(x, window, stride=1, padding=pad)
+            second = F.avg_pool2d(x * x, window, stride=1, padding=pad)
+            var = (second - mu * mu).clamp_min(0.0)
+            return (x - mu) / torch.sqrt(var + 1e-8)
+
+        error = normalize(target) - normalize(predicted)
+        charbonnier = torch.sqrt(error.square() + 1e-6) - 1e-3
+        valid = (mask > 0.5).to(charbonnier.dtype).expand_as(charbonnier)
+        return (charbonnier * valid).sum(dim=(1, 2, 3)) / valid.sum(dim=(1, 2, 3)).clamp_min(1)
+
+    def _backtracked_update(
+        self, target, hr_msi, spatial_operator, rigid, control,
+        current, local, sample_x, sample_y, delta_rigid, delta_control,
+        acceptance_mask, acceptance_window, acceptance_min_jac, acceptance_relative_gain,
+    ):
+        """Greedy, per-image line search with a no-worsening physical closure guard.
+
+        The same observed LR-MSI target and fixed PSF are used for every
+        proposal.  The input MSI is never altered.  A rejected update keeps
+        every component of the preceding geometry state, not just its output.
+        """
+        prior = self._observable_closure_per_sample(
+            target, current, acceptance_mask, acceptance_window
+        )
+        valid = (acceptance_mask > 0.5).reshape(target.shape[0], -1).any(dim=1)
+        accepted = torch.zeros_like(prior, dtype=torch.bool)
+        selected_rigid, selected_control = rigid, control
+        selected_current, selected_local = current, local
+        selected_x, selected_y = sample_x, sample_y
+        alpha_selected = torch.zeros_like(prior)
+        threshold = torch.maximum(
+            torch.full_like(prior, 1e-7),
+            prior * float(acceptance_relative_gain),
+        )
+        for alpha in (1.0, 0.5, 0.25, 0.125):
+            proposal_rigid, proposal_control = self._update_state(
+                rigid, control, alpha * delta_rigid, alpha * delta_control, hr_msi.shape[-2:]
+            )
+            proposal_current, proposal_local, proposal_x, proposal_y = self._measurement(
+                hr_msi, spatial_operator, proposal_rigid, proposal_control
+            )
+            proposal_loss = self._observable_closure_per_sample(
+                target, proposal_current, acceptance_mask, acceptance_window
+            )
+            jac_min = jacobian_determinant(proposal_local).flatten(1).amin(dim=1)
+            good = (
+                (~accepted)
+                & valid
+                & torch.isfinite(proposal_loss)
+                & torch.isfinite(jac_min)
+                & (jac_min >= float(acceptance_min_jac))
+                & (proposal_loss <= prior - threshold)
+            )
+            selected_rigid = torch.where(good[:, None], proposal_rigid, selected_rigid)
+            selected_control = torch.where(good[:, None, None, None], proposal_control, selected_control)
+            selected_current = torch.where(good[:, None, None, None], proposal_current, selected_current)
+            selected_local = torch.where(good[:, None, None, None], proposal_local, selected_local)
+            selected_x = torch.where(good[:, None, None], proposal_x, selected_x)
+            selected_y = torch.where(good[:, None, None], proposal_y, selected_y)
+            alpha_selected = torch.where(good, alpha_selected.new_full((), alpha), alpha_selected)
+            accepted = accepted | good
+            if bool(accepted.all().item()):
+                break
+        return (
+            selected_rigid, selected_control, selected_current, selected_local,
+            selected_x, selected_y, accepted, alpha_selected
+        )
+
     def forward(
         self,
         target_lr_msi: torch.Tensor,
@@ -295,6 +387,11 @@ class LearnedPhysicalResidualSolver(nn.Module):
         *,
         steps: int = 1,
         update_mode: str = "both",
+        update_policy: str = "plain",
+        acceptance_mask: torch.Tensor | None = None,
+        acceptance_window: int = 5,
+        acceptance_min_jac: float = 0.5,
+        acceptance_relative_gain: float = 1e-4,
     ) -> Dict[str, object]:
         # Ablation acts on every recursive proposal, BEFORE the next residual
         # is computed.  All modes preserve the calibrated physical seed.
@@ -302,6 +399,15 @@ class LearnedPhysicalResidualSolver(nn.Module):
             raise ValueError(
                 "update_mode must be both, rigid_only, local_only, or seed_only"
             )
+        if update_policy not in ("plain", "closure_backtrack"):
+            raise ValueError("update_policy must be plain or closure_backtrack")
+        if update_policy == "closure_backtrack":
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError("closure_backtrack is evaluation-only and requires torch.no_grad()")
+            if acceptance_mask is None:
+                raise ValueError("closure_backtrack requires an observed LR acceptance_mask")
+            if not (0.0 <= acceptance_relative_gain < 1.0):
+                raise ValueError("acceptance_relative_gain must lie in [0,1)")
         if steps < 1:
             raise ValueError("steps must be >=1")
         if target_lr_msi.ndim != 4 or hr_msi.ndim != 4:
@@ -337,6 +443,8 @@ class LearnedPhysicalResidualSolver(nn.Module):
         control_states: List[torch.Tensor] = []
         sampling_x_states: List[torch.Tensor] = []
         sampling_y_states: List[torch.Tensor] = []
+        accepted_steps: List[torch.Tensor] = []
+        accepted_alphas: List[torch.Tensor] = []
 
         for _ in range(int(steps)):
             features = self._state_features(
@@ -358,12 +466,28 @@ class LearnedPhysicalResidualSolver(nn.Module):
                     delta_control = torch.zeros_like(delta_control)
                 elif update_mode == "local_only":
                     delta_rigid = torch.zeros_like(delta_rigid)
-            rigid, control = self._update_state(
-                rigid, control, delta_rigid, delta_control, (h, w)
-            )
-            current, local, sample_x, sample_y = self._measurement(
-                hr_msi, spatial_operator, rigid, control
-            )
+            if update_policy == "closure_backtrack":
+                (
+                    rigid, control, current, local, sample_x, sample_y,
+                    accepted, accepted_alpha
+                ) = self._backtracked_update(
+                    target_lr_msi, hr_msi, spatial_operator,
+                    rigid, control, current, local, sample_x, sample_y,
+                    delta_rigid, delta_control,
+                    acceptance_mask, acceptance_window,
+                    acceptance_min_jac, acceptance_relative_gain,
+                )
+            else:
+                rigid, control = self._update_state(
+                    rigid, control, delta_rigid, delta_control, (h, w)
+                )
+                current, local, sample_x, sample_y = self._measurement(
+                    hr_msi, spatial_operator, rigid, control
+                )
+                accepted = current.new_ones((batch,), dtype=torch.bool)
+                accepted_alpha = current.new_ones((batch,))
+            accepted_steps.append(accepted)
+            accepted_alphas.append(accepted_alpha)
             predictions.append(current)
             local_fields.append(local)
             rigid_states.append(rigid)
@@ -384,4 +508,6 @@ class LearnedPhysicalResidualSolver(nn.Module):
             "final_local_field": local_fields[-1],
             "final_rigid": rigid_states[-1],
             "final_control": control_states[-1],
+            "accepted_steps": accepted_steps,
+            "accepted_alphas": accepted_alphas,
         }

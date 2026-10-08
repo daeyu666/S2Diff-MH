@@ -11,6 +11,7 @@ warps observed LR-HSI.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -546,6 +547,20 @@ def main():
             map_location=str(device),
         )
         best = stored
+        # Older _last checkpoints were saved before validation. Recover the
+        # latest validated best from this run's CSV before training resumes.
+        if os.path.isfile(logger.csv_path):
+            with open(logger.csv_path, "r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if not row.get("epoch") or not row.get("best"):
+                        continue
+                    if int(row["epoch"]) > start_epoch:
+                        continue
+                    logged_best = float(row["best"])
+                    if math.isfinite(logged_best):
+                        best = (min(best, logged_best) if args.monitor == "ref_sam"
+                                else max(best, logged_best))
+        print(f"RESUMED epoch={start_epoch} validated_best_{args.monitor}={best:.6f}")
 
     print(
         f"AUGSBURG_REAL_D2 geometry_mode={args.geometry_mode} "
@@ -576,28 +591,25 @@ def main():
             f"l1={tr['l1']:.7f} sam={tr['sam']:.7f} ref={tr['ref']:.7f} "
             f"phy={tr['phy']:.7f} msi={tr['msi']:.7f}"
         )
+        last_metadata = {
+            "stage": "AugsburgReal-D2",
+            "monitor": args.monitor,
+            "effective_sigma": sigma,
+            "scale_ratio": 3,
+            "stages": [1, 2, 3],
+            "geometry_checkpoint": args.geometry_checkpoint,
+            "geometry_mode": args.geometry_mode,
+            "output_frame": "real_S2",
+            "reference_metric_frame": (
+                "forward_warp_to_EnMAP10"
+                if args.geometry_mode == "estimated"
+                else "metadata_harmonized_EnMAP10"
+            ),
+            "kind": "last",
+        }
         save_checkpoint(
-            model,
-            optimizer,
-            epoch,
-            best,
-            last_checkpoint,
-            extra={
-                "stage": "AugsburgReal-D2",
-                "monitor": args.monitor,
-                "effective_sigma": sigma,
-                "scale_ratio": 3,
-                "stages": [1, 2, 3],
-                "geometry_checkpoint": args.geometry_checkpoint,
-                "geometry_mode": args.geometry_mode,
-                "output_frame": "real_S2",
-                "reference_metric_frame": (
-                    "forward_warp_to_EnMAP10"
-                    if args.geometry_mode == "estimated"
-                    else "metadata_harmonized_EnMAP10"
-                ),
-                "kind": "last",
-            },
+            model, optimizer, epoch, best, last_checkpoint,
+            extra=last_metadata,
         )
         if epoch % args.eval_interval != 0 and epoch != args.epochs:
             continue
@@ -646,6 +658,12 @@ def main():
             )
             print(
                 f"SAVED_BEST {checkpoint} {args.monitor}={best:.6f}"
+            )
+            # Synchronize best_metric in _last after successful validation.
+            # Retain pre-validation save above to survive eval failures.
+            save_checkpoint(
+                model, optimizer, epoch, best, last_checkpoint,
+                extra=last_metadata,
             )
         logger.write(
             {

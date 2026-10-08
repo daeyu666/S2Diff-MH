@@ -11,6 +11,7 @@ from degradations.effective_gaussian import EffectiveGaussianDegradation
 from diagnose_augsburg2_wald_cdrdi_depths import (
     collect_depth_metrics,
     parse_depths,
+    parse_modes,
 )
 from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
 
@@ -22,6 +23,53 @@ class WaldDepthDiagnosticTests(unittest.TestCase):
             parse_depths("-1,0")
         with self.assertRaises(ValueError):
             parse_depths("")
+
+    def test_mode_parser(self):
+        self.assertEqual(
+            parse_modes("rigid_only,both,local_only,rigid_only,seed_only"),
+            ["rigid_only", "both", "local_only", "seed_only"]
+        )
+        for bad in ("", "both,garbage", "none"):
+            with self.assertRaises(ValueError):
+                parse_modes(bad)
+
+    def test_ablation_masks_updates_during_each_iteration(self):
+        torch.manual_seed(21)
+        torch.set_num_threads(min(torch.get_num_threads(), 2))
+        msi = torch.rand(1, 4, 24, 24)
+        operator = EffectiveGaussianDegradation(scale_ratio=3, terminal_sigma=1.2)
+        target = operator.degrade(msi)
+        solver = LearnedPhysicalResidualSolver(
+            4, base_channels=8, control_grid=5, max_translation=1.0,
+            max_rotation_deg=0.5, max_local_px=0.5,
+            initial_dx_px=-0.5
+        ).eval()
+        with torch.no_grad():
+            full = solver(target, msi, operator, steps=3)
+            both = solver(target, msi, operator, steps=3, update_mode="both")
+            rigid = solver(target, msi, operator, steps=3, update_mode="rigid_only")
+            local = solver(target, msi, operator, steps=3, update_mode="local_only")
+            seed = solver(target, msi, operator, steps=3, update_mode="seed_only")
+            for a, b in zip(full["predictions"], both["predictions"]):
+                torch.testing.assert_close(a, b, rtol=0, atol=1e-7)
+            torch.testing.assert_close(
+                full["final_rigid"], both["final_rigid"], rtol=0, atol=1e-7
+            )
+            for control in rigid["local_fields"]:
+                self.assertLess(float(control.abs().max()), 1e-8)
+            for state in local["rigid_states"]:
+                self.assertAlmostEqual(float(state[0, 0]), -0.5, places=6)
+                self.assertLess(float(state[0, 1:].abs().max()), 1e-8)
+            for pred, state, control in zip(
+                seed["predictions"], seed["rigid_states"], seed["local_fields"]
+            ):
+                torch.testing.assert_close(
+                    pred, seed["initial_prediction"], rtol=0, atol=1e-7
+                )
+                self.assertAlmostEqual(float(state[0, 0]), -0.5, places=6)
+                self.assertLess(float(control.abs().max()), 1e-8)
+            with self.assertRaisesRegex(ValueError, "update_mode"):
+                solver(target, msi, operator, steps=1, update_mode="unknown")
 
     def test_common_input_all_steps_and_seed_better_than_identity(self):
         torch.manual_seed(8)
@@ -72,6 +120,29 @@ class WaldDepthDiagnosticTests(unittest.TestCase):
         for depth in (0, 1, 3):
             self.assertAlmostEqual(result[depth]["norm"], short[depth]["norm"], places=6)
             self.assertAlmostEqual(result[depth]["dx"], short[depth]["dx"], places=6)
+
+        for mode in ("rigid_only", "local_only", "seed_only"):
+            alternative, _ = collect_depth_metrics(
+                solver, [sample], depths=depths, update_mode=mode, **kwargs
+            )
+            self.assertAlmostEqual(
+                alternative["identity"]["norm"], result["identity"]["norm"], places=7
+            )
+            self.assertAlmostEqual(
+                alternative[0]["norm"], result[0]["norm"], places=7
+            )
+            if mode == "rigid_only":
+                self.assertLess(alternative[9]["local_mean"], 1e-8)
+            elif mode == "local_only":
+                self.assertAlmostEqual(alternative[9]["dx"], -0.5, places=6)
+            else:
+                for depth in depths:
+                    self.assertAlmostEqual(
+                        alternative[depth]["norm"], alternative[0]["norm"], places=7
+                    )
+                    self.assertAlmostEqual(
+                        alternative[depth]["reduction_vs_seed_pct"], 0, places=6
+                    )
 
 
 if __name__ == "__main__":

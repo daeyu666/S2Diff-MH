@@ -53,6 +53,10 @@ def parse_args():
                    help="Comma-separated depths. A single max-depth pass supplies all intermediate states")
     p.add_argument("--modes", default="both",
                    help="Comma-separated per-iteration modes: both,rigid_only,local_only,seed_only")
+    p.add_argument("--policies", default="plain",
+                   help="Comma-separated policies: plain,closure_backtrack; guarded policy never trains")
+    p.add_argument("--acceptance_min_jac", type=float, default=0.5)
+    p.add_argument("--acceptance_relative_gain", type=float, default=1e-4)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--output_csv", default="./logs/augsburg_real/Augsburg2_Wald_C_depth_diagnostic.csv")
@@ -74,6 +78,14 @@ def parse_modes(value: str):
     if not modes or any(mode not in allowed for mode in modes):
         raise ValueError("modes must be chosen from: " + ",".join(allowed))
     return modes
+
+
+def parse_policies(value: str):
+    allowed = ("plain", "closure_backtrack")
+    policies = list(dict.fromkeys(p.strip() for p in value.split(",") if p.strip()))
+    if not policies or any(policy not in allowed for policy in policies):
+        raise ValueError("policies must be chosen from: " + ",".join(allowed))
+    return policies
 
 
 def _closure_values(target, prediction, mask, *, window):
@@ -108,6 +120,7 @@ def _new_record():
         "weighted": {k: 0.0 for k in (
             "norm", "raw", "grad", "dx", "dy", "theta", "theta_abs",
             "delta_dx", "delta_dy", "local_mean", "local_max",
+            "step_accept", "cumulative_accept",
         )},
         "pixels": 0.0,
         "min_jac": float("inf"),
@@ -117,7 +130,9 @@ def _new_record():
 
 
 def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
-                          local_window=5, tile_positions=None, update_mode="both"):
+                          local_window=5, tile_positions=None, update_mode="both",
+                          update_policy="plain", acceptance_min_jac=0.5,
+                          acceptance_relative_gain=1e-4):
     """Evaluate identity, seed (depth 0), and recursively updated states.
 
     All rows use the exact same LR observation, MSI, ROI mask, and tile weighting.
@@ -145,6 +160,10 @@ def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
                 model, batch, p0=p0, srf=srf, radiometry=radiometry,
                 steps=eval_steps, device=device, augment_shift_px=0.0,
                 update_mode=update_mode,
+                update_policy=update_policy,
+                acceptance_window=local_window,
+                acceptance_min_jac=acceptance_min_jac,
+                acceptance_relative_gain=acceptance_relative_gain,
             )
             weight = float(mask[:, 0].sum().item())
             if weight <= 0:
@@ -181,9 +200,21 @@ def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
                 geo = _geometry_values(
                     rigid, local, seed_dx=seed_dx, seed_dy=seed_dy
                 )
+                if isinstance(d, int) and d > 0:
+                    step_accept = float(outputs["accepted_steps"][d - 1].float().mean().item())
+                    cumulative_accept = float(torch.stack(
+                        outputs["accepted_steps"][:d], dim=0
+                    ).float().mean().item())
+                else:
+                    step_accept, cumulative_accept = 0.0, 0.0
                 rec = records[d]
                 for k in rec["weighted"]:
-                    rec["weighted"][k] += (close[k] if k in close else geo[k]) * weight
+                    value = close[k] if k in close else (
+                        step_accept if k == "step_accept" else (
+                            cumulative_accept if k == "cumulative_accept" else geo[k]
+                        )
+                    )
+                    rec["weighted"][k] += value * weight
                 rec["pixels"] += weight
                 rec["min_jac"] = min(rec["min_jac"], geo["min_jac"])
                 rec["wins"] += int(close["norm"] < seed_norm - 1e-12)
@@ -192,11 +223,13 @@ def collect_depth_metrics(model, loader, *, p0, srf, radiometry, depths, device,
                     top, left, ph, pw = tile_positions[tile_index]
                     tiles_out.append({
                         "mode": update_mode,
+                        "policy": update_policy,
                         "tile": tile_index, "top": top, "left": left,
                         "height": ph, "width": pw, "depth": d,
                         "norm": close["norm"], "raw": close["raw"],
                         "dx": geo["dx"], "dy": geo["dy"], "theta": geo["theta"],
                         "local_mean": geo["local_mean"], "min_jac": geo["min_jac"],
+                        "step_accept": step_accept, "cumulative_accept": cumulative_accept,
                         "improved_over_seed": int(close["norm"] < seed_norm - 1e-12),
                     })
 
@@ -238,6 +271,11 @@ def main():
     args = parse_args()
     depths = parse_depths(args.depths)
     modes = parse_modes(args.modes)
+    policies = parse_policies(args.policies)
+    if not 0.0 <= args.acceptance_relative_gain < 1.0:
+        raise ValueError("--acceptance_relative_gain must lie in [0,1)")
+    if not 0.0 < args.acceptance_min_jac <= 1.5:
+        raise ValueError("--acceptance_min_jac must lie in (0,1.5]")
     if 0 not in depths:
         raise ValueError("--depths must include 0 for the -0.5px seed comparison")
     if args.eval_patch_size % 3:
@@ -303,22 +341,26 @@ def main():
     all_rows = {}
     combined = []
     all_tile_rows = []
-    for mode in modes:
+    combinations = [(policy, mode) for policy in policies for mode in modes]
+    for policy, mode in combinations:
         rows, tile_rows = collect_depth_metrics(
             model, loader, p0=p0, srf=srf, radiometry=radiometry,
             depths=depths, device=device, local_window=args.local_window,
             tile_positions=dataset.samples if args.per_tile_csv else None,
             update_mode=mode,
+            update_policy=policy,
+            acceptance_min_jac=args.acceptance_min_jac,
+            acceptance_relative_gain=args.acceptance_relative_gain,
         )
-        all_rows[mode] = rows
+        all_rows[(policy, mode)] = rows
         all_tile_rows.extend(tile_rows)
         for depth in ("identity", *depths):
             m = rows[depth]
-            # Keep the original CDRDI_DEPTH prefix for a single default run.
-            tag = "CDRDI_DEPTH" if modes == ["both"] else "CDRDI_BRANCH"
-            mode_info = "" if modes == ["both"] else f"mode={mode} "
+            simple = combinations == [("plain", "both")]
+            tag = "CDRDI_DEPTH" if simple else "CDRDI_GUARD"
+            prefix = "" if simple else f"policy={policy} mode={mode} "
             print(
-                f"{tag} {mode_info}step={depth} NORM={m['norm']:.8f} RAW={m['raw']:.8f} "
+                f"{tag} {prefix}step={depth} NORM={m['norm']:.8f} RAW={m['raw']:.8f} "
                 f"GRAD={m['grad']:.8f} "
                 f"REDUCTION={m['reduction_vs_identity_pct']:+.3f}% "
                 f"RESIDUAL_REDUCTION={m['reduction_vs_seed_pct']:+.3f}% "
@@ -326,56 +368,61 @@ def main():
                 f"DELTA_DX={m['delta_dx']:+.4f} DELTA_DY={m['delta_dy']:+.4f} "
                 f"THETA={m['theta']:+.4f} LOCAL_MEAN={m['local_mean']:.4f} "
                 f"LOCAL_MAX={m['local_max']:.4f} MIN_JAC={m['min_jac']:.5f} "
+                f"STEP_ACCEPT={100*m['step_accept']:.2f}% "
+                f"CUM_ACCEPT={100*m['cumulative_accept']:.2f}% "
                 f"WIN_RATE={m['win_rate_vs_seed']:.2f}%"
             )
-            combined.append({"mode": mode, **m})
-        positive = [d for d in depths if d > 0]
+            combined.append({"policy": policy, "mode": mode, **m})
+
         best_depth = min(depths, key=lambda d: rows[d]["norm"])
-        harmful = [d for d in positive if rows[d]["norm"] >= rows[0]["norm"]]
-        first_harmful = min(harmful) if harmful else None
+        harmful = [d for d in depths if d > 0 and rows[d]["norm"] >= rows[0]["norm"]]
         print(
-            f"CDRDI_DEPTH_SUMMARY mode={mode} best_depth={best_depth} "
-            f"first_harmful_tested_depth={first_harmful} "
+            f"CDRDI_DEPTH_SUMMARY policy={policy} mode={mode} best_depth={best_depth} "
+            f"first_harmful_tested_depth={min(harmful) if harmful else None} "
             f"seed_reduction={rows[0]['reduction_vs_identity_pct']:+.3f}% "
             f"best_residual_reduction={rows[best_depth]['reduction_vs_seed_pct']:+.3f}%"
         )
-        if best_depth == 0:
-            print(f"DIAGNOSIS mode={mode} result=NO_TESTED_RECURSIVE_DEPTH_BEATS_SEED")
-        elif first_harmful is not None:
-            print(f"DIAGNOSIS mode={mode} result=RECURSION_CAN_OVER_CORRECT")
-        else:
-            print(f"DIAGNOSIS mode={mode} result=ALL_TESTED_DEPTHS_BEAT_SEED")
 
-    # Modes are evaluated independently on the exact same deterministic
-    # validation data. Baseline equality is a mandatory fairness assertion.
-    baseline = all_rows[modes[0]]
-    for mode in modes[1:]:
+    # Enforce comparison over identical validation tiles, masks and physical seed.
+    first = all_rows[combinations[0]]
+    for choice in combinations[1:]:
+        other = all_rows[choice]
         for control in ("identity", 0):
-            if abs(all_rows[mode][control]["norm"] - baseline[control]["norm"]) > 1e-7:
-                raise RuntimeError(
-                    f"Ablation mismatch: {mode} and {modes[0]} differ at baseline {control}"
-                )
+            if abs(other[control]["norm"] - first[control]["norm"]) > 1e-7:
+                raise RuntimeError(f"Control changed across {choice}: step={control}")
         for d in depths:
-            if all_rows[mode][d]["valid_lr_pixels"] != baseline[d]["valid_lr_pixels"]:
-                raise RuntimeError(f"Ablation used different validation pixels: {mode} depth={d}")
+            if other[d]["valid_lr_pixels"] != first[d]["valid_lr_pixels"]:
+                raise RuntimeError(f"Validation pixels changed across {choice}: step={d}")
+
+    # The guarded policy must be non-worsening for the exact metric used
+    # by its acceptance rule (local standardized observable closure).
+    for policy, mode in combinations:
+        if policy == "closure_backtrack":
+            scores = [all_rows[(policy, mode)][d]["norm"] for d in depths]
+            if any(b > a + 1e-6 for a, b in zip(scores, scores[1:])):
+                raise RuntimeError(f"Guarded physical closure unexpectedly increased: {mode}")
+
     _write_csv(args.output_csv, combined)
     print(f"CDRDI_DEPTH_CSV={os.path.abspath(args.output_csv)}")
     if args.per_tile_csv:
         _write_csv(args.per_tile_csv, all_tile_rows)
         print(f"CDRDI_TILE_CSV={os.path.abspath(args.per_tile_csv)}")
 
-    if len(modes) > 1:
+    if len(combinations) > 1:
         for d in (depth for depth in depths if depth > 0):
-            ranked = sorted(modes, key=lambda mode: all_rows[mode][d]["norm"])
+            ranked = sorted(combinations, key=lambda key: all_rows[key][d]["norm"])
             best = ranked[0]
             print(
-                f"CDRDI_BRANCH_RANK step={d} best_mode={best} "
+                f"CDRDI_GUARD_RANK step={d} "
+                f"best_policy={best[0]} best_mode={best[1]} "
                 f"best_norm={all_rows[best][d]['norm']:.8f} "
                 f"best_residual_reduction={all_rows[best][d]['reduction_vs_seed_pct']:+.3f}% "
-                f"ranking={','.join(ranked)}"
+                f"ranking={','.join(p + ':' + m for p, m in ranked)}"
             )
-        print("CDRDI_ABLATION_NOTE=branch ablation is diagnostic only; do not select using test data")
-
+    print(
+        "CDRDI_GUARD_NOTE=only the specified masked normalized closure is "
+        "protected; this is not evidence of improved registration or 30m HSI reconstruction"
+    )
 
 if __name__ == "__main__":
     main()

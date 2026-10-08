@@ -3,9 +3,13 @@
 No network, checkpoints, real Augsburg files or 10m HSI ground truth needed.
 Run: python -m unittest discover -s tests -p test_augsburg2_wald_qnr.py
 """
+import json
+import os
+import tempfile
 import unittest
 import numpy as np
-from augsburg2_wald_qnr import projected_qnr, _masked_uiqi
+from augsburg2_wald_qnr import projected_qnr, _masked_uiqi, evaluate_cache
+from compare_augsburg2_wald_qnr import compare_qnr
 
 
 def _inputs(seed=13):
@@ -66,6 +70,60 @@ class WaldProjectedQNRTests(unittest.TestCase):
             projected_qnr(fused, lr, msi, mask, wrong_srf)
         with self.assertRaisesRegex(ValueError, "window_hr"):
             projected_qnr(fused, lr, msi, mask, srf, window_hr=50)
+
+    def test_identical_metric_reports_compare_to_zero(self):
+        fused, lr, msi, mask, srf = _inputs()
+        m = projected_qnr(fused, lr, msi, mask, srf)
+        self.assertEqual(compare_qnr(m, dict(m)), {
+            "QNR": 0.0, "Dlambda": 0.0, "Ds": 0.0
+        })
+        bad = dict(m)
+        bad["high_window"] = 96
+        with self.assertRaisesRegex(ValueError, "high_window"):
+            compare_qnr(m, bad)
+
+    def test_cache_matches_direct_eval_and_checks_provenance(self):
+        fused, lr, msi, mask, srf = _inputs()
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("train", "validation", "test"):
+                root = os.path.join(directory, name)
+                os.makedirs(root)
+                with open(os.path.join(root, "meta.json"), "w", encoding="utf-8") as f:
+                    json.dump({
+                        "msi_source": "real_Sentinel_2_Wald_30m",
+                        "target": "30m_EnMAP_like",
+                        "gt_source": "observed_30m_HSI_only",
+                        "scale_ratio": 3,
+                    }, f)
+            full = os.path.join(directory, "full")
+            os.makedirs(full)
+            with open(os.path.join(full, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump({"region": "sub_area_2"}, f)
+            with open(os.path.join(directory, "wald_psf.json"), "w", encoding="utf-8") as f:
+                json.dump({"scale_ratio": 3, "terminal_sigma_hr_pixels": 1.2}, f)
+            calibration = os.path.join(directory, "calibration.json")
+            with open(calibration, "w", encoding="utf-8") as f:
+                json.dump({"dataset": "Augsburg-2-Wald",
+                           "uses_EnMAP10_reference": False,
+                           "gain": [1, 1, 1, 1],
+                           "bias": [0, 0, 0, 0]}, f)
+            np.save(os.path.join(directory, "srf_weights.npy"), srf)
+            np.save(os.path.join(full, "lr_hsi.npy"), lr)
+            np.save(os.path.join(full, "hr_msi.npy"), msi)
+            np.save(os.path.join(full, "valid_mask.npy"), mask)
+            out = os.path.join(directory, "fused.npy")
+            np.save(out, fused)
+            direct = projected_qnr(fused, lr, msi, mask, srf)
+            cached = evaluate_cache(directory, out, calibration)
+            for k in ("QNR", "Dlambda", "Ds"):
+                self.assertAlmostEqual(direct[k], cached[k], places=7)
+            with open(calibration, "w", encoding="utf-8") as f:
+                json.dump({"dataset": "Augsburg-2-Wald",
+                           "uses_EnMAP10_reference": True,
+                           "gain": [1, 1, 1, 1],
+                           "bias": [0, 0, 0, 0]}, f)
+            with self.assertRaisesRegex(ValueError, "train-only"):
+                evaluate_cache(directory, out, calibration)
 
     def test_uiqi_ignores_invalid_samples(self):
         rng = np.random.default_rng(4)

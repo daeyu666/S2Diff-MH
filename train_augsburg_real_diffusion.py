@@ -389,14 +389,9 @@ def train_one_epoch(
         mask_ref = batch["valid_mask"].to(device, non_blocking=True) > 0.5
 
         with torch.no_grad():
-            if args.geometry_mode == "estimated":
-                rigid, local = _estimate_geometry(
-                    geometry_model,
-                    y_h,
-                    y_m,
-                    p0=p0,
-                    srf=srf,
-                    steps=args.geometry_steps,
+            if _geometry_required(args):
+                rigid, local = _batch_geometry(
+                    args, geometry_model, y_h, y_m, mask_ref, p0=p0, srf=srf
                 )
                 process = _estimated_process(base_process, rigid, local)
                 gt_msi = _warp_adjoint_normalized(gt_ref, rigid, local)
@@ -426,7 +421,7 @@ def train_one_epoch(
         pred_ref = (
             forward_warp(
                 pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
-            ) if args.geometry_mode == "estimated" else pred
+            ) if _geometry_required(args) else pred
         )
         ref = _masked_l1(pred_ref, gt_ref, mask_ref)
         phy = _masked_l1(
@@ -493,14 +488,9 @@ def evaluate(
         y_h = batch["lr_hsi"].to(device)
         y_m = _apply_radiometry(batch["hr_msi"].to(device), radiometry)
         mask_ref = batch["valid_mask"].to(device) > 0.5
-        if args.geometry_mode == "estimated":
-            rigid, local = _estimate_geometry(
-                geometry_model,
-                y_h,
-                y_m,
-                p0=p0,
-                srf=srf,
-                steps=args.geometry_steps,
+        if _geometry_required(args):
+            rigid, local = _batch_geometry(
+                args, geometry_model, y_h, y_m, mask_ref, p0=p0, srf=srf
             )
             process = _estimated_process(base_process, rigid, local)
         else:
@@ -517,7 +507,7 @@ def evaluate(
         pred_ref = (
             forward_warp(
                 pred, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
-            ) if args.geometry_mode == "estimated" else pred
+            ) if _geometry_required(args) else pred
         )
         sse, n_values, sam_sum, sam_count = _masked_metric_sums(
             pred_ref, gt_ref, mask_ref
@@ -539,7 +529,7 @@ def evaluate(
 
         mask_msi = (
             _mask_to_msi(mask_ref, rigid, local)
-            if args.geometry_mode == "estimated" else mask_ref
+            if _geometry_required(args) else mask_ref
         )
         msi_value = float(
             _masked_l1(spectral_project(pred, srf), y_m, mask_msi).item()
@@ -565,19 +555,25 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = get_device(args.device)
-    sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
     train_meta = _load_json(os.path.join(args.cache_root, "train", "meta.json"))
+    if train_meta.get("msi_source") == "real_Sentinel_2_Wald_30m":
+        if args.psf_json == "./data/calibration/AugsburgReal_effective_psf.json":
+            args.psf_json = os.path.join(args.cache_root, "wald_psf.json")
+        if args.radiometry_json == "./data/calibration/AugsburgReal_radiometry.json":
+            args.radiometry_json = "./data/calibration/Augsburg2_Wald_radiometry.json"
+    sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
     msi_source = train_meta.get("msi_source", "real_Sentinel_2")
-    if msi_source == "real_Sentinel_2_Wald_30m":
-        if args.geometry_mode != "identity":
-            raise ValueError("Wald control uses identity geometry; do not reuse Real-C")
-        if args.init_checkpoint:
-            raise ValueError(
-                "Strict Wald protocol must not load an EnMAP10-supervised Augsburg checkpoint; "
-                "use --from_scratch or --resume a Wald-only checkpoint"
-            )
-        if not args.from_scratch and not args.resume:
-            raise ValueError("Wald protocol requires --from_scratch or --resume")
+    is_wald = msi_source == "real_Sentinel_2_Wald_30m"
+    if is_wald:
+        _wald_d2_provenance(args, sigma=sigma)
+        if args.resume:
+            _wald_d2_extra_guard(args.resume, args, msi_source=msi_source, sigma=sigma)
+        if args.stage == "test":
+            if not args.diffusion_checkpoint:
+                raise ValueError("Wald --stage test requires --diffusion_checkpoint")
+            _wald_d2_extra_guard(args.diffusion_checkpoint, args, msi_source=msi_source, sigma=sigma)
+    elif args.geometry_mode in ("wald_fixed", "wald_cdrdi"):
+        raise ValueError("Wald-only geometry modes cannot be used for synthetic/legacy Real-D2")
     if msi_source == "official_EeteS_simulated_Sentinel_2":
         if args.radiometry_json:
             raise ValueError(
@@ -599,6 +595,7 @@ def main():
         min_valid_fraction=args.min_valid_fraction,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        train_augment=not is_wald,
     )
     srf = torch.as_tensor(info["srf_weights"], dtype=torch.float32, device=device)
     base_process = build_augsburg_real_process(
@@ -608,17 +605,29 @@ def main():
     p0 = base_process.operator.to(device)
 
     geometry_model = None
-    if args.geometry_mode == "estimated":
+    if args.geometry_mode in ("estimated", "wald_cdrdi"):
         if not args.geometry_checkpoint:
-            raise ValueError("--geometry_mode estimated requires --geometry_checkpoint")
-        geometry_model = LearnedPhysicalResidualSolver(
-            4,
-            base_channels=args.geometry_base_channels,
-            control_grid=args.control_grid,
-            max_translation=args.max_translation,
-            max_rotation_deg=args.max_rotation_deg,
-            max_local_px=args.max_local_px,
-        ).to(device)
+            raise ValueError("--geometry_mode estimated/wald_cdrdi requires --geometry_checkpoint")
+        if args.geometry_mode == "wald_cdrdi":
+            cc = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-D2")["geometry_config"]
+            geom_cfg = dict(
+                base_channels=int(cc["base_channels"]),
+                control_grid=int(cc["control_grid"]),
+                max_translation=float(cc["max_translation"]),
+                max_rotation_deg=float(cc["max_rotation_deg"]),
+                max_local_px=float(cc["max_local_px"]),
+                initial_dx_px=float(cc["initial_dx_px"]),
+                initial_dy_px=float(cc["initial_dy_px"]),
+            )
+        else:
+            geom_cfg = dict(
+                base_channels=args.geometry_base_channels,
+                control_grid=args.control_grid,
+                max_translation=args.max_translation,
+                max_rotation_deg=args.max_rotation_deg,
+                max_local_px=args.max_local_px,
+            )
+        geometry_model = LearnedPhysicalResidualSolver(4, **geom_cfg).to(device)
         load_checkpoint(
             geometry_model,
             args.geometry_checkpoint,
@@ -721,9 +730,10 @@ def main():
         f"AUGSBURG_REAL_D2 msi_source={msi_source} geometry_mode={args.geometry_mode} "
         f"reference_frame={reference_frame} "
         "output_frame=metadata_harmonized_S2_grid "
-        f"reference_supervision={'normalized_warp_adjoint' if args.geometry_mode == 'estimated' else 'direct_georeferenced'} "
+        f"reference_supervision={'normalized_warp_adjoint' if _geometry_required(args) else 'direct_georeferenced'} "
         f"scale=3 stages={base_process.stages} sigma={sigma:.6f} "
-        f"geometry_steps={args.geometry_steps if args.geometry_mode == 'estimated' else 0}"
+        f"geometry_steps={args.geometry_steps if args.geometry_mode in ('estimated', 'wald_cdrdi') else 0} "
+        f"fixed_shift=({args.fixed_dx_px},{args.fixed_dy_px}) wald_augmentation={not is_wald}"
     )
     print(
         "OBSERVED_LR_HSI inverse_warp=False terminal_observation=real_EnMAP30"

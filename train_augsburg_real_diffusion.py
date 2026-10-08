@@ -242,6 +242,37 @@ def _wald_d2_extra_guard(checkpoint, args, *, msi_source, sigma):
         raise ValueError("Wald-D2 checkpoint has inconsistent guarded CDRDI settings")
 
 
+def _d2_checkpoint_metadata(args, *, msi_source, sigma, reference_frame, kind):
+    is_wald = msi_source == "real_Sentinel_2_Wald_30m"
+    output = {
+        "stage": "Augsburg2-Wald-D2" if is_wald else "AugsburgReal-D2",
+        "monitor": args.monitor,
+        "effective_sigma": sigma,
+        "scale_ratio": 3,
+        "stages": [1, 2, 3],
+        "geometry_checkpoint": args.geometry_checkpoint,
+        "geometry_mode": args.geometry_mode,
+        "geometry_steps": args.geometry_steps if args.geometry_mode == "wald_cdrdi" else 0,
+        "msi_source": msi_source,
+        "output_frame": "Wald_Sentinel_2_30m" if is_wald else "metadata_harmonized_S2_grid",
+        "reference_metric_frame": (
+            "forward_warp_to_observed_EnMAP30" if is_wald and _geometry_required(args)
+            else "forward_warp_to_EnMAP10" if _geometry_required(args)
+            else reference_frame
+        ),
+        "reference_supervision_source": "observed_30m_HSI_only" if is_wald else "legacy",
+        "radiometry_json": args.radiometry_json,
+        "fixed_dx_px": args.fixed_dx_px,
+        "fixed_dy_px": args.fixed_dy_px,
+        "guard_relative_gain": args.guard_relative_gain,
+        "guard_min_jac": args.guard_min_jac,
+        "guard_window": args.guard_window,
+        "wald_train_augmentation": False if is_wald else True,
+        "kind": kind,
+    }
+    return output
+
+
 def _estimated_process(base_process, rigid, local):
     return DeformationAwareProgressiveDegradation(
         base_process,
@@ -757,23 +788,10 @@ def main():
             f"l1={tr['l1']:.7f} sam={tr['sam']:.7f} ref={tr['ref']:.7f} "
             f"phy={tr['phy']:.7f} msi={tr['msi']:.7f}"
         )
-        last_metadata = {
-            "stage": "AugsburgReal-D2",
-            "monitor": args.monitor,
-            "effective_sigma": sigma,
-            "scale_ratio": 3,
-            "stages": [1, 2, 3],
-            "geometry_checkpoint": args.geometry_checkpoint,
-            "geometry_mode": args.geometry_mode,
-            "msi_source": msi_source,
-            "output_frame": "metadata_harmonized_S2_grid",
-            "reference_metric_frame": (
-                "forward_warp_to_EnMAP10"
-                if args.geometry_mode == "estimated"
-                else reference_frame
-            ),
-            "kind": "last",
-        }
+        last_metadata = _d2_checkpoint_metadata(
+            args, msi_source=msi_source, sigma=sigma,
+            reference_frame=reference_frame, kind="last",
+        )
         save_checkpoint(
             model, optimizer, epoch, best, last_checkpoint,
             extra=last_metadata,
@@ -807,22 +825,10 @@ def main():
                 epoch,
                 best,
                 checkpoint,
-                extra={
-                    "stage": "AugsburgReal-D2",
-                    "monitor": args.monitor,
-                    "effective_sigma": sigma,
-                    "scale_ratio": 3,
-                    "stages": [1, 2, 3],
-                    "geometry_checkpoint": args.geometry_checkpoint,
-                    "geometry_mode": args.geometry_mode,
-                    "msi_source": msi_source,
-                    "output_frame": "metadata_harmonized_S2_grid",
-                    "reference_metric_frame": (
-                        "forward_warp_to_EnMAP10"
-                        if args.geometry_mode == "estimated"
-                        else reference_frame
-                    ),
-                },
+                extra=_d2_checkpoint_metadata(
+                    args, msi_source=msi_source, sigma=sigma,
+                    reference_frame=reference_frame, kind="best",
+                ),
             )
             print(
                 f"SAVED_BEST {checkpoint} {args.monitor}={best:.6f}"

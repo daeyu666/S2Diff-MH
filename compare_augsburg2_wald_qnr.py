@@ -17,6 +17,7 @@ COMPARE_FIELDS = (
     "high_valid_pixels", "low_valid_pixels",
     "spectral_reference", "spatial_reference",
     "source_HSI", "source_MSI", "pan_used", "srf_projection_used",
+    "evaluation_area", "test_bbox_30m", "test_bbox_10m", "split_protocol_id",
     "full_HR_HSI_ground_truth_used",
 )
 

@@ -107,6 +107,14 @@ def parse_args():
     p.add_argument("--checkpoint_root", default="./checkpoints/innovation3_gigi")
     p.add_argument("--log_root", default="./logs")
     p.add_argument("--save_name", default="")
+    p.add_argument(
+        "--overwrite_run",
+        action="store_true",
+        help=(
+            "Explicitly discard an existing run with the same checkpoint/log names. "
+            "Without this flag, a fresh train run refuses to overwrite prior results."
+        ),
+    )
     return p.parse_args()
 
 
@@ -199,12 +207,44 @@ def _build_refiner(args, info, device):
     return model
 
 
+def _run_stem(args) -> str:
+    if args.save_name:
+        return os.path.splitext(os.path.basename(args.save_name))[0]
+    return f"{args.dataset}_innovation3_gigi_{args.variant}"
+
+
 def _checkpoint_path(args) -> str:
     ensure_dir(args.checkpoint_root)
     name = args.save_name or f"{args.dataset}_innovation3_gigi_{args.variant}.pth"
     if not name.endswith(".pth"):
         name += ".pth"
     return os.path.join(args.checkpoint_root, name)
+
+
+def _log_path(args) -> str:
+    return os.path.join(args.log_root, _run_stem(args) + ".csv")
+
+
+def _protect_or_reset_run(args, best_path: str, last_path: str, log_path: str):
+    """Never silently append a new epoch-1 run onto an old CSV/checkpoint."""
+    if args.resume:
+        return
+    existing = [p for p in (best_path, last_path, log_path) if os.path.exists(p)]
+    if not existing:
+        return
+    if not args.overwrite_run:
+        joined = "\n  ".join(existing)
+        raise FileExistsError(
+            "A previous registered-GIGI run already exists:\n  "
+            + joined
+            + "\nA fresh run would reset epoch=1, append to the same CSV and "
+              "overwrite the previous best checkpoint. Use --resume <..._last.pth> "
+              "to continue it, or choose a new --save_name/--log_root. "
+              "Use --overwrite_run only when you intentionally want to discard it."
+        )
+    for path in existing:
+        os.remove(path)
+        print(f"OVERWRITE_RUN removed={path}")
 
 
 def _save_checkpoint(model, optimizer, epoch, best_high_sam, path, args):
@@ -483,11 +523,10 @@ def train(args):
     best_path = _checkpoint_path(args)
     stem, ext = os.path.splitext(best_path)
     last_path = stem + "_last" + ext
+    log_path = _log_path(args)
+    _protect_or_reset_run(args, best_path, last_path, log_path)
     logger = CSVLogger(
-        os.path.join(
-            args.log_root,
-            f"{args.dataset}_innovation3_gigi_{args.variant}.csv",
-        ),
+        log_path,
         [
             "epoch",
             "loss",

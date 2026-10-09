@@ -30,8 +30,10 @@ from utils import get_device, load_checkpoint, set_seed
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run full-resolution Augsburg-2 Wald diffusion fusion")
+    p.add_argument("--center_holdout", action="store_true",
+                   help="Use the trained center-test ROI protocol, own checkpoint, calibration and results folder")
     p.add_argument("--wald_root", default="./data/augsburg2_wald")
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--checkpoint", default=None)
     p.add_argument("--radiometry_json", default="./data/calibration/Augsburg2_Wald_radiometry.json")
     p.add_argument("--save_root", default="./outputs/augsburg2_wald")
     p.add_argument("--tile_size", type=int, default=96)
@@ -45,14 +47,28 @@ def parse_args():
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--write_tif", action="store_true")
     p.add_argument("--skip_qnr", action="store_true",
-                   help="Disable UAFL-identical MSI-projected modified QNR; default evaluates it")
+                   help="Skip native-scale HSI-MSI QNR (normally computed and saved on heldout test ROI)")
     p.add_argument("--qnr_window_hr", type=int, default=48,
                    help="UIQI window on original 10m grid (matches UAFL)")
     p.add_argument("--qnr_min_valid_fraction", type=float, default=0.8,
                    help="Minimum valid fraction per non-overlapping UIQI window")
     p.add_argument("--qnr_support_fraction", type=float, default=0.01,
                    help="SRF relative-to-peak threshold for MSI-covered HSI bands")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.center_holdout:
+        if args.wald_root == "./data/augsburg2_wald":
+            args.wald_root = "./data/augsburg2_wald_center_holdout"
+        if args.checkpoint is None:
+            args.checkpoint = "./checkpoints/augsburg_real/center_holdout/Augsburg2_Wald_center_D2_A.pth"
+        if args.radiometry_json == "./data/calibration/Augsburg2_Wald_radiometry.json":
+            args.radiometry_json = "./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json"
+        if args.save_root == "./outputs/augsburg2_wald":
+            args.save_root = "./outputs/augsburg2_wald_center_holdout"
+    elif args.checkpoint is None:
+        p.error("--checkpoint is required without --center_holdout")
+    if args.center_holdout and args.skip_qnr:
+        p.error("--center_holdout requires QNR output; omit --skip_qnr")
+    return args
 
 
 def positions(length, tile, stride):
@@ -256,10 +272,29 @@ def main():
             for band in range(242):
                 dst.write(fused[:, :, band], band + 1)
         print(f"FULL_OUTPUT_GEOTIFF={raster_path}")
+    report_path = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_protocol.json")
+    report = {
+        "model": "S2Diff-MH",
+        "stage": "original_10m_inference",
+        "spatial_protocol_id": split_protocol_id,
+        "evaluation_area": output_suffix,
+        "test_bbox_30m": extra.get("test_bbox_30m"),
+        "checkpoint": os.path.realpath(args.checkpoint),
+        "radiometry_json": os.path.realpath(args.radiometry_json),
+        "wald_root": os.path.realpath(args.wald_root),
+        "reconstruction": os.path.realpath(output_path),
+        "shape": list(fused.shape),
+        "ground_truth_10m_HSI": False,
+        "qnr": qnr,
+        "phy_l1": phy,
+        "msi_l1": msi_l1,
+    }
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
     print(
         f"FULL_OUTPUT_NPY={output_path} shape={fused.shape} "
         f"PHY_L1={phy:.8f} MSI_L1={msi_l1:.8f} "
-        "HR_HSI_REFERENCE=unavailable"
+        f"PROTOCOL_JSON={report_path} HR_HSI_REFERENCE=unavailable"
     )
 
 

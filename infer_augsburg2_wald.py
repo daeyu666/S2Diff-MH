@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from augsburg2_wald_qnr import evaluate_cache
+from augsburg2_wald_center_roi import crop_heldout, geotiff_transform
 from augsburg_real_process import build_augsburg_real_process
 from cdrdi_geometry import spectral_project
 from config import TrainConfig
@@ -138,6 +139,19 @@ def main():
         raise ValueError("Full inference radiometry differs from the Wald-D2 checkpoint")
     if abs(float(extra.get("effective_sigma", -1)) - sigma) > 1e-7:
         raise ValueError("Full inference PSF does not match the Wald-D2 checkpoint")
+    lr, msi, valid, roi_y0, roi_x0, output_suffix, split_protocol_id = crop_heldout(
+        args.wald_root, lr, msi, valid,
+        ckpt_protocol_id=extra.get("split_protocol_id"),
+        ckpt_bbox_30m=extra.get("test_bbox_30m"),
+    )
+    h, w = msi.shape[:2]
+    if h % 6 or w % 6:
+        raise ValueError("Held-out area must be divisible by 6 for the diffusion stages")
+    print(
+        f"WALD_INFERENCE spatial_protocol={split_protocol_id} "
+        f"area={output_suffix} HR_shape={h}x{w} "
+        f"origin_10m_rowcol=({roi_y0},{roi_x0})"
+    )
     load_checkpoint(model, args.checkpoint, map_location=str(device), load_optimizer=False)
     model.eval()
 
@@ -176,7 +190,7 @@ def main():
     fused = sum_cube / weight[..., None]
     fused[~valid] = 0.
     os.makedirs(args.save_root, exist_ok=True)
-    output_path = os.path.join(args.save_root, "Augsburg2_Wald_full_HSI.npy")
+    output_path = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_HSI.npy")
     np.save(output_path, fused.astype(np.float32))
 
     # Diagnostic observation consistency only. No HR-HSI reference exists here.
@@ -204,7 +218,7 @@ def main():
             min_valid_fraction=args.qnr_min_valid_fraction,
             support_fraction=args.qnr_support_fraction,
         )
-        qnr_json = os.path.join(args.save_root, "Augsburg2_Wald_full_QNR.json")
+        qnr_json = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_QNR.json")
         with open(qnr_json, "w", encoding="utf-8") as f:
             json.dump(qnr, f, ensure_ascii=False, indent=2)
         print(
@@ -219,11 +233,11 @@ def main():
     if args.write_tif:
         from affine import Affine
         import rasterio
-        raster_path = os.path.join(args.save_root, "Augsburg2_Wald_full_HSI.tif")
+        raster_path = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_HSI.tif")
         with rasterio.open(
             raster_path, "w", driver="GTiff", height=h, width=w, count=242,
             dtype="float32", crs=full_meta["crs"],
-            transform=Affine(*full_meta["transform_6"]),
+            transform=geotiff_transform(full_meta["transform_6"], roi_y0, roi_x0),
             compress="deflate", tiled=True,
         ) as dst:
             for band in range(242):

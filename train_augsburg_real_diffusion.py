@@ -189,6 +189,18 @@ def _wald_d2_provenance(args, *, sigma):
         raise ValueError("Strict Wald requires all three splits to be genuine Wald 30m observations")
     if args.geometry_mode not in ("identity", "wald_fixed", "wald_cdrdi"):
         raise ValueError("Wald A/B/C only supports identity, wald_fixed and wald_cdrdi")
+    if getattr(args, "wald_protocol_id", "") == "Augsburg2-Wald-center-holdout-v1":
+        if args.train_patch_size != 24 or args.train_stride != 6 or args.eval_patch_size != 48:
+            raise ValueError("Center-holdout Wald-D2 requires train_patch=24 stride=6 eval_patch=48")
+        if not getattr(args, "test_bbox_30m", None):
+            raise ValueError("Center holdout must have an explicit test bbox")
+        if args.geometry_mode == "wald_cdrdi":
+            geom_extra = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-D2")
+            if geom_extra.get("protocol_id") != args.wald_protocol_id:
+                raise ValueError(
+                    "Old same-scene CDRDI checkpoint has seen the held-out center; "
+                    "retrain CDRDI from scratch on this center-holdout cache"
+                )
     if args.init_checkpoint or (args.from_scratch and args.resume):
         raise ValueError("Wald-D2 must train from scratch or resume its own Wald-only checkpoint")
     if args.stage == "train" and not (args.from_scratch or args.resume):
@@ -237,6 +249,10 @@ def _wald_d2_extra_guard(checkpoint, args, *, msi_source, sigma):
         or abs(float(extra.get("fixed_dy_px", 99)) - args.fixed_dy_px) > 1e-7
     ):
         raise ValueError("Wald-D2 checkpoint has inconsistent fixed geometry seed")
+    if (extra.get("split_protocol_id", "legacy_full_region_wald") !=
+        getattr(args, "wald_protocol_id", "legacy_full_region_wald")
+        or extra.get("test_bbox_30m") != getattr(args, "test_bbox_30m", None)):
+        raise ValueError("Wald-D2 checkpoint spatial split differs from selected cache")
     if args.geometry_mode == "wald_cdrdi" and (
         int(extra.get("geometry_steps", -1)) != int(args.geometry_steps)
         or float(extra.get("guard_relative_gain", -1)) != float(args.guard_relative_gain)
@@ -264,6 +280,8 @@ def _d2_checkpoint_metadata(args, *, msi_source, sigma, reference_frame, kind):
         ),
         "reference_supervision_source": "observed_30m_HSI_only" if is_wald else "legacy",
         "radiometry_json": args.radiometry_json,
+        "split_protocol_id": getattr(args, "wald_protocol_id", "legacy_full_region_wald"),
+        "test_bbox_30m": getattr(args, "test_bbox_30m", None),
         "fixed_dx_px": args.fixed_dx_px,
         "fixed_dy_px": args.fixed_dy_px,
         "guard_relative_gain": args.guard_relative_gain,
@@ -597,6 +615,13 @@ def main():
     sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
     msi_source = train_meta.get("msi_source", "real_Sentinel_2")
     is_wald = msi_source == "real_Sentinel_2_Wald_30m"
+    args.wald_protocol_id = train_meta.get("protocol_id", "legacy_full_region_wald")
+    args.test_bbox_30m = train_meta.get("test_bbox_30m", None)
+    if args.wald_protocol_id == "Augsburg2-Wald-center-holdout-v1":
+        for part in ("validation", "test"):
+            part_meta = _load_json(os.path.join(args.cache_root, part, "meta.json"))
+            if part_meta.get("protocol_id") != args.wald_protocol_id:
+                raise ValueError(f"Wald spatial split mismatch: {part}")
     if is_wald:
         _wald_d2_provenance(args, sigma=sigma)
         if args.resume:
@@ -718,6 +743,8 @@ def main():
                     "radiometry_json": args.radiometry_json,
                     "diffusion_checkpoint": args.diffusion_checkpoint,
                     "geometry_checkpoint": args.geometry_checkpoint,
+                    "split_protocol_id": args.wald_protocol_id,
+                    "test_bbox_30m": args.test_bbox_30m,
                     "split": "test",
                     "metrics": metrics,
                 }, handle, indent=2)

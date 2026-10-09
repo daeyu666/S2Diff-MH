@@ -156,6 +156,14 @@ def parse_args():
     )
     p.add_argument("--log_root", default="./logs")
     p.add_argument("--save_name", default="")
+    p.add_argument(
+        "--overwrite_run",
+        action="store_true",
+        help=(
+            "Explicitly discard an existing mixed-training run with the same "
+            "checkpoint/log names. Fresh runs otherwise refuse to overwrite."
+        ),
+    )
     return p.parse_args()
 
 
@@ -428,6 +436,12 @@ def _load_refiner_weights(model, path: str, device):
     print(f"INIT_REFINER_LOAD {path}")
 
 
+def _run_stem(args):
+    if args.save_name:
+        return os.path.splitext(os.path.basename(args.save_name))[0]
+    return f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}"
+
+
 def _checkpoint_path(args):
     ensure_dir(args.checkpoint_root)
     name = (
@@ -437,6 +451,31 @@ def _checkpoint_path(args):
     if not name.endswith(".pth"):
         name += ".pth"
     return os.path.join(args.checkpoint_root, name)
+
+
+def _log_path(args):
+    return os.path.join(args.log_root, _run_stem(args) + ".csv")
+
+
+def _protect_or_reset_run(args, best_path, last_path, log_path):
+    if args.resume:
+        return
+    existing = [p for p in (best_path, last_path, log_path) if os.path.exists(p)]
+    if not existing:
+        return
+    if not args.overwrite_run:
+        joined = "\n  ".join(existing)
+        raise FileExistsError(
+            "A previous mixed GIGI-CDRDI run already exists:\n  "
+            + joined
+            + "\nA fresh run would reset epoch=1, append to the old CSV and "
+              "overwrite the old best checkpoint. Use --resume to continue, "
+              "or choose a new --save_name/--log_root. Use --overwrite_run "
+              "only when intentional."
+        )
+    for path in existing:
+        os.remove(path)
+        print(f"OVERWRITE_RUN removed={path}")
 
 
 def _save_checkpoint(model, optimizer, epoch, best_value, path, args):
@@ -890,11 +929,10 @@ def train(args):
     stem, ext = os.path.splitext(best_path)
     last_path = stem + "_last" + ext
     ensure_dir(args.log_root)
+    log_path = _log_path(args)
+    _protect_or_reset_run(args, best_path, last_path, log_path)
     logger = CSVLogger(
-        os.path.join(
-            args.log_root,
-            f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}.csv",
-        ),
+        log_path,
         [
             "epoch",
             "loss",

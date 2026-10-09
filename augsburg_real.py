@@ -481,6 +481,13 @@ class AugsburgRealDataset(Dataset):
             raise ValueError(split)
         self.split = split
         split_dir = os.path.join(cache_root, split)
+        meta_file = os.path.join(split_dir, "meta.json")
+        with open(meta_file, "r", encoding="utf-8") as handle:
+            self.split_metadata = json.load(handle)
+        self.forbidden_bbox = (
+            self.split_metadata.get("forbidden_bbox_30m")
+            if split == "train" else None
+        )
         self.gt = np.load(os.path.join(split_dir, "gt.npy"), mmap_mode="r")
         self.lr_hsi = np.load(os.path.join(split_dir, "lr_hsi.npy"), mmap_mode="r")
         self.hr_msi = np.load(os.path.join(split_dir, "hr_msi.npy"), mmap_mode="r")
@@ -509,6 +516,13 @@ class AugsburgRealDataset(Dataset):
                 self.gt.shape[0], self.gt.shape[1], patch
             )
         for top, left, ph, pw in candidates:
+            if self.forbidden_bbox is not None:
+                fy0, fx0, fy1, fx1 = map(int, self.forbidden_bbox)
+                # Hard spatial separation is mandatory; 80%-valid mask alone
+                # could accidentally admit a partially overlapping train patch.
+                if (top < fy1 and top + ph > fy0
+                    and left < fx1 and left + pw > fx0):
+                    continue
             mask = self.valid[top:top + ph, left:left + pw]
             if float(mask.mean()) >= float(min_valid_fraction):
                 self.samples.append((top, left, ph, pw))

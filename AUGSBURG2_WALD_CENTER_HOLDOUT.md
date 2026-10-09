@@ -47,6 +47,16 @@ python prepare_augsburg2_wald_center_holdout.py \
 python -m unittest discover -s tests -p "test_augsburg2_wald_center_holdout.py"
 ```
 
+**Before training, fit new radiometry only from pixels outside the test
+rectangle and the 30m PSF guard. Do not reuse the old full-region calibration.**
+
+```bash
+python calibrate_augsburg2_wald_radiometry.py \
+  --wald_root ./data/augsburg2_wald_center_holdout \
+  --real_cache_root ./data/augsburg_real_cache \
+  --output ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json
+```
+
 Do not use `--overwrite`. The original cache and checkpoints are preserved.
 
 ## 2. Re-train S2Diff-MH, starting from scratch
@@ -76,7 +86,7 @@ Then train/test `--center_holdout --branch C`.
 python infer_augsburg2_wald.py \
   --wald_root ./data/augsburg2_wald_center_holdout \
   --checkpoint ./checkpoints/augsburg_real/center_holdout/Augsburg2_Wald_center_D2_A.pth \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_radiometry.json \
+  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
   --save_root ./outputs/augsburg2_wald_center_holdout \
   --tile_size 96 --tile_stride 48 --write_tif
 ```

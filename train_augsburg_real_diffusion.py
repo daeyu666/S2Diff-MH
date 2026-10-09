@@ -187,6 +187,14 @@ def _wald_d2_provenance(args, *, sigma):
     """Guard all Wald split metadata and frozen C model provenance."""
     if not _wald_metadata(args.cache_root):
         raise ValueError("Strict Wald requires all three splits to be genuine Wald 30m observations")
+    radiometric = _load_json(args.radiometry_json)
+    expected_calibration_protocol = getattr(args, "wald_protocol_id", "legacy_full_region_wald")
+    if (radiometric.get("spatial_protocol_id", "legacy_full_region_wald") !=
+        expected_calibration_protocol):
+        raise ValueError(
+            "Radiometry must be fitted on selected Wald training split; "
+            "old full-region calibration leaks center-heldout test pixels"
+        )
     if args.geometry_mode not in ("identity", "wald_fixed", "wald_cdrdi"):
         raise ValueError("Wald A/B/C only supports identity, wald_fixed and wald_cdrdi")
     if getattr(args, "wald_protocol_id", "") == "Augsburg2-Wald-center-holdout-v1":

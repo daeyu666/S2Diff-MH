@@ -198,6 +198,12 @@ def evaluate_cache(
     if (rad.get("dataset") != "Augsburg-2-Wald"
         or rad.get("uses_EnMAP10_reference") is not False):
         raise ValueError("Require train-only Augsburg-2-Wald radiometry")
+    expected_calibration_id = (
+        "Augsburg2-Wald-center-holdout-v1" if (root / "roi.json").exists()
+        else "legacy_full_region_wald"
+    )
+    if rad.get("spatial_protocol_id", "legacy_full_region_wald") != expected_calibration_id:
+        raise ValueError("Calibration was fitted on a different spatial split; heldout ROI leakage risk")
     gain = np.asarray(rad["gain"], dtype=np.float32)
     bias = np.asarray(rad["bias"], dtype=np.float32)
     if gain.shape != (4,) or bias.shape != (4,) or not np.isfinite(gain).all() or not np.isfinite(bias).all():

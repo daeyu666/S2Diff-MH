@@ -426,6 +426,15 @@ def main():
             args.psf_json = os.path.join(args.cache_root, "wald_psf.json")
         if args.radiometry_json == "./data/calibration/AugsburgReal_radiometry.json":
             args.radiometry_json = "./data/calibration/Augsburg2_Wald_radiometry.json"
+        if (args.spatial_protocol_id == "Augsburg2-Wald-center-holdout-v1"
+            and args.radiometry_json == "./data/calibration/Augsburg2_Wald_radiometry.json"):
+            args.radiometry_json = (
+                "./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json"
+            )
+        with open(args.radiometry_json, encoding="utf-8") as fp:
+            calibration = json.load(fp)
+        if calibration.get("spatial_protocol_id", "legacy_full_region_wald") != args.spatial_protocol_id:
+            raise ValueError("Wald CDRDI radiometry calibrated on the wrong spatial split")
         if (args.max_translation > 1.5 or args.max_rotation_deg > 1.0
             or args.max_local_px > 1.0):
             raise ValueError(

@@ -34,7 +34,7 @@ def stretch(x, bounds=None):
     return Image.fromarray(np.asarray(np.rint(np.clip(z, 0, 1) * 255), dtype=np.uint8), "RGB")
 
 
-def visualize(wald_root, output_dir, methods, rgb=(43,28,10)):
+def visualize(wald_root, output_dir, methods, rgb=(43,28,10), savefig=None):
     root = Path(wald_root)
     roi = read_roi(root)
     if roi is None:
@@ -91,6 +91,14 @@ def visualize(wald_root, output_dir, methods, rgb=(43,28,10)):
         draw.text((i*tile_w+8, 11), label, fill="white")
     fig = out/"Augsburg2_center_heldout_Fig13_style.png"
     canvas.save(fig)
+    requested_fig = None
+    if savefig:
+        requested_fig = Path(savefig).expanduser()
+        if requested_fig.suffix.lower() != ".png":
+            raise ValueError("--savefig requires a .png filename")
+        requested_fig.parent.mkdir(parents=True, exist_ok=True)
+        if requested_fig.resolve() != fig.resolve():
+            canvas.save(requested_fig)
     with (out/"visualization_provenance.json").open("w",encoding="utf-8") as f:
         json.dump({
             "protocol_id": roi["protocol_id"],
@@ -102,9 +110,14 @@ def visualize(wald_root, output_dir, methods, rgb=(43,28,10)):
             "comparison_rgb_per_method_shared_percentiles": [1,99],
             "model_paths": {name:str(Path(path).resolve()) for name,path in methods},
             "metrics_unchanged_by_visualization": True,
-            "figure": str(fig.resolve()),
+            "figure": str((requested_fig or fig).resolve()),
+            "default_figure": str(fig.resolve()),
+            "requested_savefig": str(requested_fig.resolve()) if requested_fig else None,
         },f,indent=2)
-    print(f"FIG13_STYLE={fig.resolve()} REDBOX_BBOX_10M={roi['test_bbox_10m']}")
+    print(
+        f"FIG13_STYLE={(requested_fig or fig).resolve()} "
+        f"REDBOX_BBOX_10M={roi['test_bbox_10m']}"
+    )
 
 
 def main():
@@ -113,11 +126,14 @@ def main():
     p.add_argument("--output_dir", default="./outputs/augsburg2_wald_center_holdout/fig13")
     p.add_argument("--method", nargs=2, action="append", default=[], metavar=("NAME","FUSED_NPY"))
     p.add_argument("--hsi_rgb", default="43,28,10")
+    p.add_argument("--savefig", default=None,
+                   help="Optional exact path for the final combined PNG figure")
     args = p.parse_args()
     bands = tuple(int(x) for x in args.hsi_rgb.split(","))
     if len(bands) != 3 or any(z<0 or z>=242 for z in bands):
         raise ValueError("3 zero-based HSI RGB band indices required")
-    visualize(args.wald_root, args.output_dir, args.method, rgb=bands)
+    visualize(args.wald_root, args.output_dir, args.method, rgb=bands,
+              savefig=args.savefig)
 
 
 if __name__=="__main__":

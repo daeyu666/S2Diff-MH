@@ -372,13 +372,28 @@ def _save_checkpoint(model, optimizer, epoch, best_value, path, args):
     )
 
 
-def _load_training_checkpoint(model, path, device, optimizer=None):
+def _load_training_checkpoint(
+    model, path, device, optimizer=None, *, expected_monitor=None,
+    expected_train_geometry_mode=None,
+):
     try:
         state = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         state = torch.load(path, map_location=device)
     if state.get("variant", model.variant) != model.variant:
         raise ValueError("checkpoint/refiner variant mismatch")
+    if expected_monitor is not None and state.get("monitor") != expected_monitor:
+        raise ValueError(
+            f"checkpoint monitor={state.get('monitor')!r}, requested={expected_monitor!r}"
+        )
+    extra = state.get("extra", {})
+    if (
+        expected_train_geometry_mode is not None
+        and extra.get("train_geometry_mode", "mixed") != expected_train_geometry_mode
+    ):
+        raise ValueError(
+            "checkpoint train_geometry_mode differs from requested controlled experiment"
+        )
     model.load_state_dict(state["model"], strict=True)
     if optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
@@ -763,6 +778,17 @@ def train(args):
         raise ValueError("--geometry_steps must be >=1")
     if args.eval_cases < 1:
         raise ValueError("--eval_cases must be >=1")
+    if (
+        args.train_geometry_mode == "registered"
+        and not args.monitor.startswith("registered_")
+    ):
+        raise ValueError(
+            "registered continuation must select checkpoints with a registered_* monitor"
+        )
+    if args.train_geometry_mode == "mixed" and args.monitor.startswith("registered_"):
+        raise ValueError(
+            "mixed training should keep its warp_* selection objective for the robustness model"
+        )
 
     set_seed(args.seed)
     device = get_device(args.device)
@@ -806,6 +832,8 @@ def train(args):
             args.resume,
             device,
             optimizer=optimizer,
+            expected_monitor=args.monitor,
+            expected_train_geometry_mode=args.train_geometry_mode,
         )
         start_epoch = loaded_epoch + 1
         print(
@@ -1055,7 +1083,13 @@ def test(args):
     refiner = _build_refiner(args, info, device)
 
     path = args.refiner_checkpoint or _checkpoint_path(args)
-    epoch, best = _load_training_checkpoint(refiner, path, device)
+    epoch, best = _load_training_checkpoint(
+        refiner,
+        path,
+        device,
+        expected_monitor=args.monitor,
+        expected_train_geometry_mode=args.train_geometry_mode,
+    )
     print(
         f"REFINER_LOAD path={path} epoch={epoch} monitor={args.monitor} best={best:.6f}"
     )

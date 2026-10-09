@@ -162,11 +162,35 @@ def parse_args():
 
 
 def _resolve_dataset_checkpoints(args):
-    """Resolve default frozen/initialization checkpoints from --dataset.
+    """Resolve frozen/initialization checkpoints without cross-dataset leakage.
 
-    Explicit CLI paths always take precedence.
+    Priority:
+      1) explicit CLI paths;
+      2) for --stage test, exact paths recorded in the trained refiner checkpoint;
+      3) dataset-specific filename convention.
     """
     dataset = args.dataset
+
+    # Test should preferentially reuse exactly the frozen geometry/diffusion
+    # checkpoints that produced the mixed-training refiner.  This also supports
+    # local filenames that do not follow the repository convention.
+    if args.stage == "test":
+        refiner_path = args.refiner_checkpoint or _checkpoint_path(args)
+        if os.path.exists(refiner_path):
+            try:
+                state = torch.load(
+                    refiner_path, map_location="cpu", weights_only=False
+                )
+            except TypeError:
+                state = torch.load(refiner_path, map_location="cpu")
+            extra = state.get("extra", {}) if isinstance(state, dict) else {}
+            if not args.geometry_checkpoint and extra.get("geometry_checkpoint"):
+                args.geometry_checkpoint = extra["geometry_checkpoint"]
+            if not args.diffusion_checkpoint and extra.get("diffusion_checkpoint"):
+                args.diffusion_checkpoint = extra["diffusion_checkpoint"]
+            if not args.init_refiner_checkpoint and extra.get("init_refiner_checkpoint"):
+                args.init_refiner_checkpoint = extra["init_refiner_checkpoint"]
+
     if not args.geometry_checkpoint:
         args.geometry_checkpoint = (
             f"./checkpoints/cdrdi_stage1/"

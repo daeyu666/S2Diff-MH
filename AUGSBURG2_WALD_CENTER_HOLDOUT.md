@@ -102,10 +102,12 @@ A checkpoint trained with the old full-region split is refused.
 python visualize_augsburg2_wald_center_holdout.py \
   --wald_root ./data/augsburg2_wald_center_holdout \
   --method S2Diff ./outputs/augsburg2_wald_center_holdout/Augsburg2_Wald_heldout_HSI.npy \
-  --method UAFL ../comparison_experiments/comparison/UAFL/outputs/augsburg2_wald_center_holdout/Augsburg2_Wald_UAFL_heldout_HSI.npy
+  --method UAFL ../comparison_experiments/comparison/UAFL/outputs/augsburg2_wald_center_holdout/Augsburg2_Wald_UAFL_heldout_HSI.npy \
+  --savefig ./figures/Augsburg_holdout_S2Diff_vs_UAFL_RGB.png
 ```
 
-Outputs `outputs/augsburg2_wald_center_holdout/fig13/Augsburg2_center_heldout_Fig13_style.png`.
+The combined figure is saved to the explicit `--savefig` path (parent directory created automatically). The default copy is also saved at
+`outputs/augsburg2_wald_center_holdout/fig13/Augsburg2_center_heldout_Fig13_style.png`, together with the ROI previews and provenance JSON.
 
 **Do not compare legacy whole-region QNR or test metrics to center-heldout
 scores as though they share a spatial protocol.** Re-train both methods.

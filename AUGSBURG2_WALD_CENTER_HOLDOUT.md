@@ -160,7 +160,20 @@ Custom outputs can be specified by repeating
 `--method NAME /path/to/existing_fused_HSI.npy`. The shared figures
 use the same selected 0-based HSI RGB bands and stretch ranges.
 
-## 6. Fair comparison and regression tests
+## 6. Compare metrics without moving model outputs
+
+After both independent inference runs, from S2Diff-MH root:
+
+```bash
+python compare_augsburg2_wald_qnr.py --center_holdout
+```
+
+It reads each model's own QNR JSON, verifies that ROI coordinates,
+sensor/spectral definitions and windows match, then reports
+`S2DIFF_MINUS_UAFL` for QNR, Dlambda and Ds. It does not train, infer
+or copy model outputs.
+
+## 7. Regression checks
 
 ```bash
 python -m unittest discover -s tests -p "test_augsburg2_wald_center_holdout.py"

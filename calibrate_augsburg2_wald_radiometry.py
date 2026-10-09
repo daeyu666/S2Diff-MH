@@ -154,6 +154,31 @@ def main():
     raw_s2_30 = np.nan_to_num(raw_s2_30, nan=0., posinf=0., neginf=0.)
     projection = lr_array @ srf.T
 
+    spatial_protocol_id = "legacy_full_region_wald"
+    forbidden_bbox = None
+    roi_path = os.path.join(args.wald_root, "roi.json")
+    if os.path.isfile(roi_path):
+        with open(roi_path, "r", encoding="utf-8") as fp:
+            roi = json.load(fp)
+        spatial_protocol_id = roi.get("protocol_id", "")
+        if spatial_protocol_id != "Augsburg2-Wald-center-holdout-v1":
+            raise ValueError("Unknown Wald center split; refusing calibration")
+        forbidden_bbox = list(map(int, roi["forbidden_bbox_30m"]))
+        fy0, fx0, fy1, fx1 = forbidden_bbox
+        if not (0 <= fy0 < fy1 <= h and 0 <= fx0 < fx1 <= w):
+            raise ValueError("Invalid center-holdout calibration exclusion bbox")
+        # Neither the gain/bias fit nor its diagnostic holdout may use
+        # the central test pixels or their Gaussian/geometry guard.
+        valid[fy0:fy1, fx0:fx1] = False
+        if args.output == "./data/calibration/Augsburg2_Wald_radiometry.json":
+            args.output = (
+                "./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json"
+            )
+        if "center_holdout" not in os.path.basename(args.output):
+            raise ValueError(
+                "Center-holdout radiometry must use a separately named output"
+            )
+
     fit, hold, boundary, cut = _stable_masks(
         lr_array, raw_s2_30, valid,
         args.train_fraction, args.stable_fraction,
@@ -213,6 +238,9 @@ def main():
     result = {
         "dataset": "Augsburg-2-Wald",
         "split": "region2_30m_spatial_train_only",
+        "spatial_protocol_id": spatial_protocol_id,
+        "forbidden_bbox_30m": forbidden_bbox,
+        "test_pixels_used_for_calibration": False if forbidden_bbox else None,
         "domain": "projected_EnMAP30_vs_real_S2_area30",
         "bands": list(NAMES),
         "gain": gains,

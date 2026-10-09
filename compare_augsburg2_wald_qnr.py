@@ -46,9 +46,23 @@ def compare_qnr(a, b):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--uafl_json", required=True)
-    p.add_argument("--s2diff_json", default="./outputs/augsburg2_wald/Augsburg2_Wald_full_QNR.json")
+    p.add_argument("--center_holdout", action="store_true",
+                   help="Compare center test QNR from each model's own results folder")
+    p.add_argument("--uafl_json", default=None)
+    p.add_argument("--s2diff_json", default=None)
     args = p.parse_args()
+    if args.center_holdout:
+        args.uafl_json = args.uafl_json or (
+            "../comparison_experiments/comparison/UAFL/outputs/"
+            "augsburg2_wald_center_holdout/UAFL_Wald_heldout_QNR.json"
+        )
+        args.s2diff_json = args.s2diff_json or (
+            "./outputs/augsburg2_wald_center_holdout/Augsburg2_Wald_heldout_QNR.json"
+        )
+    elif args.uafl_json is None:
+        p.error("Pass --center_holdout or supply --uafl_json for legacy full-region QNR")
+    if args.s2diff_json is None:
+        args.s2diff_json = "./outputs/augsburg2_wald/Augsburg2_Wald_full_QNR.json"
     with open(args.uafl_json, encoding="utf-8") as f:
         uafl = json.load(f)
     with open(args.s2diff_json, encoding="utf-8") as f:

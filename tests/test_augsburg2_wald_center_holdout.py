@@ -9,6 +9,8 @@ import numpy as np
 from augsburg2_wald_center_roi import (
     PROTOCOL, crop_heldout, geotiff_transform, read_roi
 )
+from augsburg_real import AugsburgRealDataset
+from prepare_augsburg2_wald_center_holdout import heldout_train_tile_candidates, _rects_intersect
 
 
 class AugsburgCenterHoldoutROITests(unittest.TestCase):
@@ -72,6 +74,38 @@ class AugsburgCenterHoldoutROITests(unittest.TestCase):
             p.write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError,"exactly 3x"):
                 read_roi(d)
+
+
+    def test_real_loader_never_sees_center_plus_psf_guard(self):
+        box=(24,36,72,84)
+        forbidden=(18,30,78,90)
+        coords=heldout_train_tile_candidates(
+            (99,120),box,patch=24,stride=6,guard=6
+        )
+        self.assertGreater(len(coords),10)
+        for y,x,ph,pw in coords:
+            self.assertFalse(_rects_intersect((y,x,y+ph,x+pw),forbidden))
+        with TemporaryDirectory() as d:
+            train=Path(d)/"train"
+            train.mkdir()
+            for name,arr in (
+                ("gt",np.zeros((99,120,242),np.float32)),
+                ("lr_hsi",np.zeros((33,40,242),np.float32)),
+                ("hr_msi",np.zeros((99,120,4),np.float32)),
+                ("valid_mask",np.ones((99,120),np.uint8)),
+            ):
+                np.save(train/(name+".npy"),arr)
+            (train/"meta.json").write_text(json.dumps({
+                "forbidden_bbox_30m":list(forbidden),
+                "msi_source":"real_Sentinel_2_Wald_30m",
+            }))
+            ds=AugsburgRealDataset(
+                d,"train",train_patch_size=24,train_stride=6,
+                eval_patch_size=48,min_valid_fraction=.8,augment=False
+            )
+            self.assertEqual(len(ds.samples),len(coords))
+            for y,x,ph,pw in ds.samples:
+                self.assertFalse(_rects_intersect((y,x,y+ph,x+pw),forbidden))
 
 
 if __name__=="__main__":

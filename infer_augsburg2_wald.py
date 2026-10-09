@@ -135,8 +135,13 @@ def main():
             "B/C checkpoints require geometrically consistent 30m->10m "
             "motion scaling; refusing to evaluate them with identity physics."
         )
-    if os.path.normpath(extra.get("radiometry_json", "")) != os.path.normpath(args.radiometry_json):
-        raise ValueError("Full inference radiometry differs from the Wald-D2 checkpoint")
+    checkpoint_rad = extra.get("radiometry_json", "")
+    if (not checkpoint_rad or
+        os.path.realpath(checkpoint_rad) != os.path.realpath(args.radiometry_json)):
+        raise ValueError(
+            "Full inference radiometry differs from Wald-D2 checkpoint. "
+            f"checkpoint={checkpoint_rad!r}; supplied={args.radiometry_json!r}"
+        )
     if abs(float(extra.get("effective_sigma", -1)) - sigma) > 1e-7:
         raise ValueError("Full inference PSF does not match the Wald-D2 checkpoint")
     lr, msi, valid, roi_y0, roi_x0, output_suffix, split_protocol_id = crop_heldout(

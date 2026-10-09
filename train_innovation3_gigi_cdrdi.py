@@ -93,16 +93,6 @@ def parse_args():
     p.add_argument("--min_jacobian", type=float, default=0.5)
     p.add_argument("--identity_probability", type=float, default=0.10)
     p.add_argument("--min_strength", type=float, default=0.20)
-    p.add_argument(
-        "--train_geometry_mode",
-        choices=["mixed", "registered"],
-        default="mixed",
-        help=(
-            "mixed: current registered+synthetic-warp training; "
-            "registered: SAME frozen CDRDI-stage2 diffusion backbone and same "
-            "registered-GIGI initialization, but all extra training samples stay registered"
-        ),
-    )
 
     p.add_argument("--geometry_steps", type=int, default=9)
     p.add_argument("--geometry_base_channels", type=int, default=32)
@@ -152,10 +142,7 @@ def parse_args():
     p.add_argument("--region_fraction", type=float, default=0.25)
     p.add_argument(
         "--monitor",
-        choices=[
-            "warp_sam_high", "warp_sam", "warp_psnr",
-            "registered_sam_high", "registered_sam", "registered_psnr",
-        ],
+        choices=["warp_sam_high", "warp_sam", "warp_psnr"],
         default="warp_sam_high",
     )
     p.add_argument(
@@ -342,15 +329,10 @@ def _load_refiner_weights(model, path: str, device):
 
 def _checkpoint_path(args):
     ensure_dir(args.checkpoint_root)
-    if args.save_name:
-        name = args.save_name
-    elif args.train_geometry_mode == "registered":
-        name = (
-            f"{args.dataset}_innovation3_gigi_registered_continued_"
-            f"{args.variant}_k{args.geometry_steps}"
-        )
-    else:
-        name = f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}_k{args.geometry_steps}"
+    name = (
+        args.save_name
+        or f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}_k{args.geometry_steps}"
+    )
     if not name.endswith(".pth"):
         name += ".pth"
     return os.path.join(args.checkpoint_root, name)
@@ -372,28 +354,13 @@ def _save_checkpoint(model, optimizer, epoch, best_value, path, args):
     )
 
 
-def _load_training_checkpoint(
-    model, path, device, optimizer=None, *, expected_monitor=None,
-    expected_train_geometry_mode=None,
-):
+def _load_training_checkpoint(model, path, device, optimizer=None):
     try:
         state = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         state = torch.load(path, map_location=device)
     if state.get("variant", model.variant) != model.variant:
         raise ValueError("checkpoint/refiner variant mismatch")
-    if expected_monitor is not None and state.get("monitor") != expected_monitor:
-        raise ValueError(
-            f"checkpoint monitor={state.get('monitor')!r}, requested={expected_monitor!r}"
-        )
-    extra = state.get("extra", {})
-    if (
-        expected_train_geometry_mode is not None
-        and extra.get("train_geometry_mode", "mixed") != expected_train_geometry_mode
-    ):
-        raise ValueError(
-            "checkpoint train_geometry_mode differs from requested controlled experiment"
-        )
     model.load_state_dict(state["model"], strict=True)
     if optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
@@ -749,24 +716,17 @@ def _print_eval(metrics, mechanism, geom_epe):
 
 def _monitor_value(metrics, mode: str) -> float:
     wr = metrics["warp_refined"]
-    rr = metrics["registered_refined"]
     if mode == "warp_sam_high":
         return float(wr["SAM_HIGH"])
     if mode == "warp_sam":
         return float(wr["SAM"])
     if mode == "warp_psnr":
         return float(wr["PSNR"])
-    if mode == "registered_sam_high":
-        return float(rr["SAM_HIGH"])
-    if mode == "registered_sam":
-        return float(rr["SAM"])
-    if mode == "registered_psnr":
-        return float(rr["PSNR"])
     raise ValueError(mode)
 
 
 def _is_better(value: float, best: float, mode: str) -> bool:
-    if mode in ("warp_psnr", "registered_psnr"):
+    if mode == "warp_psnr":
         return value > best
     return value < best
 
@@ -778,17 +738,6 @@ def train(args):
         raise ValueError("--geometry_steps must be >=1")
     if args.eval_cases < 1:
         raise ValueError("--eval_cases must be >=1")
-    if (
-        args.train_geometry_mode == "registered"
-        and not args.monitor.startswith("registered_")
-    ):
-        raise ValueError(
-            "registered continuation must select checkpoints with a registered_* monitor"
-        )
-    if args.train_geometry_mode == "mixed" and args.monitor.startswith("registered_"):
-        raise ValueError(
-            "mixed training should keep its warp_* selection objective for the robustness model"
-        )
 
     set_seed(args.seed)
     device = get_device(args.device)
@@ -822,9 +771,7 @@ def train(args):
     )
     start_epoch = 1
     best_value = (
-        float("-inf")
-        if args.monitor in ("warp_psnr", "registered_psnr")
-        else float("inf")
+        float("-inf") if args.monitor == "warp_psnr" else float("inf")
     )
     if args.resume:
         loaded_epoch, best_value = _load_training_checkpoint(
@@ -832,8 +779,6 @@ def train(args):
             args.resume,
             device,
             optimizer=optimizer,
-            expected_monitor=args.monitor,
-            expected_train_geometry_mode=args.train_geometry_mode,
         )
         start_epoch = loaded_epoch + 1
         print(
@@ -844,13 +789,11 @@ def train(args):
     stem, ext = os.path.splitext(best_path)
     last_path = stem + "_last" + ext
     ensure_dir(args.log_root)
-    log_stem = (
-        f"{args.dataset}_innovation3_gigi_registered_continued_{args.variant}"
-        if args.train_geometry_mode == "registered"
-        else f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}"
-    )
     logger = CSVLogger(
-        os.path.join(args.log_root, log_stem + ".csv"),
+        os.path.join(
+            args.log_root,
+            f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}.csv",
+        ),
         [
             "epoch",
             "loss",
@@ -860,8 +803,6 @@ def train(args):
             "msi",
             "registered_psnr",
             "registered_sam",
-            "registered_sam_high",
-            "registered_sam_low",
             "warp_psnr",
             "warp_sam",
             "warp_sam_high",
@@ -877,8 +818,7 @@ def train(args):
     train_generator = _make_generator(device, args.seed + 93000)
     print(
         "TRAINING_POLICY geometry=frozen diffusion=frozen terminal_GIGI_only "
-        f"geometry_steps={args.geometry_steps} init_registered_GIGI={init_from_registered} "
-        f"train_geometry_mode={args.train_geometry_mode}"
+        f"geometry_steps={args.geometry_steps} init_registered_GIGI={init_from_registered}"
     )
     print(
         "NONREGISTERED_PROTOCOL "
@@ -898,37 +838,30 @@ def train(args):
             b, _, h, w = gt.shape
 
             with torch.no_grad():
-                if args.train_geometry_mode == "registered":
-                    # Controlled continuation: SAME stage2 diffusion backbone,
-                    # SAME registered-GIGI initialization, optimizer/loss/epochs;
-                    # only the extra-training geometry distribution changes.
-                    estimated_process = base_process
-                    y_h = base_process.terminal_observation(gt)
-                else:
-                    gt_phi = sample_training_geometry(
-                        b,
-                        h,
-                        w,
-                        device=device,
-                        dtype=gt.dtype,
-                        generator=train_generator,
-                        args=args,
-                    )
-                    true_process = _process_from_geometry(base_process, gt_phi)
-                    y_h = true_process.terminal_observation(gt)
-                    pred_rigid, pred_local = _estimate_geometry(
-                        geometry_model,
-                        y_h=y_h,
-                        hr_msi=hr_msi,
-                        p0=p0,
-                        srf=srf,
-                        steps=args.geometry_steps,
-                    )
-                    estimated_process = _process_from_estimate(
-                        base_process,
-                        pred_rigid,
-                        pred_local,
-                    )
+                gt_phi = sample_training_geometry(
+                    b,
+                    h,
+                    w,
+                    device=device,
+                    dtype=gt.dtype,
+                    generator=train_generator,
+                    args=args,
+                )
+                true_process = _process_from_geometry(base_process, gt_phi)
+                y_h = true_process.terminal_observation(gt)
+                pred_rigid, pred_local = _estimate_geometry(
+                    geometry_model,
+                    y_h=y_h,
+                    hr_msi=hr_msi,
+                    p0=p0,
+                    srf=srf,
+                    steps=args.geometry_steps,
+                )
+                estimated_process = _process_from_estimate(
+                    base_process,
+                    pred_rigid,
+                    pred_local,
+                )
                 base = reconstruct_from_terminal_lr(
                     diffusion_model,
                     estimated_process,
@@ -987,8 +920,6 @@ def train(args):
             "msi": msi_sum / max(count, 1),
             "registered_psnr": "",
             "registered_sam": "",
-            "registered_sam_high": "",
-            "registered_sam_low": "",
             "warp_psnr": "",
             "warp_sam": "",
             "warp_sam_high": "",
@@ -1025,8 +956,6 @@ def train(args):
                 {
                     "registered_psnr": rr["PSNR"],
                     "registered_sam": rr["SAM"],
-                    "registered_sam_high": rr["SAM_HIGH"],
-                    "registered_sam_low": rr["SAM_LOW"],
                     "warp_psnr": wr["PSNR"],
                     "warp_sam": wr["SAM"],
                     "warp_sam_high": wr["SAM_HIGH"],
@@ -1083,13 +1012,7 @@ def test(args):
     refiner = _build_refiner(args, info, device)
 
     path = args.refiner_checkpoint or _checkpoint_path(args)
-    epoch, best = _load_training_checkpoint(
-        refiner,
-        path,
-        device,
-        expected_monitor=args.monitor,
-        expected_train_geometry_mode=args.train_geometry_mode,
-    )
+    epoch, best = _load_training_checkpoint(refiner, path, device)
     print(
         f"REFINER_LOAD path={path} epoch={epoch} monitor={args.monitor} best={best:.6f}"
     )

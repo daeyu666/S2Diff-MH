@@ -202,17 +202,54 @@ def evaluate_cache(
     bias = np.asarray(rad["bias"], dtype=np.float32)
     if gain.shape != (4,) or bias.shape != (4,) or not np.isfinite(gain).all() or not np.isfinite(bias).all():
         raise ValueError("Wald radiometry must contain four finite gains and biases")
-    return hsi_msi_qnr(
-        np.load(fused, mmap_mode="r"),
-        np.load(root / "full" / "lr_hsi.npy", mmap_mode="r"),
-        np.load(root / "full" / "hr_msi.npy", mmap_mode="r"),
-        np.load(root / "full" / "valid_mask.npy", mmap_mode="r"),
+    fused_image = np.load(fused, mmap_mode="r")
+    full_lr = np.load(root / "full" / "lr_hsi.npy", mmap_mode="r")
+    full_msi = np.load(root / "full" / "hr_msi.npy", mmap_mode="r")
+    full_valid = np.load(root / "full" / "valid_mask.npy", mmap_mode="r")
+    roi_file = root / "roi.json"
+    if roi_file.exists():
+        # Center holdout QNR is computed ONLY on its untrained test pixels.
+        # A full-scene result from a model trained on the rest of this scene
+        # is not an independent held-out full-scene measurement.
+        with roi_file.open(encoding="utf-8") as handle:
+            roi = json.load(handle)
+        if roi.get("protocol_id") != "Augsburg2-Wald-center-holdout-v1":
+            raise ValueError("Unknown central holdout ROI protocol")
+        y0, x0, y1, x1 = map(int, roi["test_bbox_30m"])
+        y10, x10, y11, x11 = map(int, roi["test_bbox_10m"])
+        if [y10, x10, y11, x11] != [3*y0, 3*x0, 3*y1, 3*x1]:
+            raise ValueError("Wald HSI/MSI ROI coordinates have inconsistent x3 scaling")
+        if fused_image.shape != (y11-y10, x11-x10, 242):
+            raise ValueError(
+                "Center-holdout QNR requires ONLY the held-out 10m ROI HSI output, "
+                f"not a full-scene estimate; got {fused_image.shape}"
+            )
+        lr = full_lr[y0:y1, x0:x1]
+        msi = full_msi[y10:y11, x10:x11]
+        valid = full_valid[y10:y11, x10:x11]
+        evaluation_area = "center_heldout_sub_area_2_only"
+        bbox_30m, bbox_10m = [y0,x0,y1,x1], [y10,x10,y11,x11]
+    else:
+        lr, msi, valid = full_lr, full_msi, full_valid
+        evaluation_area = "entire_sub_area_2_not_spatial_holdout"
+        bbox_30m = [0,0,int(full_lr.shape[0]),int(full_lr.shape[1])]
+        bbox_10m = [0,0,int(full_msi.shape[0]),int(full_msi.shape[1])]
+    quality = hsi_msi_qnr(
+        fused_image, lr, msi, valid,
         np.load(root / "srf_weights.npy"),
         gains=gain, biases=bias,
         window_hr=window_hr,
         min_valid_fraction=min_valid_fraction,
         support_fraction=support_fraction,
     )
+    quality["evaluation_area"] = evaluation_area
+    quality["test_bbox_30m"] = bbox_30m
+    quality["test_bbox_10m"] = bbox_10m
+    quality["split_protocol_id"] = (
+        "Augsburg2-Wald-center-holdout-v1" if roi_file.exists()
+        else "legacy_full_region_wald"
+    )
+    return quality
 
 
 def main():

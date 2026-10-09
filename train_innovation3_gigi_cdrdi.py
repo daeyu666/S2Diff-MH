@@ -98,7 +98,8 @@ def parse_args():
     p.add_argument("--geometry_base_channels", type=int, default=32)
     p.add_argument(
         "--geometry_checkpoint",
-        default="./checkpoints/cdrdi_stage1/PaviaU_recursive_k6_finalonly_300ep_lr1e4.pth",
+        default="",
+        help="Stage-1 geometry checkpoint. Empty => dataset-specific default.",
     )
 
     p.add_argument("--diffusion_base_channels", type=int, default=64)
@@ -107,7 +108,8 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument(
         "--diffusion_checkpoint",
-        default="./checkpoints/cdrdi_stage2/PaviaU_estimated_deform_diffusion_k9_stage2d_A.pth",
+        default="",
+        help="Stage-2D diffusion checkpoint. Empty => dataset-specific default.",
     )
 
     p.add_argument("--refine_hidden", type=int, default=64)
@@ -119,8 +121,11 @@ def parse_args():
     )
     p.add_argument(
         "--init_refiner_checkpoint",
-        default="./checkpoints/innovation3_gigi/PaviaU_innovation3_gigi_full.pth",
-        help="Optional registered-GIGI checkpoint used only to initialize the refiner.",
+        default="",
+        help=(
+            "Registered-GIGI checkpoint used only to initialize training. "
+            "Empty => dataset-specific default."
+        ),
     )
     p.add_argument("--refiner_checkpoint", default="")
     p.add_argument("--resume", default="")
@@ -152,6 +157,68 @@ def parse_args():
     p.add_argument("--log_root", default="./logs")
     p.add_argument("--save_name", default="")
     return p.parse_args()
+
+
+
+
+def _resolve_dataset_checkpoints(args):
+    """Resolve default frozen/initialization checkpoints from --dataset.
+
+    Explicit CLI paths always take precedence.
+    """
+    dataset = args.dataset
+    if not args.geometry_checkpoint:
+        args.geometry_checkpoint = (
+            f"./checkpoints/cdrdi_stage1/"
+            f"{dataset}_recursive_k6_finalonly_300ep_lr1e4.pth"
+        )
+    if not args.diffusion_checkpoint:
+        args.diffusion_checkpoint = (
+            f"./checkpoints/cdrdi_stage2/"
+            f"{dataset}_estimated_deform_diffusion_k9_stage2d_A.pth"
+        )
+    if not args.init_refiner_checkpoint:
+        args.init_refiner_checkpoint = (
+            f"./checkpoints/innovation3_gigi/"
+            f"{dataset}_innovation3_gigi_full.pth"
+        )
+    return args
+
+
+def _checkpoint_sensor_preflight(path, *, expected_msi_bands, role):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{role} checkpoint for selected dataset is missing: {path}. "
+            "Pass the actual dataset-specific checkpoint explicitly if your filename differs."
+        )
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    model_state = state.get("model", state)
+    if role == "geometry":
+        key = "update_net.stem.0.weight"
+        weight = model_state.get(key)
+        if weight is not None:
+            actual_in = int(weight.shape[1])
+            expected_in = 5 * int(expected_msi_bands) + 5
+            if actual_in != expected_in:
+                actual_msi = (
+                    (actual_in - 5) // 5
+                    if (actual_in - 5) >= 0 and (actual_in - 5) % 5 == 0
+                    else None
+                )
+                detail = (
+                    f" ({actual_msi} MSI bands)"
+                    if actual_msi is not None else ""
+                )
+                raise ValueError(
+                    f"Wrong geometry checkpoint for this dataset/sensor: {path}. "
+                    f"Selected dataset expects {expected_msi_bands} MSI bands "
+                    f"(stem input {expected_in}), but checkpoint has stem input "
+                    f"{actual_in}{detail}. This is typically a checkpoint from "
+                    "another dataset."
+                )
 
 
 def _config(args) -> TrainConfig:
@@ -243,6 +310,16 @@ def _geometry_epe(
 
 
 def _build_frozen_models(args, info, device):
+    _checkpoint_sensor_preflight(
+        args.geometry_checkpoint,
+        expected_msi_bands=info["n_msi_bands"],
+        role="geometry",
+    )
+    if not os.path.exists(args.diffusion_checkpoint):
+        raise FileNotFoundError(
+            f"diffusion checkpoint for {args.dataset} is missing: "
+            f"{args.diffusion_checkpoint}"
+        )
     geometry_model = LearnedPhysicalResidualSolver(
         info["n_msi_bands"],
         base_channels=args.geometry_base_channels,
@@ -1046,7 +1123,14 @@ def test(args):
 
 
 def main():
-    args = parse_args()
+    args = _resolve_dataset_checkpoints(parse_args())
+    print(
+        "CHECKPOINTS "
+        f"dataset={args.dataset} "
+        f"geometry={args.geometry_checkpoint} "
+        f"diffusion={args.diffusion_checkpoint} "
+        f"init_refiner={args.init_refiner_checkpoint}"
+    )
     if args.stage == "train":
         train(args)
     else:

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,6 +12,7 @@ from augsburg2_wald_center_roi import (
 )
 from augsburg_real import AugsburgRealDataset
 from prepare_augsburg2_wald_center_holdout import heldout_train_tile_candidates, _rects_intersect
+from visualize_augsburg2_wald_center_holdout import prepare_missing_outputs
 
 
 class AugsburgCenterHoldoutROITests(unittest.TestCase):
@@ -106,6 +108,99 @@ class AugsburgCenterHoldoutROITests(unittest.TestCase):
             self.assertEqual(len(ds.samples),len(coords))
             for y,x,ph,pw in ds.samples:
                 self.assertFalse(_rects_intersect((y,x,y+ph,x+pw),forbidden))
+
+
+    def test_missing_reconstructions_report_all_missing_checkpoints_before_inference(self):
+        with TemporaryDirectory() as d:
+            root=Path(d)
+            wald=root/"wald"
+            wald.mkdir()
+            self.create_cache(str(wald))
+            missing_output1=root/"ours"/"Augsburg2_Wald_heldout_HSI.npy"
+            missing_output2=root/"theirs"/"Augsburg2_Wald_UAFL_heldout_HSI.npy"
+            missing_ours=root/"not_trained_ours.pth"
+            missing_theirs=root/"not_trained_theirs.pth.tar"
+            calibration=root/"not_calibrated.json"
+            with patch("visualize_augsburg2_wald_center_holdout.subprocess.run") as mocked:
+                with self.assertRaises(FileNotFoundError) as exc:
+                    prepare_missing_outputs(
+                        [("S2Diff",str(missing_output1)),("UAFL",str(missing_output2))],
+                        wald_root=str(wald),
+                        uafl_repo=str(root/"not_cloned_uafl"),
+                        radiometry_json=str(calibration),
+                        s2diff_checkpoint=str(missing_ours),
+                        uafl_checkpoint=str(missing_theirs)
+                    )
+                message=str(exc.exception)
+                self.assertIn(str(missing_ours),message)
+                self.assertIn(str(missing_theirs),message)
+                self.assertIn(str(calibration),message)
+                mocked.assert_not_called()
+
+    def test_auto_infer_reconstructs_missing_s2diff_npy_using_matching_checkpoint(self):
+        with TemporaryDirectory() as d:
+            root=Path(d)
+            wald=root/"wald"
+            wald.mkdir()
+            self.create_cache(str(wald))
+            ckpt=root/"center_only.pth"
+            ckpt.touch()
+            calibration=root/"center_only_radiometry.json"
+            calibration.write_text("{}")
+            target=root/"outputs"/"Augsburg2_Wald_heldout_HSI.npy"
+            commands=[]
+            def fake_inference(command, *, cwd, check):
+                self.assertTrue(check)
+                self.assertIn("--skip_qnr", command)
+                self.assertEqual(command[command.index("--checkpoint")+1],str(ckpt))
+                self.assertEqual(command[command.index("--wald_root")+1],str(wald))
+                self.assertEqual(command[command.index("--radiometry_json")+1],str(calibration))
+                self.assertEqual(command[command.index("--save_root")+1],str(target.parent))
+                commands.append((command,cwd))
+                target.touch()
+            with patch("visualize_augsburg2_wald_center_holdout.subprocess.run",
+                       side_effect=fake_inference) as mocked:
+                methods=prepare_missing_outputs(
+                    [("S2Diff",str(target))],
+                    wald_root=str(wald),
+                    uafl_repo=str(root/"uafl"),
+                    radiometry_json=str(calibration),
+                    s2diff_checkpoint=str(ckpt),
+                    uafl_checkpoint=str(root/"absent_UAFL.pth")
+                )
+                self.assertEqual(methods,[("S2Diff",str(target.resolve()))])
+                mocked.assert_called_once()
+                self.assertEqual(len(commands),1)
+                # Second invocation reuses existing output; does not
+                # request a GPU run or require an unrelated UAFL checkpoint.
+                prepare_missing_outputs(
+                    [("S2Diff",str(target))],
+                    wald_root=str(wald),
+                    uafl_repo=str(root/"uafl"),
+                    radiometry_json=str(calibration),
+                    s2diff_checkpoint=str(ckpt),
+                    uafl_checkpoint=str(root/"absent_UAFL.pth")
+                )
+                mocked.assert_called_once()
+
+    def test_no_auto_infer_explains_stage_test_does_not_create_npy(self):
+        with TemporaryDirectory() as d:
+            root=Path(d)
+            wald=root/"wald"
+            wald.mkdir()
+            self.create_cache(str(wald))
+            with patch("visualize_augsburg2_wald_center_holdout.subprocess.run") as mocked:
+                with self.assertRaisesRegex(FileNotFoundError,"stage test"):
+                    prepare_missing_outputs(
+                        [("S2Diff",str(root/"Augsburg2_Wald_heldout_HSI.npy"))],
+                        wald_root=str(wald),
+                        uafl_repo=str(root),
+                        radiometry_json=str(root/"absent.json"),
+                        s2diff_checkpoint=str(root/"absent.pth"),
+                        uafl_checkpoint=str(root/"absent.tar"),
+                        auto_infer=False
+                    )
+                mocked.assert_not_called()
 
 
 if __name__=="__main__":

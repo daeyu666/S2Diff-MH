@@ -29,6 +29,9 @@ def make_command(args):
     if branch not in BRANCH_MODES:
         raise ValueError(f"Unknown Wald branch {branch}")
     mode = BRANCH_MODES[branch]
+    stem = ("Augsburg2_Wald_center_D2_" if args.center_holdout
+            else "Augsburg2_Wald_D2_")
+    train_patch = "24" if args.center_holdout else "72"
     if args.stage not in ("train", "test"):
         raise ValueError("stage must be train or test")
     common = [
@@ -40,7 +43,7 @@ def make_command(args):
         "--geometry_mode", mode,
         "--fixed_dx_px", "-0.5",
         "--fixed_dy_px", "0",
-        "--train_patch_size", "72",
+        "--train_patch_size", train_patch,
         "--train_stride", "6",
         "--eval_patch_size", "48",
         "--batch_size", str(args.batch_size),
@@ -56,7 +59,7 @@ def make_command(args):
         "--monitor", "ref_psnr",
         "--seed", str(args.seed),
         "--device", args.device,
-        "--save_name", f"Augsburg2_Wald_D2_{branch}",
+        "--save_name", f"{stem}{branch}",
         "--checkpoint_root", args.checkpoint_root,
         "--log_root", args.log_root,
     ]
@@ -71,7 +74,7 @@ def make_command(args):
     if args.stage == "train":
         if args.resume_last:
             common += ["--resume", os.path.join(
-                args.checkpoint_root, f"Augsburg2_Wald_D2_{branch}_last.pth"
+                args.checkpoint_root, f"{stem}{branch}_last.pth"
             )]
         else:
             common.append("--from_scratch")
@@ -80,10 +83,10 @@ def make_command(args):
             raise ValueError("--resume_last only applies to --stage train")
         common += [
             "--diffusion_checkpoint", os.path.join(
-                args.checkpoint_root, f"Augsburg2_Wald_D2_{branch}.pth"
+                args.checkpoint_root, f"{stem}{branch}.pth"
             ),
             "--metrics_json", os.path.join(
-                args.log_root, f"Augsburg2_Wald_D2_{branch}_test.json"
+                args.log_root, f"{stem}{branch}_test.json"
             ),
         ]
     return common
@@ -106,6 +109,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dry_run", action="store_true")
+    p.add_argument("--center_holdout", action="store_true",
+                   help="Use new DRT-inspired center-holdout protocol, with isolated checkpoint/logs")
     p.add_argument("--resume_last", action="store_true",
                    help="Resume from branch-specific _last checkpoint without restarting")
     return p.parse_args()
@@ -113,6 +118,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.center_holdout:
+        if args.wald_root == "./data/augsburg2_wald":
+            args.wald_root = "./data/augsburg2_wald_center_holdout"
+        if args.checkpoint_root == "./checkpoints/augsburg_real":
+            args.checkpoint_root = "./checkpoints/augsburg_real/center_holdout"
+        if args.log_root == "./logs/augsburg_real":
+            args.log_root = "./logs/augsburg_real/center_holdout"
+        if args.geometry_checkpoint == CHECKPOINT_C_DEFAULT:
+            args.geometry_checkpoint = (
+                "./checkpoints/augsburg_real/center_holdout/Augsburg2_Wald_center_C.pth"
+            )
+        roi = os.path.join(args.wald_root, "roi.json")
+        if not args.dry_run and not os.path.isfile(roi):
+            raise FileNotFoundError(
+                "Center-holdout cache missing; run prepare_augsburg2_wald_center_holdout.py: "+roi
+            )
     cmd = make_command(args)
     if not args.dry_run:
         for path in (args.psf_json, args.radiometry_json):
@@ -125,13 +146,13 @@ def main():
             )
         if args.stage == "train" and args.resume_last:
             resume_path = os.path.join(
-                args.checkpoint_root, f"Augsburg2_Wald_D2_{args.branch}_last.pth"
+                args.checkpoint_root, f"{'Augsburg2_Wald_center_D2_' if args.center_holdout else 'Augsburg2_Wald_D2_'}{args.branch}_last.pth"
             )
             if not os.path.isfile(resume_path):
                 raise FileNotFoundError(resume_path)
         if args.stage == "test":
             check_path = os.path.join(
-                args.checkpoint_root, f"Augsburg2_Wald_D2_{args.branch}.pth"
+                args.checkpoint_root, f"{'Augsburg2_Wald_center_D2_' if args.center_holdout else 'Augsburg2_Wald_D2_'}{args.branch}.pth"
             )
             if not os.path.isfile(check_path):
                 raise FileNotFoundError(check_path)

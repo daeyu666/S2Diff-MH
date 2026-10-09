@@ -96,18 +96,52 @@ Outputs `Augsburg2_Wald_heldout_HSI.npy` (144x144x242),
 and `Augsburg2_Wald_heldout_QNR.json` (QNR only on the heldout ROI).
 A checkpoint trained with the old full-region split is refused.
 
-## 4. Produce Fig.13 style illustration
+## 4. Produce Fig.13 style illustration (one command)
+
+**The Wald `--stage test` reports reference PSNR/SAM only and does not
+write 10 m HSI .npy files.** The visualization CLI now runs both
+held-out 10 m inference jobs automatically when their output .npy files
+are missing, using their separately trained center-holdout checkpoints.
+
+After preparing the center cache, fitting *center-only* radiometry, and
+training S2Diff Wald-A plus UAFL with the corresponding spatial split:
 
 ```bash
+git pull
 python visualize_augsburg2_wald_center_holdout.py \
-  --wald_root ./data/augsburg2_wald_center_holdout \
-  --method S2Diff ./outputs/augsburg2_wald_center_holdout/Augsburg2_Wald_heldout_HSI.npy \
-  --method UAFL ../comparison_experiments/comparison/UAFL/outputs/augsburg2_wald_center_holdout/Augsburg2_Wald_UAFL_heldout_HSI.npy \
   --savefig ./figures/Augsburg_holdout_S2Diff_vs_UAFL_RGB.png
 ```
 
-The combined figure is saved to the explicit `--savefig` path (parent directory created automatically). The default copy is also saved at
-`outputs/augsburg2_wald_center_holdout/fig13/Augsburg2_center_heldout_Fig13_style.png`, together with the ROI previews and provenance JSON.
+No `--method` arguments are necessary for the default S2Diff vs UAFL
+comparison. The original explicit `--method S2Diff ... --method UAFL ...`
+command still works. The script automatically invokes these inferences
+if needed:
+
+- S2Diff inference checkpoint:
+  `checkpoints/augsburg_real/center_holdout/Augsburg2_Wald_center_D2_A.pth`
+- UAFL inference checkpoint:
+  `../comparison_experiments/comparison/UAFL/checkpoints/augsburg2_wald_center_holdout/best.pth.tar`
+- Shared radiometry:
+  `data/calibration/Augsburg2_Wald_center_holdout_radiometry.json`
+- Inputs:
+  `data/augsburg2_wald_center_holdout`
+
+Missing checkpoints or calibration are reported together **before**
+launching any inference. Inference validates each checkpoint's center
+ROI / sensor provenance; old full-scene-trained checkpoints are
+rejected. Existing valid output files are reused without recomputing.
+
+Automatic inference passes `--skip_qnr` because this command creates
+the *figure*. To calculate quantitative QNR afterwards, use
+`augsburg2_wald_qnr.py` and the corresponding UAFL evaluator.
+The combined figure is saved at the explicit `--savefig` location,
+and the default copy remains at
+`outputs/augsburg2_wald_center_holdout/fig13/Augsburg2_center_heldout_Fig13_style.png`.
+
+For a different repository location or models, override
+`--uafl_repo`, `--s2diff_checkpoint`, `--uafl_checkpoint`,
+`--radiometry_json`, or `--device cpu`.
+Use `--no_auto_infer` to require existing .npy files.
 
 **Do not compare legacy whole-region QNR or test metrics to center-heldout
 scores as though they share a spatial protocol.** Re-train both methods.

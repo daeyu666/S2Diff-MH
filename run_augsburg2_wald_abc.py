@@ -125,6 +125,10 @@ def main():
             args.checkpoint_root = "./checkpoints/augsburg_real/center_holdout"
         if args.log_root == "./logs/augsburg_real":
             args.log_root = "./logs/augsburg_real/center_holdout"
+        if args.radiometry_json == "./data/calibration/Augsburg2_Wald_radiometry.json":
+            args.radiometry_json = (
+                "./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json"
+            )
         if args.geometry_checkpoint == CHECKPOINT_C_DEFAULT:
             args.geometry_checkpoint = (
                 "./checkpoints/augsburg_real/center_holdout/Augsburg2_Wald_center_C.pth"

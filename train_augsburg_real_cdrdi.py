@@ -406,6 +406,14 @@ def main():
     set_seed(args.seed)
     device = get_device(args.device)
     is_wald = _wald_metadata(args.cache_root)
+    with open(os.path.join(args.cache_root, "train", "meta.json"), encoding="utf-8") as fp:
+        train_meta = json.load(fp)
+    args.spatial_protocol_id = train_meta.get("protocol_id", "legacy_full_region_wald")
+    args.test_bbox_30m = train_meta.get("test_bbox_30m")
+    if args.spatial_protocol_id == "Augsburg2-Wald-center-holdout-v1":
+        if (args.train_patch_size != 24 or args.train_stride != 6 or
+            args.eval_patch_size != 48):
+            raise ValueError("Center-heldout CDRDI requires train24/stride6/eval48")
     if is_wald:
         if not 0.0 <= args.augment_shift_px <= 0.75:
             raise ValueError("Wald augment_shift_px must be in [0,0.75] 30m MSI pixels")
@@ -447,6 +455,9 @@ def main():
         check_path = args.resume if args.resume else args.geometry_checkpoint
         extra = _wald_checkpoint_guard(check_path, stage="resume" if args.resume else "test")
         _assert_wald_checkpoint_settings(extra, args, sigma=sigma)
+        if (extra.get("protocol_id", "legacy_full_region_wald") != args.spatial_protocol_id
+            or extra.get("test_bbox_30m") != args.test_bbox_30m):
+            raise ValueError("Frozen CDRDI checkpoint was trained with a different spatial split")
     radiometry = _load_radiometry(args.radiometry_json, device)
 
     train_loader, val_loader, test_loader, info = build_augsburg_real_loaders(
@@ -655,6 +666,8 @@ def main():
                     "stage": "Augsburg2-Wald-CDRDI" if is_wald else "AugsburgReal-C",
                     "msi_source": "real_Sentinel_2_Wald_30m" if is_wald else "real_Sentinel_2",
                     "geometry_pixel_size_m": 30 if is_wald else 10,
+                    "protocol_id": args.spatial_protocol_id,
+                    "test_bbox_30m": args.test_bbox_30m,
                     "radiometry_json": args.radiometry_json,
                     "geometry_config": {
                         "base_channels": args.base_channels,

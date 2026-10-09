@@ -32,7 +32,8 @@ def load_results(log_root):
     baseline = output["A"]
     for name, obj in output.items():
         for key in ("cache_root", "effective_sigma", "diffusion_steps",
-                    "seed", "radiometry_json", "split"):
+                    "seed", "radiometry_json", "split",
+                    "split_protocol_id", "test_bbox_30m"):
             if obj.get(key) != baseline.get(key):
                 raise ValueError(
                     f"A/B/C experimental setting mismatch for {name}: {key}"

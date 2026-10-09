@@ -145,6 +145,14 @@ def main():
         ckpt_bbox_30m=extra.get("test_bbox_30m"),
     )
     h, w = msi.shape[:2]
+    with open(args.radiometry_json, encoding="utf-8") as handle:
+        radiometry_meta = json.load(handle)
+    if (radiometry_meta.get("spatial_protocol_id", "legacy_full_region_wald")
+        != split_protocol_id):
+        raise ValueError(
+            "Full-resolution inference radiometry belongs to a different spatial split; "
+            "re-fit outside center holdout"
+        )
     if h % 6 or w % 6:
         raise ValueError("Held-out area must be divisible by 6 for the diffusion stages")
     print(

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -12,6 +13,7 @@ from augsburg2_wald_center_roi import (
 from augsburg_real import AugsburgRealDataset
 from prepare_augsburg2_wald_center_holdout import heldout_train_tile_candidates, _rects_intersect
 from visualize_augsburg2_wald_center_holdout import resolve_existing_outputs, visualize
+from infer_augsburg2_wald import parse_args as parse_s2diff_inference_args
 
 
 class AugsburgCenterHoldoutROITests(unittest.TestCase):
@@ -24,6 +26,19 @@ class AugsburgCenterHoldoutROITests(unittest.TestCase):
             "test_bbox_10m":[72,108,216,252],
             "guard_pixels_30m":6,
         }), encoding="utf-8")
+
+    def test_center_inference_cli_routes_to_s2diff_own_files(self):
+        with patch("sys.argv", ["infer_augsburg2_wald.py", "--center_holdout", "--write_tif"]):
+            args = parse_s2diff_inference_args()
+        self.assertEqual(args.wald_root, "./data/augsburg2_wald_center_holdout")
+        self.assertEqual(args.save_root, "./outputs/augsburg2_wald_center_holdout")
+        self.assertEqual(
+            args.checkpoint,
+            "./checkpoints/augsburg_real/center_holdout/Augsburg2_Wald_center_D2_A.pth",
+        )
+        self.assertIn("center_holdout_radiometry", args.radiometry_json)
+        self.assertFalse(args.skip_qnr)
+        self.assertTrue(args.write_tif)
 
     def test_heldout_crops_exact_same_region_at_both_resolutions(self):
         with TemporaryDirectory() as d:

@@ -509,3 +509,10 @@ separate Sentinel-2A V4.0 resource; the two protocols are not mixed.
 支持原随机WARP和固定强度协议，默认关闭GIGI以隔离Innovation-2，
 也可对所有路径使用同一份冻结GIGI并保留base/refined两套指标。
 运行命令和结果解释见 [CDRDI_ROBUSTNESS_DIAGNOSTIC.md](CDRDI_ROBUSTNESS_DIAGNOSTIC.md)。
+
+## 主表的多形变种子测试
+
+`test_multiseed_deformation.py`对同一份混合训练权重评估Registered单值，
+以及10个形变种子×每个种子每个test patch 10个case的Warp mean±std。
+与comparison_experiments使用同一套CPU形变/指标/统计代码，支持完成种子的续跑。
+完整命令与新旧协议区别见 [MULTISEED_MAIN_TABLE_TEST.md](MULTISEED_MAIN_TABLE_TEST.md)。

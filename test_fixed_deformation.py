@@ -31,7 +31,7 @@ def parse_args(argv=None):
     return args
 
 
-def build_predictor(args, info, base_process, device):
+def build_predictor(args, info, base_process, device, *, include_registered=False):
     """Model inference consumes Y_H/Y_M only; synthesis geometry stays private."""
     geometry_model, diffusion_model = pipeline._build_frozen_models(args, info, device)
     projector = pipeline._build_projector(args, info, device)
@@ -61,12 +61,24 @@ def build_predictor(args, info, base_process, device):
         heterogeneity = pipeline.ranked_msi_heterogeneity(hr_msi)
         return refiner(base, hr_msi, residual, heterogeneity)
 
+    @torch.no_grad()
+    def predict_registered(lr_hsi, hr_msi):
+        # Match the original FINAL_REGISTERED path: bypass geometry estimation.
+        base = pipeline.reconstruct_from_terminal_lr(
+            diffusion_model, base_process, lr_hsi,
+            target_size=tuple(hr_msi.shape[-2:]), hr_msi=hr_msi,
+        )
+        residual = pipeline._physical_residual(base_process, projector, lr_hsi, base)
+        return refiner(base, hr_msi, residual, pipeline.ranked_msi_heterogeneity(hr_msi))
+
     details = {"refiner_checkpoint": str(path), "checkpoint_epoch": epoch,
                "best_training_monitor": best, "geometry_checkpoint": args.geometry_checkpoint,
                "diffusion_checkpoint": args.diffusion_checkpoint,
                "geometry_steps": args.geometry_steps, "diffusion_steps": args.diffusion_steps,
                "variant": args.variant, "model_geometry_bounds": [4.0, 2.0, 4.0],
                "model_args": vars(args)}
+    if include_registered:
+        return predict, predict_registered, details
     return predict, details
 
 

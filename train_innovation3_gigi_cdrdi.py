@@ -61,7 +61,7 @@ VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full")
 METRIC_KEYS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
 
 
-def parse_args():
+def build_arg_parser(*, fixed_suite=False):
     p = argparse.ArgumentParser(
         description="Innovation-3 terminal GIGI refinement on final CDRDI nonregistered fusion"
     )
@@ -141,7 +141,11 @@ def parse_args():
     p.add_argument("--lambda_phy", type=float, default=0.1)
     p.add_argument("--lambda_msi", type=float, default=0.1)
 
-    p.add_argument("--eval_cases", type=int, default=10)
+    if fixed_suite:
+        p.add_argument("--cases", "--eval_cases", dest="cases", type=int, default=10,
+                       help="Random local fields per test patch per strength")
+    else:
+        p.add_argument("--eval_cases", type=int, default=10)
     p.add_argument("--eval_interval", type=int, default=5)
     p.add_argument("--save_interval", type=int, default=10)
     p.add_argument("--region_fraction", type=float, default=0.25)
@@ -164,7 +168,11 @@ def parse_args():
             "checkpoint/log names. Fresh runs otherwise refuse to overwrite."
         ),
     )
-    return p.parse_args()
+    return p
+
+
+def parse_args():
+    return build_arg_parser().parse_args()
 
 
 

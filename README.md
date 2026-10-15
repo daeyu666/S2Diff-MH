@@ -493,3 +493,11 @@ python calibrate_augsburg_real_radiometry.py \
 For the fixed MDAS acquisition on 7 May 2018, Augsburg-Real uses the frozen
 Sentinel-2B B2/B3/B4/B8 SRF resource. Synthetic Augsburg continues to use the
 separate Sentinel-2A V4.0 resource; the two protocols are not mixed.
+
+## 六档固定形变强度测试
+
+运行 `python test_fixed_deformation.py --dataset CAVE --variant full`，
+并沿用原最终test所用的refiner、geometry、diffusion权重和网络参数。
+脚本逐档遍历全部test patch，固定dx/dy与旋转，局部场在该档上限内随机生成，
+输出逐档JSON及6行指标CSV。与comparison_experiments使用相同CPU局部场采样及指标。
+完整说明见 [FIXED_DEFORMATION_TESTS.md](FIXED_DEFORMATION_TESTS.md)。

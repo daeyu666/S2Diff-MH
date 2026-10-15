@@ -501,3 +501,11 @@ separate Sentinel-2A V4.0 resource; the two protocols are not mixed.
 脚本逐档遍历全部test patch，固定dx/dy与旋转，局部场在该档上限内随机生成，
 输出逐档JSON及6行指标CSV。与comparison_experiments使用相同CPU局部场采样及指标。
 完整说明见 [FIXED_DEFORMATION_TESTS.md](FIXED_DEFORMATION_TESTS.md)。
+
+## 非配准机制诊断
+
+`diagnose_cdrdi_robustness.py`在同一组观测上比较配准Innovation-1骨干、
+适配骨干忽略形变、CDRDI估计形变、GT形变4条路径，不需要重新训练。
+支持原随机WARP和固定强度协议，默认关闭GIGI以隔离Innovation-2，
+也可对所有路径使用同一份冻结GIGI并保留base/refined两套指标。
+运行命令和结果解释见 [CDRDI_ROBUSTNESS_DIAGNOSTIC.md](CDRDI_ROBUSTNESS_DIAGNOSTIC.md)。

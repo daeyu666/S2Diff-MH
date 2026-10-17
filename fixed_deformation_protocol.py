@@ -1,8 +1,9 @@
 """Identical fixed-strength final-test protocol distributed in both repositories.
 
-Rigid motion is fixed, not sampled or alpha-scaled. Only the local B-spline
-field is random. Geometry uses a private CPU generator so model/GPU RNG cannot
-change it. Predictions receive observations only, never GT geometry or HSI.
+Rigid motion is fixed, not sampled or alpha-scaled. The random local field can
+be either the original cubic B-spline field or a Gaussian-smoothed elastic
+field. Geometry uses a private CPU generator so model/GPU RNG cannot change it.
+Predictions receive observations only, never GT geometry or HSI.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-PROTOCOL_ID = "fixed-rigid-random-local-v1"
+PROTOCOL_ID = "fixed-rigid-random-local-v2"
 METRIC_KEYS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
 
 
@@ -58,6 +59,18 @@ def add_suite_args(parser, *, include_cases=True):
     parser.add_argument("--levels", type=int, nargs="+", choices=range(1, 7),
                         default=list(range(1, 7)))
     parser.add_argument("--output_dir", default="")
+    parser.add_argument(
+        "--local_deformation", choices=("bspline", "elastic"), default="bspline",
+        help="Local deformation family. Default preserves the original B-spline protocol.",
+    )
+    parser.add_argument(
+        "--elastic_sigma_hr_px", type=float, default=8.0,
+        help="Gaussian smoothing sigma in HR pixels for elastic local deformation.",
+    )
+    parser.add_argument(
+        "--elastic_truncate", type=float, default=3.0,
+        help="Gaussian kernel radius in sigma units for elastic local deformation.",
+    )
 
 
 def tensor_sha256(tensor):
@@ -82,6 +95,56 @@ def _dense_field(control, height, width):
                         control, _basis(control.shape[-1], width))
 
 
+def _gaussian_kernel1d(sigma, truncate=3.0):
+    sigma = float(sigma)
+    truncate = float(truncate)
+    if sigma <= 0 or truncate <= 0:
+        raise ValueError("elastic sigma and truncate must be positive")
+    radius = max(1, int(math.ceil(truncate * sigma)))
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    kernel = torch.exp(-0.5 * (coords / sigma).square())
+    return kernel / kernel.sum().clamp_min(1e-12)
+
+
+def _elastic_field(noise, sigma, truncate=3.0):
+    """Gaussian-smoothed dense random field, with global translation removed."""
+    if noise.ndim != 4 or noise.shape[1] != 2:
+        raise ValueError("elastic noise must have shape Bx2xHxW")
+    kernel = _gaussian_kernel1d(sigma, truncate).to(device=noise.device, dtype=noise.dtype)
+    radius = kernel.numel() // 2
+    # reflect padding requires the padding radius to be smaller than the image size.
+    max_radius = min(noise.shape[-2], noise.shape[-1]) - 1
+    if max_radius < 1:
+        raise ValueError("elastic deformation needs spatial dimensions >=2")
+    if radius > max_radius:
+        radius = max_radius
+        coords = torch.arange(-radius, radius + 1, device=noise.device, dtype=noise.dtype)
+        kernel = torch.exp(-0.5 * (coords / float(sigma)).square())
+        kernel = kernel / kernel.sum().clamp_min(1e-12)
+    channels = noise.shape[1]
+    weight_x = kernel.view(1, 1, 1, -1).repeat(channels, 1, 1, 1)
+    weight_y = kernel.view(1, 1, -1, 1).repeat(channels, 1, 1, 1)
+    field = F.conv2d(F.pad(noise, (radius, radius, 0, 0), mode="reflect"),
+                     weight_x, groups=channels)
+    field = F.conv2d(F.pad(field, (0, 0, radius, radius), mode="reflect"),
+                     weight_y, groups=channels)
+    return field - field.mean(dim=(-2, -1), keepdim=True)
+
+
+def local_field_statistics(field):
+    magnitude = torch.linalg.vector_norm(field, dim=1)
+    gx = field[:, :, :-1, 1:] - field[:, :, :-1, :-1]
+    gy = field[:, :, 1:, :-1] - field[:, :, :-1, :-1]
+    grad = torch.sqrt((gx.square() + gy.square()).sum(dim=1).clamp_min(0.0))
+    return {
+        "local_mean_hr_px": float(magnitude.mean().item()),
+        "local_rms_hr_px": float(torch.sqrt(magnitude.square().mean()).item()),
+        "local_p95_hr_px": float(torch.quantile(magnitude.flatten(), 0.95).item()),
+        "local_max_hr_px": float(magnitude.amax().item()),
+        "local_grad_p95": float(torch.quantile(grad.flatten(), 0.95).item()),
+    }
+
+
 def local_jacobian(field):
     vx, vy = field[:, 0], field[:, 1]
     a = vx[:, :-1, 1:] - vx[:, :-1, :-1]
@@ -92,7 +155,9 @@ def local_jacobian(field):
 
 
 def sample_fixed_geometry(height, width, strength, *, sample_index, case_index,
-                          seed=10, control_grid=5, min_jacobian=0.5):
+                          seed=10, control_grid=5, min_jacobian=0.5,
+                          local_deformation="bspline", elastic_sigma_hr_px=8.0,
+                          elastic_truncate=3.0):
     """CPU/float32 synthesis; the seed is independent of level/model/device.
 
     Paired levels start with the same candidate field and amplitude fraction.
@@ -103,16 +168,30 @@ def sample_fixed_geometry(height, width, strength, *, sample_index, case_index,
         raise ValueError("Spatial dimensions and control_grid must be >=2")
     if not 0 < min_jacobian <= 1:
         raise ValueError("min_jacobian must be in (0,1]")
+    if local_deformation not in ("bspline", "elastic"):
+        raise ValueError("local_deformation must be 'bspline' or 'elastic'")
+    if elastic_sigma_hr_px <= 0 or elastic_truncate <= 0:
+        raise ValueError("elastic sigma/truncate must be positive")
     local_seed = (int(seed) + 70000 + int(sample_index)*1000003
                   + int(case_index)*9176) % (2**63 - 1)
     gen = torch.Generator(device="cpu").manual_seed(local_seed)
     for attempt in range(64):
-        control = torch.randn(1, 2, control_grid, control_grid, generator=gen)
-        control -= control.mean(dim=(-2, -1), keepdim=True)
-        dense = _dense_field(control, height, width)
-        amplitude = torch.rand(1, generator=gen) * strength.local_max_hr_px
-        control *= amplitude / torch.linalg.vector_norm(dense, dim=1).amax().clamp_min(1e-8)
-        dense = _dense_field(control, height, width)
+        if local_deformation == "bspline":
+            control = torch.randn(1, 2, control_grid, control_grid, generator=gen)
+            control -= control.mean(dim=(-2, -1), keepdim=True)
+            dense = _dense_field(control, height, width)
+            amplitude = torch.rand(1, generator=gen) * strength.local_max_hr_px
+            control *= amplitude / torch.linalg.vector_norm(dense, dim=1).amax().clamp_min(1e-8)
+            dense = _dense_field(control, height, width)
+        else:
+            # PSRF-style elastic family: dense random displacement followed by
+            # Gaussian spatial smoothing. This is not claimed to reproduce the
+            # unpublished Elastic1000 generator exactly.
+            control = torch.randn(1, 2, height, width, generator=gen)
+            control -= control.mean(dim=(-2, -1), keepdim=True)
+            dense = _elastic_field(control, elastic_sigma_hr_px, elastic_truncate)
+            amplitude = torch.rand(1, generator=gen) * strength.local_max_hr_px
+            dense *= amplitude / torch.linalg.vector_norm(dense, dim=1).amax().clamp_min(1e-8)
         jacobian = local_jacobian(dense).amin().item()
         if jacobian >= min_jacobian:
             geometry = FixedGeometry(
@@ -121,12 +200,15 @@ def sample_fixed_geometry(height, width, strength, *, sample_index, case_index,
                 theta_deg=torch.tensor([strength.rotation_deg], dtype=torch.float32),
                 control=control, local_field=dense,
             )
+            stats = local_field_statistics(dense)
             record = {
                 "geometry_seed": local_seed, "local_sampling_attempts": attempt + 1,
+                "local_deformation": local_deformation,
+                "elastic_sigma_hr_px": float(elastic_sigma_hr_px) if local_deformation == "elastic" else None,
                 "dx_hr_px": float(geometry.dx.item()),
                 "dy_hr_px": float(geometry.dy.item()),
                 "rotation_deg": float(geometry.theta_deg.item()),
-                "local_max_hr_px": float(torch.linalg.vector_norm(dense, dim=1).amax().item()),
+                **stats,
                 "min_local_jacobian": jacobian,
                 "local_field_sha256": tensor_sha256(dense),
             }
@@ -190,7 +272,9 @@ def _write_json(path, payload):
 @torch.no_grad()
 def run_fixed_suite(test_set, predict, degrade, *, device, output_dir, metadata,
                     cases=10, seed=10, eval_seed=1234, levels=None,
-                    control_grid=5, min_jacobian=0.5, scale_ratio=4):
+                    control_grid=5, min_jacobian=0.5, scale_ratio=4,
+                    local_deformation="bspline", elastic_sigma_hr_px=8.0,
+                    elastic_truncate=3.0):
     """Each level traverses every patch; average cases, then patches equally.
 
     ``predict(lr_hsi, hr_msi)`` sees neither GT nor synthesis geometry. Every
@@ -208,7 +292,10 @@ def run_fixed_suite(test_set, predict, degrade, *, device, output_dir, metadata,
         "protocol_id": PROTOCOL_ID, "torch_version": str(torch.__version__),
         "seed": seed, "eval_seed": eval_seed, "geometry_device": "cpu/float32",
         "rigid_definition": "dx=dy=+translation_hr_px; theta=+rotation_deg; no alpha",
+        "local_deformation": local_deformation,
         "local_amplitude_proposal": "U(0,level.local_max_hr_px), conditioned on min local Jacobian",
+        "elastic_sigma_hr_px": float(elastic_sigma_hr_px) if local_deformation == "elastic" else None,
+        "elastic_truncate": float(elastic_truncate) if local_deformation == "elastic" else None,
         "case_schedule": "private seed per patch/case; paired across levels and models",
         "warp_observation": "Y_H=P0(W_phi(X)); HR-MSI and GT stay registered",
         "control_grid": control_grid, "min_local_jacobian": min_jacobian,
@@ -238,7 +325,9 @@ def run_fixed_suite(test_set, predict, degrade, *, device, output_dir, metadata,
                 geometry, record = sample_fixed_geometry(
                     *gt.shape[-2:], strength, sample_index=sample_index,
                     case_index=case_index, seed=seed, control_grid=control_grid,
-                    min_jacobian=min_jacobian,
+                    min_jacobian=min_jacobian, local_deformation=local_deformation,
+                    elastic_sigma_hr_px=elastic_sigma_hr_px,
+                    elastic_truncate=elastic_truncate,
                 )
                 lr_hsi = degrade(warp_hsi(gt, geometry))
                 reconstruction_seed = (eval_seed + sample_index*1000003 + case_index*9176) % (2**63-1)
@@ -259,9 +348,16 @@ def run_fixed_suite(test_set, predict, degrade, *, device, output_dir, metadata,
         reference_inputs = inputs
         averaged = {key: mean(row[key] for row in per_patch) for key in METRIC_KEYS}
         local_values = [row["local_max_hr_px"] for row in per_case]
-        result = {**asdict(strength), "test_patch_count": len(test_set),
+        local_p95_values = [row["local_p95_hr_px"] for row in per_case]
+        local_mean_values = [row["local_mean_hr_px"] for row in per_case]
+        local_grad_values = [row["local_grad_p95"] for row in per_case]
+        result = {**asdict(strength), "local_deformation": local_deformation,
+                  "test_patch_count": len(test_set),
                   "evaluated_cases": len(per_case), "average_metrics": averaged,
                   "actual_local_max_hr_px": {"min": min(local_values), "mean": mean(local_values), "max": max(local_values)},
+                  "actual_local_p95_hr_px": {"min": min(local_p95_values), "mean": mean(local_p95_values), "max": max(local_p95_values)},
+                  "actual_local_mean_hr_px": {"min": min(local_mean_values), "mean": mean(local_mean_values), "max": max(local_mean_values)},
+                  "actual_local_grad_p95": {"min": min(local_grad_values), "mean": mean(local_grad_values), "max": max(local_grad_values)},
                   "detail_json": f"level_{level_id}.json"}
         _write_json(output_dir / result["detail_json"], {
             "test_conditions": conditions, "result": result,
@@ -277,7 +373,7 @@ def run_fixed_suite(test_set, predict, degrade, *, device, output_dir, metadata,
             for row in summary["results"]:
                 writer.writerow({**{key: row[key] for key in fields if key not in METRIC_KEYS}, **row["average_metrics"]})
         print(f"FIXED_LEVEL={level_id} dx=dy={strength.translation_hr_px:g}px "
-              f"rotation={strength.rotation_deg:g}deg local<={strength.local_max_hr_px:g}px "
+              f"rotation={strength.rotation_deg:g}deg local={local_deformation}<={strength.local_max_hr_px:g}px "
               + " ".join(f"{key}={averaged[key]:.6f}" for key in METRIC_KEYS), flush=True)
     print(f"FIXED_TEST_SUMMARY={output_dir / 'summary.csv'}", flush=True)
     return summary

@@ -85,8 +85,12 @@ def build_predictor(args, info, base_process, device, *, include_registered=Fals
 def main(argv=None):
     args = parse_args(argv)
     if not args.output_dir:
+        deformation_tag = (
+            f"{args.local_deformation}_a{args.tarc_alpha:g}_s{args.tarc_sigma_hr_px:g}"
+            if args.local_deformation.startswith("tarc") else args.local_deformation
+        )
         args.output_dir = str(Path("outputs/fixed_deformation") / args.dataset
-                              / f"{args.variant}_{args.local_deformation}_seed{args.seed}_cases{args.cases}_eval{args.eval_seed}")
+                              / f"{args.variant}_{deformation_tag}_seed{args.seed}_cases{args.cases}_eval{args.eval_seed}")
     print(json.dumps({"method": "S2Diff-MH", "dataset": args.dataset,
                       "output_dir": args.output_dir,
                       "strengths": [asdict(STRENGTHS[i-1]) for i in args.levels]}, indent=2), flush=True)
@@ -113,6 +117,8 @@ def main(argv=None):
         local_deformation=args.local_deformation,
         elastic_sigma_hr_px=args.elastic_sigma_hr_px,
         elastic_truncate=args.elastic_truncate,
+        tarc_alpha=args.tarc_alpha,
+        tarc_sigma_hr_px=args.tarc_sigma_hr_px,
     )
 
 

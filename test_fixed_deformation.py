@@ -82,11 +82,11 @@ def build_predictor(args, info, base_process, device, *, include_registered=Fals
     return predict, details
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     if not args.output_dir:
         args.output_dir = str(Path("outputs/fixed_deformation") / args.dataset
-                              / f"{args.variant}_seed{args.seed}_cases{args.cases}_eval{args.eval_seed}")
+                              / f"{args.variant}_{args.local_deformation}_seed{args.seed}_cases{args.cases}_eval{args.eval_seed}")
     print(json.dumps({"method": "S2Diff-MH", "dataset": args.dataset,
                       "output_dir": args.output_dir,
                       "strengths": [asdict(STRENGTHS[i-1]) for i in args.levels]}, indent=2), flush=True)
@@ -110,6 +110,9 @@ def main():
                   "psf_truncate": args.psf_truncate, **details},
         cases=args.cases, seed=args.seed, eval_seed=args.eval_seed, levels=args.levels,
         control_grid=args.control_grid, min_jacobian=args.min_jacobian,
+        local_deformation=args.local_deformation,
+        elastic_sigma_hr_px=args.elastic_sigma_hr_px,
+        elastic_truncate=args.elastic_truncate,
     )
 
 

@@ -199,6 +199,10 @@ Training/checkpoint selection must use only train + validation.  The final test
 split is not used for early stopping or model selection.  `main.py` now selects
 the best Innovation-1 checkpoint on the validation loader.
 
+For a separate synthetic Augsburg x4 capacity ablation with 128-channel
+reconstruction backbones and isolated checkpoints/logs, see
+[`AUGSBURG_SYNTHETIC_BASE128.md`](AUGSBURG_SYNTHETIC_BASE128.md).
+
 ### Expected local layout
 
 ```text

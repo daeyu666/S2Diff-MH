@@ -62,7 +62,7 @@ def parse_args():
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
     p.add_argument("--geometry_checkpoint", default="", help="Only needed for learned geometry")
     p.add_argument("--diffusion_checkpoint", required=True)
-    p.add_argument("--geometry_mode", choices=("identity", "wald_fixed", "estimated", "wald_cdrdi"), default="identity")
+    p.add_argument("--geometry_mode", choices=("identity", "wald_fixed", "estimated", "wald_cdrdi"), default="estimated")
     p.add_argument("--fixed_dx_px", type=float, default=-0.5)
     p.add_argument("--fixed_dy_px", type=float, default=0.0)
     p.add_argument("--guard_window", type=int, default=5)

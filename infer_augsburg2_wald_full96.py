@@ -45,7 +45,8 @@ def parse_args():
     p.add_argument("--wald_root", default="./data/augsburg2_wald")
     p.add_argument("--checkpoint", required=True,
                    help="Wald-C 96-channel diffusion checkpoint")
-    p.add_argument("--geometry_checkpoint", required=True)
+    p.add_argument("--geometry_checkpoint", default="", help="Required only for Wald C")
+    p.add_argument("--geometry_mode", choices=("identity", "wald_fixed", "wald_cdrdi"), default="identity")
     p.add_argument("--refiner_checkpoint", required=True)
     p.add_argument("--geometry_steps", type=int, default=9)
     p.add_argument("--fixed_dx_px", type=float, default=-0.5)
@@ -196,8 +197,10 @@ def main():
             "Full inference requires strictly Wald-D2 trained on observed 30m HSI, "
             "never legacy EnMAP10 supervision"
         )
-    if extra.get("geometry_mode") != "wald_cdrdi":
-        raise ValueError("Requires a Wald C geometry-aware diffusion checkpoint")
+    if extra.get("geometry_mode") != args.geometry_mode:
+        raise ValueError("Diffusion checkpoint geometry mode does not match requested mode")
+    if args.geometry_mode in ("identity", "wald_fixed") and args.geometry_checkpoint:
+        raise ValueError("Identity and fixed-shift inference must not load a learned geometry checkpoint")
     if extra.get("geometry_checkpoint") != args.geometry_checkpoint:
         raise ValueError("Diffusion checkpoint refers to another geometry checkpoint")
     if int(extra.get("geometry_steps", -1)) != args.geometry_steps:
@@ -237,26 +240,30 @@ def main():
     load_checkpoint(model, args.checkpoint, map_location=str(device), load_optimizer=False)
     model.eval().requires_grad_(False)
 
-    geom_extra = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-Full96-Inference")
-    if (geom_extra.get("protocol_id") != split_protocol_id
-        or geom_extra.get("test_bbox_30m") != extra.get("test_bbox_30m")):
-        raise ValueError("Geometry checkpoint was trained with a different center holdout")
-    geom_config = geom_extra["geometry_config"]
-    geometry_model = LearnedPhysicalResidualSolver(
-        4, **{
-            key: int(geom_config[key]) if key in ("base_channels", "control_grid")
-            else float(geom_config[key])
-            for key in (
-                "base_channels", "control_grid", "max_translation",
-                "max_rotation_deg", "max_local_px", "initial_dx_px", "initial_dy_px"
-            )
-        }
-    ).to(device)
-    load_checkpoint(
-        geometry_model, args.geometry_checkpoint,
-        map_location=str(device), load_optimizer=False,
-    )
-    geometry_model.eval().requires_grad_(False)
+    geometry_model = None
+    if args.geometry_mode == "wald_cdrdi":
+        geom_extra = _wald_checkpoint_guard(
+            args.geometry_checkpoint, stage="Wald-Full96-Inference"
+        )
+        if (geom_extra.get("protocol_id") != split_protocol_id
+            or geom_extra.get("test_bbox_30m") != extra.get("test_bbox_30m")):
+            raise ValueError("Geometry checkpoint was trained with a different center holdout")
+        geom_config = geom_extra["geometry_config"]
+        geometry_model = LearnedPhysicalResidualSolver(
+            4, **{
+                key: int(geom_config[key]) if key in ("base_channels", "control_grid")
+                else float(geom_config[key])
+                for key in (
+                    "base_channels", "control_grid", "max_translation",
+                    "max_rotation_deg", "max_local_px", "initial_dx_px", "initial_dy_px"
+                )
+            }
+        ).to(device)
+        load_checkpoint(
+            geometry_model, args.geometry_checkpoint,
+            map_location=str(device), load_optimizer=False,
+        )
+        geometry_model.eval().requires_grad_(False)
     ref_args = SimpleNamespace(
         refine_hidden=args.refine_hidden, heads=args.heads,
         variant=args.variant, disable_tangent=args.disable_tangent,
@@ -266,7 +273,8 @@ def main():
     if (ref_extra.get("geometry_checkpoint") != args.geometry_checkpoint
         or ref_extra.get("diffusion_checkpoint") != args.checkpoint
         or ref_extra.get("wald_protocol_id") != split_protocol_id
-        or int(ref_extra.get("diffusion_base_channels", -1)) != args.base_channels):
+        or int(ref_extra.get("diffusion_base_channels", -1)) != args.base_channels
+        or ref_extra.get("geometry_mode") != args.geometry_mode):
         raise ValueError("Refiner was not trained with this Wald C/96/split combination")
     refiner = _build_refiner(ref_args, info, device)
     _load_training_refiner(refiner, args.refiner_checkpoint, device)
@@ -298,9 +306,18 @@ def main():
         }),
         msi_source="real_Sentinel_2_Wald_30m", sigma=sigma,
     )
-    rigid_10, rigid_30 = _geometry_from_wald_30m(
-        geometry_model, process, lr, msi, valid, radiometry, srf, geometry_args, device
-    )
+    if args.geometry_mode == "wald_cdrdi":
+        rigid_10, rigid_30 = _geometry_from_wald_30m(
+            geometry_model, process, lr, msi, valid,
+            radiometry, srf, geometry_args, device,
+        )
+    else:
+        rigid_30 = torch.zeros((1, 3), dtype=torch.float32, device=device)
+        if args.geometry_mode == "wald_fixed":
+            rigid_30[:, 0] = args.fixed_dx_px
+            rigid_30[:, 1] = args.fixed_dy_px
+        rigid_10 = rigid_30.clone()
+        rigid_10[:, :2] *= 3.0
     print(
         "FULL96_GEOMETRY rigid_30m=" + str(rigid_30[0].tolist())
         + " rigid_10m=" + str(rigid_10[0].tolist())
@@ -322,13 +339,16 @@ def main():
             y_h = torch.from_numpy(lr_patch).permute(2, 0, 1).unsqueeze(0).to(device)
             y_m = torch.from_numpy(msi_patch).permute(2, 0, 1).unsqueeze(0).to(device)
             y_m = _apply_radiometry(y_m, radiometry)
-            tile_rigid = _tile_rigid(
-                rigid_10, top, left, ts, h, w
-            )
-            tile_local = y_m.new_zeros((1, 2, ts, ts))
-            tile_process = DeformationAwareProgressiveDegradation(
-                process, rigid=tile_rigid, local_field=tile_local
-            )
+            if args.geometry_mode == "identity":
+                tile_process = process
+            else:
+                tile_rigid = _tile_rigid(
+                    rigid_10, top, left, ts, h, w
+                )
+                tile_local = y_m.new_zeros((1, 2, ts, ts))
+                tile_process = DeformationAwareProgressiveDegradation(
+                    process, rigid=tile_rigid, local_field=tile_local
+                )
             base = reconstruct_from_terminal_lr(
                 model, tile_process, y_h,
                 target_size=(ts, ts), hr_msi=y_m,
@@ -361,9 +381,12 @@ def main():
         hm = _apply_radiometry(hm, radiometry)
         valid_hr = torch.from_numpy(valid.copy()).unsqueeze(0).unsqueeze(0).to(device)
         valid_lr = F.avg_pool2d(valid_hr.float(), 3, 3) >= 0.999
-        full_process = DeformationAwareProgressiveDegradation(
-            process, rigid=rigid_10,
-            local_field=ph.new_zeros((1, 2, h, w)),
+        full_process = (
+            process if args.geometry_mode == "identity"
+            else DeformationAwareProgressiveDegradation(
+                process, rigid=rigid_10,
+                local_field=ph.new_zeros((1, 2, h, w)),
+            )
         )
         predicted_lr = full_process.terminal_observation(ph)
         predicted_msi = spectral_project(ph, srf)
@@ -405,13 +428,14 @@ def main():
         print(f"FULL_OUTPUT_GEOTIFF={raster_path}")
     report_path = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_protocol.json")
     report = {
-        "model": "S2Diff-MH-Full96-CDRDI-Diffusion-HPGC",
+        "model": "S2Diff-MH-Full96-Diffusion-HPGC",
         "stage": "original_10m_inference",
         "spatial_protocol_id": split_protocol_id,
         "evaluation_area": output_suffix,
         "test_bbox_30m": extra.get("test_bbox_30m"),
         "checkpoint": os.path.realpath(args.checkpoint),
-        "geometry_checkpoint": os.path.realpath(args.geometry_checkpoint),
+        "geometry_checkpoint": os.path.realpath(args.geometry_checkpoint) if args.geometry_checkpoint else "",
+        "geometry_mode": args.geometry_mode,
         "refiner_checkpoint": os.path.realpath(args.refiner_checkpoint),
         "geometry_rigid_30m": rigid_30[0].tolist(),
         "geometry_rigid_10m": rigid_10[0].tolist(),

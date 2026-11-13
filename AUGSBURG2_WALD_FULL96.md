@@ -165,7 +165,7 @@ python train_augsburg_real_gigi.py \
   --seed 10 --device cuda:0
 ```
 
-## 5. Native 10m 242-band reconstruction with HPGC and QNR
+## 5. Native 10m 242-band single-pass reconstruction with HPGC and QNR
 
 ```bash
 python infer_augsburg2_wald_full96.py \
@@ -176,7 +176,6 @@ python infer_augsburg2_wald_full96.py \
   --base_channels 96 --diffusion_steps 12 \
   --time_dim 256 --spectral_hidden 8 \
   --refine_hidden 64 --heads 4 --variant full \
-  --tile_size 96 --tile_stride 48 \
   --save_root "./outputs/augsburg2_wald_center_holdout/full96_${BRANCH}" \
   --seed 10 --device cuda:0 --write_tif
 ```
@@ -190,6 +189,14 @@ outputs/augsburg2_wald_center_holdout/full96_A/
   Augsburg2_Wald_heldout_QNR.json
   Augsburg2_Wald_heldout_protocol.json
 ```
+
+**Single-pass requirement:** The held-out HSI30 48x48 and MSI10 144x144
+are forwarded as complete images: one 12-step diffusion reconstruction,
+followed by one HPGC refinement. The 144x144x242 HSI is never tiled,
+overlap-averaged, or stitched. Logs print `FULL_SINGLE_PASS` and
+`FULL_SINGLE_PASS_DONE diffusion_runs=1 refiner_runs=1`.
+The script tolerates legacy `--tile_size` and `--tile_stride` arguments
+but explicitly ignores them; omit both in new runs.
 
 For fixed B, use `full96_B`. The B native 10m operator uses fixed
 translation `dx=-1.5,dy=0` in 10m pixels (same -15m shift), rather than

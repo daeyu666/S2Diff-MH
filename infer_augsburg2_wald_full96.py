@@ -1,10 +1,11 @@
-"""Complete Augsburg-2 Center-Holdout Wald C + Diffusion96 + HPGC original-scale inference.
+"""Complete Augsburg-2 Center-Holdout Wald A/B/C + Diffusion96 + HPGC inference.
 
 Input: original EnMAP-like 30m HSI and real Sentinel-2 10m MSI, both from
 MDAS sub_area_2. Does not load 10m HSI ground truth or run validation on it.
 Output: 10m 242-band HSI in the original MSI georeferenced frame.
 
-Overlap-add tiles avoid tiny edge tiles and fit a 12 GB GPU.
+The held-out 144x144 HR-MSI ROI is processed as ONE whole-image diffusion
+reconstruction and ONE whole-image HPGC refinement, without tiles or stitching.
 """
 
 from __future__ import annotations
@@ -60,8 +61,10 @@ def parse_args():
     p.add_argument("--disable_tangent", action="store_true")
     p.add_argument("--radiometry_json", default="./data/calibration/Augsburg2_Wald_radiometry.json")
     p.add_argument("--save_root", default="./outputs/augsburg2_wald")
-    p.add_argument("--tile_size", type=int, default=96)
-    p.add_argument("--tile_stride", type=int, default=48)
+    p.add_argument("--tile_size", type=int, default=None,
+                   help="DEPRECATED: ignored; full ROI is always processed in one pass")
+    p.add_argument("--tile_stride", type=int, default=None,
+                   help="DEPRECATED: ignored; full ROI is always processed in one pass")
     p.add_argument("--diffusion_steps", type=int, default=12)
     p.add_argument("--base_channels", type=int, default=96)
     p.add_argument("--time_dim", type=int, default=256)
@@ -92,6 +95,9 @@ def parse_args():
         p.error("--center_holdout requires QNR output; omit --skip_qnr")
     if args.base_channels != 96:
         p.error("Full96 inference requires --base_channels 96")
+    if args.tile_size is not None or args.tile_stride is not None:
+        print("INFO: --tile_size/--tile_stride are obsolete and ignored; "
+              "the full held-out 144x144 ROI will be inferred once.", flush=True)
     # argparse(required=True) checks only whether a flag is supplied. A shell
     # expansion such as --checkpoint "$DIFF" can still pass an empty string
     # after starting a new terminal where DIFF/REF are no longer exported.
@@ -154,27 +160,9 @@ def _geometry_from_wald_30m(geometry_model, base_process, lr, msi, valid, radiom
     return rigid_10, rigid_30
 
 
-def positions(length, tile, stride):
-    if length < tile:
-        raise ValueError(f"Full-resolution side {length} is smaller than tile {tile}")
-    coords = list(range(0, length - tile + 1, stride))
-    last = length - tile
-    if not coords or coords[-1] != last:
-        coords.append(last)
-    if any(v % 3 for v in coords):
-        raise ValueError("Tile origins must be multiples of 3 for matched LR-HSI")
-    return coords
-
-
 @torch.no_grad()
 def main():
     args = parse_args()
-    if args.tile_size <= 0 or args.tile_size % 6:
-        raise ValueError("--tile_size must be a positive multiple of 6")
-    if args.tile_stride <= 0 or args.tile_stride % 6:
-        raise ValueError("--tile_stride must be a positive multiple of 6")
-    if args.tile_stride > args.tile_size:
-        raise ValueError("--tile_stride must not exceed --tile_size")
     set_seed(args.seed)
     device = get_device(args.device)
     with open(os.path.join(args.wald_root, "wald_psf.json"), "r", encoding="utf-8") as f:
@@ -350,48 +338,45 @@ def main():
         "FULL96_GEOMETRY rigid_30m=" + str(rigid_30[0].tolist())
         + " rigid_10m=" + str(rigid_10[0].tolist())
     )
-    sum_cube = np.zeros((h, w, 242), dtype=np.float32)
-    weight = np.zeros((h, w), dtype=np.float32)
-    ys = positions(h, args.tile_size, args.tile_stride)
-    xs = positions(w, args.tile_size, args.tile_stride)
+    # Single full-ROI pass: 48x48 HSI30 + 144x144 MSI10 -> 144x144 HSI10.
+    # This retains identical geometry and physical degradation throughout
+    # the full ROI, instead of reconstructing four overlapping 96x96 tiles.
+    y_h = torch.from_numpy(np.ascontiguousarray(lr)).permute(
+        2, 0, 1
+    ).unsqueeze(0).to(device)
+    y_m = torch.from_numpy(np.ascontiguousarray(msi)).permute(
+        2, 0, 1
+    ).unsqueeze(0).to(device)
+    y_m = _apply_radiometry(y_m, radiometry)
+    if args.geometry_mode == "identity":
+        full_process = process
+    else:
+        full_process = DeformationAwareProgressiveDegradation(
+            process, rigid=rigid_10,
+            local_field=y_m.new_zeros((1, 2, h, w)),
+        )
 
-    for i, top in enumerate(ys):
-        for j, left in enumerate(xs):
-            ts = args.tile_size
-            lr_patch = np.ascontiguousarray(
-                lr[top // 3:(top + ts) // 3, left // 3:(left + ts) // 3, :]
-            )
-            msi_patch = np.ascontiguousarray(
-                msi[top:top + ts, left:left + ts, :]
-            )
-            y_h = torch.from_numpy(lr_patch).permute(2, 0, 1).unsqueeze(0).to(device)
-            y_m = torch.from_numpy(msi_patch).permute(2, 0, 1).unsqueeze(0).to(device)
-            y_m = _apply_radiometry(y_m, radiometry)
-            if args.geometry_mode == "identity":
-                tile_process = process
-            else:
-                tile_rigid = _tile_rigid(
-                    rigid_10, top, left, ts, h, w
-                )
-                tile_local = y_m.new_zeros((1, 2, ts, ts))
-                tile_process = DeformationAwareProgressiveDegradation(
-                    process, rigid=tile_rigid, local_field=tile_local
-                )
-            base = reconstruct_from_terminal_lr(
-                model, tile_process, y_h,
-                target_size=(ts, ts), hr_msi=y_m,
-            )
-            residual = _physical_residual(tile_process, projector, y_h, base)
-            heterogeneity = ranked_msi_heterogeneity(y_m)
-            pred = refiner(base, y_m, residual, heterogeneity)
-            array = pred[0].permute(1, 2, 0).cpu().numpy()
-            sum_cube[top:top + ts, left:left + ts, :] += array
-            weight[top:top + ts, left:left + ts] += 1.
-            print(f"FULL_TILE {i + 1}/{len(ys)} {j + 1}/{len(xs)} at={top},{left}")
-
-    if not np.all(weight > 0):
-        raise AssertionError("Not all full-resolution pixels were reconstructed")
-    fused = sum_cube / weight[..., None]
+    print(
+        f"FULL_SINGLE_PASS input_HSI30={tuple(y_h.shape)} "
+        f"input_MSI10={tuple(y_m.shape)} output_HW=({h},{w})",
+        flush=True,
+    )
+    base = reconstruct_from_terminal_lr(
+        model, full_process, y_h,
+        target_size=(h, w), hr_msi=y_m,
+    )
+    residual = _physical_residual(
+        full_process, projector, y_h, base
+    )
+    heterogeneity = ranked_msi_heterogeneity(y_m)
+    refined = refiner(base, y_m, residual, heterogeneity)
+    if refined.shape != (1, 242, h, w):
+        raise RuntimeError(
+            "Full ROI refined shape mismatch: "
+            f"expected (1,242,{h},{w}), got {tuple(refined.shape)}"
+        )
+    fused = refined[0].permute(1, 2, 0).contiguous().cpu().numpy()
+    print("FULL_SINGLE_PASS_DONE diffusion_runs=1 refiner_runs=1", flush=True)
     fused[~valid] = 0.
     os.makedirs(args.save_root, exist_ok=True)
     output_path = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_HSI.npy")
@@ -471,6 +456,9 @@ def main():
         "wald_root": os.path.realpath(args.wald_root),
         "reconstruction": os.path.realpath(output_path),
         "shape": list(fused.shape),
+        "inference_mode": "single_full_roi",
+        "diffusion_reconstructions": 1,
+        "refiner_evaluations": 1,
         "ground_truth_10m_HSI": False,
         "qnr": qnr,
         "phy_l1": phy,

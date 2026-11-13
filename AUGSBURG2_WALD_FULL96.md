@@ -1,50 +1,41 @@
-# Augsburg Region-2 Center-Holdout: full S2Diff-MH at Diffusion base_channels=96
+# Augsburg Center-Holdout: original A/B geometry + Diffusion96 + HPGC
 
-This protocol trains **CDRDI -> geometry-aware 96-wide physics-grounded diffusion ->
-full HPGC/GCI spectral refiner** from scratch on Wald Center-Holdout. It does
-**not** load EnMAP-like 10m hyperspectral ground truth. Original 10m evaluation
-uses QNR, Dlambda and Ds only.
+**Important correction:** Earlier Wald A/B/C experiments selected **A/identity**
+for native-scale QNR: Wald reduced-resolution A PSNR=31.852742, SAM=3.938751;
+B (fixed dx=-0.5, dy=0) PSNR=31.800527, SAM=4.197228;
+C (learned CDRDI) PSNR=31.816066, SAM=4.085203. The original
+`infer_augsburg2_wald.py` is A/identity only and did not run HPGC.
 
-The scripts in this branch retain the legacy 64-channel/identity pathways.
-The new complete native-scale entrypoint is `infer_augsburg2_wald_full96.py`.
+Therefore, to preserve the **actual original selected training protocol** when
+changing **only diffusion base_channels 64 -> 96** and **adding the requested
+HPGC spectral refinement**, run the **A/identity** commands here. No CDRDI
+checkpoint or CDRDI training is required.
 
-## 0. Empty server: code, environment and raw data
+The B/fixed-shift alternative, if desired, requires only `--geometry_mode
+wald_fixed` and `--fixed_dx_px -0.5 --fixed_dy_px 0`; it does **not** learn
+CDRDI. Keep A and B checkpoints, logs, and results in separate directories.
+**Do not refer to Wald A/B as a learned CDRDI demonstration.**
+
+## 0. Fresh server
 
 ```bash
-git clone --branch feature/augsburg-wald-full96 https://github.com/daeyu666/S2Diff-MH.git
+git clone -b feature/augsburg-wald-full96 https://github.com/daeyu666/S2Diff-MH.git
 cd S2Diff-MH
+
 conda create -n s2diff96 python=3.10 -y
 conda activate s2diff96
 python -m pip install --upgrade pip
 python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 python -m pip install -r requirements.txt
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-**Raw Augsburg MDAS data are NOT stored in this Git repository.** Transfer
-`Augsburg_data_4_publication/` from the original storage or obtain it from
-the data publisher, preserving its directory names:
+Raw MDAS data are not in GitHub. Transfer the original
+`data/raw/Augsburg/Augsburg_data_4_publication/` directory from storage
+before proceeding (including the original train/validation and
+`sub_area_2` EnMAP30 / real Sentinel-2 data).
 
-```text
-data/raw/Augsburg/Augsburg_data_4_publication/
-  band_242_meta_info.hdr
-  sr_deep_model_data/EeteS_EnMAP_30m_deep_train.tif
-  sr_deep_model_data/EeteS_EnMAP_30m_deep_valid.tif
-  sub_area_2/EeteS_EnMAP_30m_sub_area2.tif
-  sub_area_2/Sentinel_2_sub_area2.tif
-  entire_city/Sentinel-2.tif
-  ...
-```
-
-`prepare_augsburg_real.py` also expects the other original MDAS files used
-to build the original split cache. Check completeness with the preparation
-commands below; do not substitute simulated Sentinel-2 imagery for real MSI.
-
-## 1. Data preparation and train-only radiometric calibration
-
-Run from the repository root, in order. `--s2_platform auto` requires
-valid platform metadata; if the source does not identify the platform, use
-`--s2_platform S2A` or `S2B` based on the original product metadata.
+## 1. Prepare held-out Wald data and calibration
 
 ```bash
 python prepare_augsburg_real.py \
@@ -56,9 +47,7 @@ python prepare_augsburg2_wald.py \
   --real_cache_root ./data/augsburg_real_cache \
   --data_root ./data/raw \
   --output_root ./data/augsburg2_wald \
-  --training_area region2 \
-  --subarea sub_area_2 \
-  --sigma 1.2
+  --training_area region2 --subarea sub_area_2 --sigma 1.2
 
 python prepare_augsburg2_wald_center_holdout.py \
   --source_wald_root ./data/augsburg2_wald \
@@ -70,72 +59,40 @@ python calibrate_augsburg2_wald_radiometry.py \
   --wald_root ./data/augsburg2_wald_center_holdout \
   --real_cache_root ./data/augsburg_real_cache \
   --output ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json
-
-python -m unittest discover -s tests -p 'test_augsburg2_wald_full96.py'
-python -m unittest discover -s tests -p 'test_augsburg2_wald_center_holdout.py'
 ```
 
-The 30m test region is 48x48, the corresponding 10m center ROI is
-144x144. A surrounding 6-pixel guard is excluded from training.
+If platform detection fails, identify S2A/S2B from original imagery metadata;
+do not arbitrarily select a platform.
 
-## 2. Train Wald-only CDRDI (Stage C)
-
-Use conservative, physically validated geometry caps at Wald 30m.
-The learning-based geometry network remains width 32; only the **diffusion**
-backbone changes width.
+## 2. Define experiment paths (A is the reproduced selected configuration)
 
 ```bash
-python train_augsburg_real_cdrdi.py \
-  --stage train \
-  --cache_root ./data/augsburg2_wald_center_holdout \
-  --psf_json ./data/augsburg2_wald_center_holdout/wald_psf.json \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
-  --from_scratch \
-  --initial_dx_px -0.5 --initial_dy_px 0 \
-  --max_translation 1 --max_rotation_deg 0.5 --max_local_px 0.5 \
-  --lambda_rigid 0.01 --lambda_local 0.01 \
-  --base_channels 32 --control_grid 5 \
-  --train_steps 6 --eval_steps 9 \
-  --train_patch_size 24 --train_stride 6 --eval_patch_size 48 \
-  --batch_size 1 --num_workers 0 \
-  --epochs 100 --lr 2e-5 --eval_interval 5 \
-  --seed 10 --device cuda:0 \
-  --checkpoint_root ./checkpoints/augsburg_real/center_holdout/full96 \
-  --log_root ./logs/augsburg_real/center_holdout/full96 \
-  --save_name Augsburg2_Wald_center_C
+export WALD=./data/augsburg2_wald_center_holdout
+export RAD=./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json
 
-python train_augsburg_real_cdrdi.py \
-  --stage test \
-  --cache_root ./data/augsburg2_wald_center_holdout \
-  --psf_json ./data/augsburg2_wald_center_holdout/wald_psf.json \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
-  --initial_dx_px -0.5 --initial_dy_px 0 \
-  --max_translation 1 --max_rotation_deg 0.5 --max_local_px 0.5 \
-  --lambda_rigid 0.01 --lambda_local 0.01 \
-  --base_channels 32 --control_grid 5 \
-  --train_patch_size 24 --train_stride 6 --eval_patch_size 48 \
-  --batch_size 1 --num_workers 0 \
-  --geometry_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_C.pth \
-  --seed 10 --device cuda:0
+export MODE=identity
+export BRANCH=A
+# Optional separately evaluated fixed-shift experiment:
+# export MODE=wald_fixed
+# export BRANCH=B
+
+export OUT=./checkpoints/augsburg_real/center_holdout/full96_${BRANCH}
+export LOG=./logs/augsburg_real/center_holdout/full96_${BRANCH}
+export DIFF=${OUT}/Augsburg2_Wald_center_D2_${BRANCH}_base96.pth
+export REF=${OUT}/Augsburg2_Wald_center_E_${BRANCH}_full96.pth
+mkdir -p "$OUT" "$LOG"
 ```
 
-**Guard:** if no candidate checkpoint passes CDRDI validation constraints,
-the pipeline deliberately does not create a best checkpoint. Check the
-geometry log before proceeding; do not select by held-out-test QNR.
-
-## 3. Train and test the geometry-aware 96-channel diffusion (Stage D2)
+## 3. Train and test 96-channel physical diffusion
 
 ```bash
 python train_augsburg_real_diffusion.py \
   --stage train \
-  --cache_root ./data/augsburg2_wald_center_holdout \
-  --psf_json ./data/augsburg2_wald_center_holdout/wald_psf.json \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
-  --geometry_mode wald_cdrdi \
-  --geometry_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_C.pth \
-  --geometry_steps 9 \
+  --cache_root "$WALD" \
+  --psf_json "$WALD/wald_psf.json" \
+  --radiometry_json "$RAD" \
+  --geometry_mode "$MODE" \
   --fixed_dx_px -0.5 --fixed_dy_px 0 \
-  --guard_window 5 --guard_min_jac 0.5 --guard_relative_gain 0.0001 \
   --from_scratch \
   --train_patch_size 24 --train_stride 6 --eval_patch_size 48 \
   --batch_size 1 --num_workers 0 \
@@ -144,52 +101,43 @@ python train_augsburg_real_diffusion.py \
   --epochs 100 --lr 1e-4 --weight_decay 0 \
   --monitor ref_psnr --eval_interval 5 \
   --seed 10 --device cuda:0 \
-  --checkpoint_root ./checkpoints/augsburg_real/center_holdout/full96 \
-  --log_root ./logs/augsburg_real/center_holdout/full96 \
-  --save_name Augsburg2_Wald_center_D2_C_base96
+  --checkpoint_root "$OUT" --log_root "$LOG" \
+  --save_name "Augsburg2_Wald_center_D2_${BRANCH}_base96"
 
 python train_augsburg_real_diffusion.py \
   --stage test \
-  --cache_root ./data/augsburg2_wald_center_holdout \
-  --psf_json ./data/augsburg2_wald_center_holdout/wald_psf.json \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
-  --geometry_mode wald_cdrdi \
-  --geometry_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_C.pth \
-  --geometry_steps 9 \
+  --cache_root "$WALD" \
+  --psf_json "$WALD/wald_psf.json" \
+  --radiometry_json "$RAD" \
+  --geometry_mode "$MODE" \
   --fixed_dx_px -0.5 --fixed_dy_px 0 \
-  --guard_window 5 --guard_min_jac 0.5 --guard_relative_gain 0.0001 \
   --train_patch_size 24 --train_stride 6 --eval_patch_size 48 \
-  --batch_size 1 --num_workers 0 \
-  --diffusion_steps 12 --base_channels 96 \
+  --batch_size 1 --diffusion_steps 12 --base_channels 96 \
   --time_dim 256 --spectral_hidden 8 \
-  --seed 10 --device cuda:0 \
-  --diffusion_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_D2_C_base96.pth \
-  --metrics_json ./logs/augsburg_real/center_holdout/full96/D2_C_base96_test.json
+  --device cuda:0 --diffusion_checkpoint "$DIFF" \
+  --metrics_json "$LOG/D2_${BRANCH}_base96_test.json"
 ```
 
-## 4. Train and test the full HPGC-Refiner (Stage E)
+For A, geometry is identity. Passing fixed-dx parameters does **not** apply
+a shift when `--geometry_mode identity`.
 
-New Wald C support in `train_augsburg_real_gigi.py`:
-- reuses Wald C `rigid_only` closure-backtracking instead of the legacy
-  Real-E geometry path;
-- loads geometry architecture from the strict Wald-only checkpoint;
-- disables data augmentation for Wald; monitors SAM of high-heterogeneity
-  regions on the **validation** split;
-- permits scratch training (no previous refiner checkpoint);
-- refuses mismatched geometry, diffusion, calibration, or test split.
+## 4. Train and test full HPGC/Global Correlation Refiner
+
+The same frozen Diffusion96 checkpoint is used; CDRDI is not instantiated
+in A or B. The refiner trains **from scratch** because the new server has no
+previous refiner checkpoint. It uses the existing full architecture
+(`hidden=64`, `heads=4`, tangent correction enabled), monitored on
+validation high-heterogeneity SAM.
 
 ```bash
 python train_augsburg_real_gigi.py \
   --stage train --from_scratch --variant full \
-  --cache_root ./data/augsburg2_wald_center_holdout \
-  --psf_json ./data/augsburg2_wald_center_holdout/wald_psf.json \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
-  --geometry_mode wald_cdrdi \
-  --geometry_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_C.pth \
-  --diffusion_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_D2_C_base96.pth \
-  --geometry_steps 9 \
+  --cache_root "$WALD" \
+  --psf_json "$WALD/wald_psf.json" \
+  --radiometry_json "$RAD" \
+  --geometry_mode "$MODE" \
   --fixed_dx_px -0.5 --fixed_dy_px 0 \
-  --guard_window 5 --guard_min_jac 0.5 --guard_relative_gain 0.0001 \
+  --diffusion_checkpoint "$DIFF" \
   --train_patch_size 24 --train_stride 6 --eval_patch_size 48 \
   --batch_size 1 --num_workers 0 \
   --diffusion_steps 12 --diffusion_base_channels 96 \
@@ -198,79 +146,68 @@ python train_augsburg_real_gigi.py \
   --epochs 100 --lr 2e-5 \
   --monitor ref_sam_high --eval_interval 5 \
   --seed 10 --device cuda:0 \
-  --checkpoint_root ./checkpoints/augsburg_real/center_holdout/full96 \
-  --log_root ./logs/augsburg_real/center_holdout/full96 \
-  --save_name Augsburg2_Wald_center_E_full96
+  --checkpoint_root "$OUT" --log_root "$LOG" \
+  --save_name "Augsburg2_Wald_center_E_${BRANCH}_full96"
 
 python train_augsburg_real_gigi.py \
   --stage test --variant full \
-  --cache_root ./data/augsburg2_wald_center_holdout \
-  --psf_json ./data/augsburg2_wald_center_holdout/wald_psf.json \
-  --radiometry_json ./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json \
-  --geometry_mode wald_cdrdi \
-  --geometry_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_C.pth \
-  --diffusion_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_D2_C_base96.pth \
-  --refiner_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_E_full96.pth \
-  --geometry_steps 9 \
+  --cache_root "$WALD" \
+  --psf_json "$WALD/wald_psf.json" \
+  --radiometry_json "$RAD" \
+  --geometry_mode "$MODE" \
   --fixed_dx_px -0.5 --fixed_dy_px 0 \
-  --guard_window 5 --guard_min_jac 0.5 --guard_relative_gain 0.0001 \
+  --diffusion_checkpoint "$DIFF" \
+  --refiner_checkpoint "$REF" \
   --train_patch_size 24 --train_stride 6 --eval_patch_size 48 \
-  --batch_size 1 --num_workers 0 \
-  --diffusion_steps 12 --diffusion_base_channels 96 \
+  --batch_size 1 --diffusion_steps 12 --diffusion_base_channels 96 \
   --time_dim 256 --spectral_hidden 8 \
   --refine_hidden 64 --heads 4 \
   --seed 10 --device cuda:0
 ```
 
-## 5. Original-resolution 10m inference + QNR (final full model)
+## 5. Native 10m 242-band reconstruction with HPGC and QNR
 
 ```bash
 python infer_augsburg2_wald_full96.py \
   --center_holdout \
-  --checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_D2_C_base96.pth \
-  --geometry_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_C.pth \
-  --refiner_checkpoint ./checkpoints/augsburg_real/center_holdout/full96/Augsburg2_Wald_center_E_full96.pth \
+  --geometry_mode "$MODE" \
+  --fixed_dx_px -0.5 --fixed_dy_px 0 \
+  --checkpoint "$DIFF" --refiner_checkpoint "$REF" \
   --base_channels 96 --diffusion_steps 12 \
   --time_dim 256 --spectral_hidden 8 \
-  --geometry_steps 9 \
-  --fixed_dx_px -0.5 --fixed_dy_px 0 \
-  --guard_window 5 --guard_min_jac 0.5 --guard_relative_gain 0.0001 \
   --refine_hidden 64 --heads 4 --variant full \
   --tile_size 96 --tile_stride 48 \
-  --save_root ./outputs/augsburg2_wald_center_holdout/full96 \
+  --save_root "./outputs/augsburg2_wald_center_holdout/full96_${BRANCH}" \
   --seed 10 --device cuda:0 --write_tif
 ```
 
-Outputs under `./outputs/augsburg2_wald_center_holdout/full96/`:
+Outputs:
 
 ```text
-Augsburg2_Wald_heldout_HSI.npy
-Augsburg2_Wald_heldout_HSI.tif
-Augsburg2_Wald_heldout_QNR.json
-Augsburg2_Wald_heldout_protocol.json
+outputs/augsburg2_wald_center_holdout/full96_A/
+  Augsburg2_Wald_heldout_HSI.npy
+  Augsburg2_Wald_heldout_HSI.tif
+  Augsburg2_Wald_heldout_QNR.json
+  Augsburg2_Wald_heldout_protocol.json
 ```
 
-The native inference script estimates rigid-only CDRDI geometry on the
-30m Wald scale (by degrading the *observed* center HSI30 to HSI90 and
-area-reducing the *observed* MSI10 to MSI30), multiplies translations by
-3 for 10m physical acquisition, preserves rotation, and adjusts crop-centered
-rigid sampling for each inference tile. It then runs diffusion96,
-the physical-residual-guided HPGC-Refiner, and QNR on the **final** fused
-10m/242-band hyperspectral image.
+For fixed B, use `full96_B`. The B native 10m operator uses fixed
+translation `dx=-1.5,dy=0` in 10m pixels (same -15m shift), rather than
+incorrectly reusing -0.5 native pixels.
 
-**Important scientific limitation:** transferring a deformation estimated at
-the Wald 30m scale to native 10m uses a shared physical displacement
-assumption; it is not a separately validated native-scale geometric ground
-truth. The Wald holdout PSNR/SAM and native QNR are distinct evaluations.
-Do not use test QNR to select a checkpoint. Compare this full Wald-C96
-result only against methods using the same heldout ROI, sensor/radiometry,
-QNR implementation and training split.
+**Research caveat:** Original A native-QNR baseline used diffusion **without**
+HPGC. The new A+96+HPGC is a new model configuration, not just widening the
+backbone. Do not attribute any QNR difference exclusively to width without
+an A+64+HPGC control.
 
-## 6. Preflight regression tests
+## 6. Tests
 
 ```bash
 python -m unittest discover -s tests -p 'test_augsburg2_wald_full96.py' -v
-python -m unittest discover -s tests -p 'test_augsburg2_wald_cdrdi.py' -v
+python -m unittest discover -s tests -p 'test_augsburg2_wald_center_holdout.py' -v
 python -m unittest discover -s tests -p 'test_augsburg2_wald_d2_abc.py' -v
-python -m unittest discover -s tests -p 'test_augsburg2_wald_qnr.py' -v
 ```
+
+The code is pushed to the PR branch, but no actual GPU/data end-to-end
+training or QNR test was performed by the assistant. Review logs and best
+checkpoint outputs before proceeding to the next stage.

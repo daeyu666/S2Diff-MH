@@ -291,7 +291,7 @@ def main():
         dtype=torch.float32, device=device,
     )
     geometry_args = SimpleNamespace(
-        geometry_mode="wald_cdrdi", geometry_steps=args.geometry_steps,
+        geometry_mode=args.geometry_mode, geometry_steps=args.geometry_steps,
         fixed_dx_px=args.fixed_dx_px, fixed_dy_px=args.fixed_dy_px,
         guard_window=args.guard_window, guard_min_jac=args.guard_min_jac,
         guard_relative_gain=args.guard_relative_gain,

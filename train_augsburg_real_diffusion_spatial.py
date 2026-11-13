@@ -86,6 +86,8 @@ def parse_args():
     p.add_argument("--base_channels", type=int, default=64)
     p.add_argument("--time_dim", type=int, default=256)
     p.add_argument("--spectral_hidden", type=int, default=8)
+    p.add_argument("--expected_hsi_bands", type=int, default=0,
+                   help="Optional guard (e.g. 96) to reject the wrong spectral-band cache")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=5e-6)
@@ -835,6 +837,11 @@ def main():
         num_workers=args.num_workers,
         train_augment=not is_wald,
     )
+    if args.expected_hsi_bands and int(info["n_bands"]) != args.expected_hsi_bands:
+        raise ValueError(
+            f"Expected {args.expected_hsi_bands} HSI bands, but cache has {info['n_bands']}; "
+            "select the intended 96-band Wald cache before training"
+        )
     srf = torch.as_tensor(info["srf_weights"], dtype=torch.float32, device=device)
     base_process = build_augsburg_real_process(
         effective_sigma=sigma,

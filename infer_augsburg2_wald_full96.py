@@ -203,7 +203,8 @@ def main():
         raise ValueError("Identity and fixed-shift inference must not load a learned geometry checkpoint")
     if extra.get("geometry_checkpoint") != args.geometry_checkpoint:
         raise ValueError("Diffusion checkpoint refers to another geometry checkpoint")
-    if int(extra.get("geometry_steps", -1)) != args.geometry_steps:
+    if (args.geometry_mode == "wald_cdrdi"
+        and int(extra.get("geometry_steps", -1)) != args.geometry_steps):
         raise ValueError("Diffusion/geometry recursion steps mismatch")
     if int(extra.get("scale_ratio", -1)) != 3:
         raise ValueError("Expected Wald 3x reconstruction")

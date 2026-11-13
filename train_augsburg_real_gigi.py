@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import json
 import os
 from statistics import mean
 
@@ -750,7 +751,7 @@ def _run_eval_print(metrics, prefix):
 def _validate_wald_refiner_protocol(args):
     """Fail closed if Center-Holdout CDRDI/D2 or calibration provenance differs."""
     with open(os.path.join(args.cache_root, "train", "meta.json"), encoding="utf-8") as f:
-        meta = __import__("json").load(f)
+        meta = json.load(f)
     is_wald = meta.get("msi_source") == "real_Sentinel_2_Wald_30m"
     args.wald_protocol_id = meta.get("protocol_id", "legacy_full_region_wald")
     args.test_bbox_30m = meta.get("test_bbox_30m")
@@ -766,7 +767,7 @@ def _validate_wald_refiner_protocol(args):
         raise ValueError("Center-holdout refiner requires train24/stride6/eval48")
     for split in ("validation", "test"):
         with open(os.path.join(args.cache_root, split, "meta.json"), encoding="utf-8") as f:
-            entry = __import__("json").load(f)
+            entry = json.load(f)
         if entry.get("protocol_id") != args.wald_protocol_id:
             raise ValueError("Mismatched Wald split: " + split)
     rad = _load_json(args.radiometry_json)

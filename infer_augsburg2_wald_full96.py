@@ -92,6 +92,33 @@ def parse_args():
         p.error("--center_holdout requires QNR output; omit --skip_qnr")
     if args.base_channels != 96:
         p.error("Full96 inference requires --base_channels 96")
+    # argparse(required=True) checks only whether a flag is supplied. A shell
+    # expansion such as --checkpoint "$DIFF" can still pass an empty string
+    # after starting a new terminal where DIFF/REF are no longer exported.
+    for flag, filename in (
+        ("--checkpoint", args.checkpoint),
+        ("--refiner_checkpoint", args.refiner_checkpoint),
+    ):
+        if not filename or not str(filename).strip():
+            p.error(
+                f"{flag} is empty. Re-export the DIFF/REF shell variables "
+                "or pass the actual .pth path explicitly."
+            )
+        if not os.path.isfile(filename):
+            p.error(f"{flag} file not found: {filename!r}")
+    if args.geometry_mode == "wald_cdrdi":
+        if not args.geometry_checkpoint or not os.path.isfile(args.geometry_checkpoint):
+            p.error(
+                "--geometry_mode wald_cdrdi requires an existing "
+                "--geometry_checkpoint file"
+            )
+    for flag, filename in (
+        ("--wald_root", args.wald_root),
+        ("--radiometry_json", args.radiometry_json),
+        ("--save_root", args.save_root),
+    ):
+        if not filename or not str(filename).strip():
+            p.error(f"{flag} is empty; use a non-empty path")
     return args
 
 

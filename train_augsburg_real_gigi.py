@@ -28,7 +28,10 @@ from models import (
     ranked_msi_heterogeneity,
 )
 from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
+from train_augsburg_real_cdrdi import _checkpoint_extra, _wald_checkpoint_guard
 from train_augsburg_real_diffusion import (
+    _batch_geometry,
+    _wald_d2_extra_guard,
     _apply_radiometry,
     _estimated_process,
     _estimate_geometry,
@@ -58,6 +61,14 @@ def parse_args():
     p.add_argument("--radiometry_json", default="./data/calibration/AugsburgReal_radiometry.json")
     p.add_argument("--geometry_checkpoint", required=True)
     p.add_argument("--diffusion_checkpoint", required=True)
+    p.add_argument("--geometry_mode", choices=("estimated", "wald_cdrdi"), default="estimated")
+    p.add_argument("--fixed_dx_px", type=float, default=-0.5)
+    p.add_argument("--fixed_dy_px", type=float, default=0.0)
+    p.add_argument("--guard_window", type=int, default=5)
+    p.add_argument("--guard_min_jac", type=float, default=0.5)
+    p.add_argument("--guard_relative_gain", type=float, default=1e-4)
+    p.add_argument("--from_scratch", action="store_true",
+                   help="Train HPGC-Refiner without a pretrained refiner checkpoint")
     p.add_argument("--init_refiner_checkpoint", default="", help="Synthetic Augsburg Stage-E checkpoint")
     p.add_argument("--refiner_checkpoint", default="")
     p.add_argument("--resume", default="")
@@ -285,14 +296,14 @@ def _base_bundle(
         batch["hr_msi"].to(device, non_blocking=True), radiometry
     )
     mask_ref = batch["valid_mask"].to(device, non_blocking=True) > 0.5
-    rigid, local = _estimate_geometry(
-        geometry,
-        y_h,
-        y_m,
-        p0=p0,
-        srf=srf,
-        steps=args.geometry_steps,
-    )
+    if args.geometry_mode == "wald_cdrdi":
+        rigid, local = _batch_geometry(
+            args, geometry, y_h, y_m, mask_ref, p0=p0, srf=srf
+        )
+    else:
+        rigid, local = _estimate_geometry(
+            geometry, y_h, y_m, p0=p0, srf=srf, steps=args.geometry_steps
+        )
     process = _estimated_process(base_process, rigid, local)
     base = reconstruct_from_terminal_lr(
         diffusion,
@@ -654,14 +665,27 @@ def _build_frozen(args, info, device, base_process):
         info["srf_weights"], dtype=torch.float32, device=device
     )
     p0 = base_process.operator.to(device)
-    geometry = LearnedPhysicalResidualSolver(
-        4,
-        base_channels=args.geometry_base_channels,
-        control_grid=args.control_grid,
-        max_translation=args.max_translation,
-        max_rotation_deg=args.max_rotation_deg,
-        max_local_px=args.max_local_px,
-    ).to(device)
+    if args.geometry_mode == "wald_cdrdi":
+        config = _wald_checkpoint_guard(
+            args.geometry_checkpoint, stage="Wald-HPGC"
+        )["geometry_config"]
+        geom_kwargs = {
+            key: int(config[key]) if key in ("base_channels", "control_grid")
+            else float(config[key])
+            for key in (
+                "base_channels", "control_grid", "max_translation",
+                "max_rotation_deg", "max_local_px", "initial_dx_px", "initial_dy_px"
+            )
+        }
+    else:
+        geom_kwargs = dict(
+            base_channels=args.geometry_base_channels,
+            control_grid=args.control_grid,
+            max_translation=args.max_translation,
+            max_rotation_deg=args.max_rotation_deg,
+            max_local_px=args.max_local_px,
+        )
+    geometry = LearnedPhysicalResidualSolver(4, **geom_kwargs).to(device)
     load_checkpoint(
         geometry,
         args.geometry_checkpoint,
@@ -723,13 +747,51 @@ def _run_eval_print(metrics, prefix):
     )
 
 
+def _validate_wald_refiner_protocol(args):
+    """Fail closed if Center-Holdout CDRDI/D2 or calibration provenance differs."""
+    with open(os.path.join(args.cache_root, "train", "meta.json"), encoding="utf-8") as f:
+        meta = __import__("json").load(f)
+    is_wald = meta.get("msi_source") == "real_Sentinel_2_Wald_30m"
+    args.wald_protocol_id = meta.get("protocol_id", "legacy_full_region_wald")
+    args.test_bbox_30m = meta.get("test_bbox_30m")
+    if not is_wald:
+        if args.geometry_mode == "wald_cdrdi":
+            raise ValueError("wald_cdrdi requires Wald data")
+        return False
+    if args.wald_protocol_id != "Augsburg2-Wald-center-holdout-v1":
+        raise ValueError("Full-96 Refiner requires the center-holdout Wald split")
+    if args.geometry_mode != "wald_cdrdi":
+        raise ValueError("Full-96 Wald Refiner requires --geometry_mode wald_cdrdi")
+    if (args.train_patch_size, args.train_stride, args.eval_patch_size) != (24, 6, 48):
+        raise ValueError("Center-holdout refiner requires train24/stride6/eval48")
+    for split in ("validation", "test"):
+        with open(os.path.join(args.cache_root, split, "meta.json"), encoding="utf-8") as f:
+            entry = __import__("json").load(f)
+        if entry.get("protocol_id") != args.wald_protocol_id:
+            raise ValueError("Mismatched Wald split: " + split)
+    rad = _load_json(args.radiometry_json)
+    if rad.get("spatial_protocol_id") != args.wald_protocol_id:
+        raise ValueError("Radiometry must be calibrated on the center holdout")
+    geom = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-HPGC")
+    if (geom.get("protocol_id") != args.wald_protocol_id
+        or geom.get("test_bbox_30m") != args.test_bbox_30m):
+        raise ValueError("CDRDI checkpoint was not trained on this holdout")
+    _wald_d2_extra_guard(
+        args.diffusion_checkpoint, args,
+        msi_source="real_Sentinel_2_Wald_30m",
+        sigma=float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"]),
+    )
+    return True
+
+
 def train(args):
     if not 0.0 < args.region_fraction < 0.5:
         raise ValueError("--region_fraction must lie in (0,0.5)")
-    if not args.init_refiner_checkpoint and not args.resume:
-        raise ValueError(
-            "Real-E training requires --init_refiner_checkpoint or --resume"
-        )
+    if args.from_scratch and (args.init_refiner_checkpoint or args.resume):
+        raise ValueError("--from_scratch cannot be combined with refiner initialization/resume")
+    if not (args.from_scratch or args.init_refiner_checkpoint or args.resume):
+        raise ValueError("Refiner training requires --from_scratch, --init_refiner_checkpoint or --resume")
+    is_wald = _validate_wald_refiner_protocol(args)
     set_seed(args.seed)
     device = get_device(args.device)
     sigma = float(
@@ -744,6 +806,7 @@ def train(args):
         min_valid_fraction=args.min_valid_fraction,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        train_augment=not is_wald,
     )
     base_process = build_augsburg_real_process(
         effective_sigma=sigma,
@@ -900,6 +963,14 @@ def train(args):
 def test(args):
     if not args.refiner_checkpoint:
         raise ValueError("--stage test requires --refiner_checkpoint")
+    is_wald = _validate_wald_refiner_protocol(args)
+    if is_wald:
+        extra = _checkpoint_extra(args.refiner_checkpoint)
+        if (extra.get("geometry_checkpoint") != args.geometry_checkpoint
+            or extra.get("diffusion_checkpoint") != args.diffusion_checkpoint
+            or int(extra.get("diffusion_base_channels", -1)) != args.diffusion_base_channels
+            or extra.get("wald_protocol_id") != args.wald_protocol_id):
+            raise ValueError("Refiner checkpoint belongs to another diffusion/geometry/split")
     set_seed(args.seed)
     device = get_device(args.device)
     sigma = float(
@@ -914,6 +985,7 @@ def test(args):
         min_valid_fraction=args.min_valid_fraction,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        train_augment=not is_wald,
     )
     base_process = build_augsburg_real_process(
         effective_sigma=sigma,

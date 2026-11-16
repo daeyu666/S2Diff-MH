@@ -1,0 +1,1019 @@
+"""Strict Augsburg-2 center-heldout Wald terminal GIGI refiner (A/B/C).
+
+Observed EnMAP30 serves as the sole supervised reference, Wald HSI90 is the
+terminal physical observation, and real Sentinel-2 MSI30 supplies spatial
+information. A=identity, B=fixed 30m shift, C=rigid guarded Wald CDRDI.
+Diffusion and geometry (C only) are frozen. Legacy Real-E is untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from statistics import mean
+
+import torch
+import torch.nn.functional as F
+
+from augsburg_real import build_augsburg_real_loaders
+from augsburg_real_process import build_augsburg_real_process
+from cdrdi_geometry import forward_warp, spectral_project
+from config import TrainConfig
+from innovation1 import reconstruct_from_terminal_lr
+from main import build_model
+from models import (
+    HeterogeneityGuidedSpectralRefiner,
+    TerminalGIGISpectralRefiner,
+    ranked_msi_heterogeneity,
+)
+from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
+from train_augsburg_real_diffusion import (
+    _apply_radiometry,
+    _estimated_process,
+    _batch_geometry,
+    _wald_d2_extra_guard,
+    _wald_checkpoint_guard,
+    _wald_metadata,
+    _load_json,
+    _lr_mask,
+    _mask_to_msi,
+    _masked_l1,
+    _masked_metric_sums,
+    _masked_metrics,
+    _masked_sam,
+    _metrics_from_sums,
+    _radiometry,
+    _warp_adjoint_normalized,
+)
+from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, set_seed
+
+
+VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Strict Augsburg2 Wald-E terminal GIGI A/B/C")
+    p.add_argument("--stage", choices=["train", "test"], default="train")
+    p.add_argument("--variant", choices=VARIANTS, default="full")
+    p.add_argument("--cache_root", default="./data/augsburg2_wald_center_holdout")
+    p.add_argument("--psf_json", default="./data/augsburg2_wald_center_holdout/wald_psf.json")
+    p.add_argument("--radiometry_json", default="./data/calibration/Augsburg2_Wald_center_holdout_radiometry.json")
+    p.add_argument("--geometry_mode", choices=("identity", "wald_fixed", "wald_cdrdi"), default="identity")
+    p.add_argument("--geometry_checkpoint", default="")
+    p.add_argument("--fixed_dx_px", type=float, default=-0.5)
+    p.add_argument("--fixed_dy_px", type=float, default=0.0)
+    p.add_argument("--guard_window", type=int, default=5)
+    p.add_argument("--guard_min_jac", type=float, default=0.5)
+    p.add_argument("--guard_relative_gain", type=float, default=1e-4)
+    p.add_argument("--diffusion_checkpoint", required=True)
+    p.add_argument("--init_refiner_checkpoint", default="", help="Optional compatible synthetic Stage-E refiner")
+    p.add_argument("--from_scratch", action="store_true", help="Randomly initialize GIGI for Wald-E")
+    p.add_argument("--refiner_checkpoint", default="")
+    p.add_argument("--resume", default="")
+    p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
+    p.add_argument("--log_root", default="./logs/augsburg_real")
+    p.add_argument("--save_name", default="Augsburg2_Wald_center_E_A_gigi_full")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--seed", type=int, default=10)
+
+    p.add_argument("--train_patch_size", type=int, default=24)
+    p.add_argument("--train_stride", type=int, default=6)
+    p.add_argument("--eval_patch_size", type=int, default=48)
+    p.add_argument("--min_valid_fraction", type=float, default=0.80)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=0)
+
+    p.add_argument("--geometry_steps", type=int, default=9)
+    p.add_argument("--geometry_base_channels", type=int, default=32)
+    p.add_argument("--control_grid", type=int, default=5)
+    p.add_argument("--max_translation", type=float, default=4.0)
+    p.add_argument("--max_rotation_deg", type=float, default=2.0)
+    p.add_argument("--max_local_px", type=float, default=4.0)
+
+    p.add_argument("--diffusion_steps", type=int, default=12)
+    p.add_argument("--diffusion_base_channels", type=int, default=96)
+    p.add_argument("--time_dim", type=int, default=256)
+    p.add_argument("--spectral_hidden", type=int, default=8)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--refine_hidden", type=int, default=64)
+    p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--disable_tangent", action="store_true")
+
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--lambda_l1", type=float, default=1.0)
+    p.add_argument("--lambda_ang", type=float, default=0.1)
+    p.add_argument("--lambda_ref", type=float, default=0.5)
+    p.add_argument("--lambda_phy", type=float, default=0.1)
+    p.add_argument("--lambda_msi", type=float, default=0.1)
+    p.add_argument("--region_fraction", type=float, default=0.25)
+    p.add_argument("--monitor", choices=["ref_sam_high", "ref_sam", "ref_psnr"], default="ref_sam_high")
+    p.add_argument("--eval_interval", type=int, default=5)
+    p.add_argument("--save_interval", type=int, default=10)
+    return p.parse_args()
+
+
+def _diffusion_config(args):
+    return TrainConfig(
+        dataset="Augsburg",
+        scale_ratio=3,
+        diffusion_steps=args.diffusion_steps,
+        predictor="raw_direct",
+        base_channels=args.diffusion_base_channels,
+        time_dim=args.time_dim,
+        spectral_hidden=args.spectral_hidden,
+        dropout=args.dropout,
+        device=args.device,
+    )
+
+
+def _load_refiner_weights(model, path: str, device):
+    if not path:
+        return
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    try:
+        state = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location=device)
+    variant = state.get("variant", model.variant)
+    if variant != model.variant:
+        raise ValueError(f"refiner variant mismatch: checkpoint={variant} requested={model.variant}")
+    payload = state.get("model")
+    if payload is None:
+        raise KeyError(f"{path} does not contain key 'model'")
+    model.load_state_dict(payload, strict=True)
+    print(f"REFINER_INIT {path}")
+
+
+def _save_refiner(model, optimizer, epoch, best, path, args):
+    ensure_dir(os.path.dirname(path))
+    torch.save(
+        {
+            "epoch": int(epoch),
+            "best_metric": float(best),
+            "monitor": args.monitor,
+            "variant": model.variant,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+            "extra": vars(args),
+        },
+        path,
+    )
+
+
+def _load_training_refiner(model, path, device, optimizer=None):
+    try:
+        state = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location=device)
+    if state.get("variant", model.variant) != model.variant:
+        raise ValueError("checkpoint/refiner variant mismatch")
+    model.load_state_dict(state["model"], strict=True)
+    if optimizer is not None and state.get("optimizer") is not None:
+        optimizer.load_state_dict(state["optimizer"])
+    return int(state.get("epoch", 0)), float(state.get("best_metric", float("inf")))
+
+
+def _build_projector(info, args, device):
+    model = HeterogeneityGuidedSpectralRefiner(
+        n_bands=info["n_bands"],
+        total_steps=args.diffusion_steps,
+        hidden_channels=1,
+        variant="full",
+    ).to(device)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
+
+
+def _physical_residual(process, projector, y_h, base):
+    predicted = process.terminal_observation(base)
+    native = y_h - predicted
+    lifted = process.terminal_state(native, target_size=tuple(base.shape[-2:]))
+    broad = projector.project_broadshape(lifted)
+    return projector.project_tangent(broad, base, preserve_broadshape=True)
+
+
+def _hsi_to_msi(x, srf):
+    return spectral_project(x, srf)
+
+
+def _heterogeneity_to_reference(heterogeneity, rigid, local):
+    if rigid is None:
+        return heterogeneity
+    return forward_warp(
+        heterogeneity[:, None].float(),
+        rigid[:, 0],
+        rigid[:, 1],
+        rigid[:, 2],
+        local,
+    )[:, 0]
+
+
+def _pixel_sam_deg(pred, target, eps=1e-12):
+    p = pred.float()
+    t = target.float()
+    dot = (p * t).sum(dim=1)
+    pn = torch.linalg.vector_norm(p, dim=1)
+    tn = torch.linalg.vector_norm(t, dim=1)
+    valid = (pn > eps) & (tn > eps)
+    angle = torch.full_like(pn, float("nan"))
+    if valid.any():
+        cos = (dot[valid] / (pn[valid] * tn[valid]).clamp_min(eps)).clamp(-1.0, 1.0)
+        angle[valid] = torch.acos(cos) * (180.0 / math.pi)
+    return angle
+
+
+def _masked_region_sam(pred, target, mask, heterogeneity, fraction):
+    angle = _pixel_sam_deg(pred, target)
+    valid = (mask[:, 0] > 0.5) & torch.isfinite(angle) & torch.isfinite(heterogeneity)
+    if not valid.any():
+        return float("nan"), float("nan")
+    h = heterogeneity[valid]
+    a = angle[valid]
+    lo = torch.quantile(h, float(fraction))
+    hi = torch.quantile(h, 1.0 - float(fraction))
+    high = a[h >= hi]
+    low = a[h <= lo]
+    return (
+        float(high.mean().item()) if high.numel() else float("nan"),
+        float(low.mean().item()) if low.numel() else float("nan"),
+    )
+
+
+def _update_mechanism(details, mask_msi, fraction):
+    update = details["update"]
+    heterogeneity = details["heterogeneity"]
+    energy = torch.linalg.vector_norm(update.float(), dim=1)
+    valid = mask_msi[:, 0] > 0.5
+    h = heterogeneity[valid]
+    e = energy[valid]
+    if h.numel() == 0:
+        return {
+            "update_high": float("nan"),
+            "update_low": float("nan"),
+            "update_ratio": float("nan"),
+        }
+    lo = torch.quantile(h, float(fraction))
+    hi = torch.quantile(h, 1.0 - float(fraction))
+    high = e[h >= hi]
+    low = e[h <= lo]
+    high_mean = float(high.mean().item()) if high.numel() else float("nan")
+    low_mean = float(low.mean().item()) if low.numel() else float("nan")
+    ratio = (
+        high_mean / max(low_mean, 1e-12)
+        if math.isfinite(high_mean) and math.isfinite(low_mean)
+        else float("nan")
+    )
+    return {
+        "update_high": high_mean,
+        "update_low": low_mean,
+        "update_ratio": ratio,
+    }
+
+
+def _to_reference(x, rigid, local):
+    if rigid is None:
+        return x
+    return forward_warp(x, rigid[:, 0], rigid[:, 1], rigid[:, 2], local)
+
+
+@torch.no_grad()
+def _base_bundle(
+    diffusion, geometry, projector, batch, *,
+    base_process, p0, srf, radiometry, args, device,
+):
+    gt_ref = batch["gt"].to(device, non_blocking=True)
+    y_h = batch["lr_hsi"].to(device, non_blocking=True)
+    y_m = _apply_radiometry(
+        batch["hr_msi"].to(device, non_blocking=True), radiometry
+    )
+    mask_ref = batch["valid_mask"].to(device, non_blocking=True) > 0.5
+    if args.geometry_mode == "identity":
+        rigid, local = None, None
+        process = base_process
+        gt_msi, mask_msi = gt_ref, mask_ref
+    else:
+        rigid, local = _batch_geometry(
+            args, geometry, y_h, y_m, mask_ref, p0=p0, srf=srf
+        )
+        process = _estimated_process(base_process, rigid, local)
+        gt_msi = _warp_adjoint_normalized(gt_ref, rigid, local)
+        mask_msi = _mask_to_msi(mask_ref, rigid, local)
+    base = reconstruct_from_terminal_lr(
+        diffusion, process, y_h,
+        target_size=tuple(gt_ref.shape[-2:]), hr_msi=y_m,
+    )
+    r_phy = _physical_residual(process, projector, y_h, base)
+    heterogeneity = ranked_msi_heterogeneity(y_m)
+    return {
+        "gt_ref": gt_ref, "gt_msi": gt_msi, "y_h": y_h, "y_m": y_m,
+        "mask_ref": mask_ref, "mask_msi": mask_msi,
+        "rigid": rigid, "local": local, "process": process,
+        "base": base, "r_phy": r_phy, "heterogeneity": heterogeneity,
+    }
+
+def train_one_epoch(
+    refiner,
+    diffusion,
+    geometry,
+    projector,
+    loader,
+    optimizer,
+    *,
+    base_process,
+    p0,
+    srf,
+    radiometry,
+    args,
+    device,
+):
+    refiner.train()
+    diffusion.eval()
+    if geometry is not None:
+        geometry.eval()
+    projector.eval()
+    sums = {k: 0.0 for k in ("loss", "l1", "ang", "ref", "phy", "msi")}
+    count = 0
+    for batch in loader:
+        with torch.no_grad():
+            pack = _base_bundle(
+                diffusion,
+                geometry,
+                projector,
+                batch,
+                base_process=base_process,
+                p0=p0,
+                srf=srf,
+                radiometry=radiometry,
+                args=args,
+                device=device,
+            )
+        refined = refiner(
+            pack["base"],
+            pack["y_m"],
+            pack["r_phy"],
+            pack["heterogeneity"],
+        )
+        l1 = _masked_l1(refined, pack["gt_msi"], pack["mask_msi"])
+        ang = _masked_sam(refined, pack["gt_msi"], pack["mask_msi"])
+        ref_pred = _to_reference(refined, pack["rigid"], pack["local"])
+        ref_loss = _masked_l1(
+            ref_pred, pack["gt_ref"], pack["mask_ref"]
+        )
+        phy = _masked_l1(
+            pack["process"].terminal_observation(refined),
+            pack["y_h"],
+            _lr_mask(pack["mask_ref"]),
+        )
+        msi = _masked_l1(
+            _hsi_to_msi(refined, srf),
+            pack["y_m"],
+            pack["mask_msi"],
+        )
+        loss = (
+            args.lambda_l1 * l1
+            + args.lambda_ang * ang
+            + args.lambda_ref * ref_loss
+            + args.lambda_phy * phy
+            + args.lambda_msi * msi
+        )
+        if not torch.isfinite(loss):
+            raise FloatingPointError("non-finite Augsburg-Real GIGI loss")
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            refiner.parameters(),
+            args.grad_clip,
+            error_if_nonfinite=True,
+        )
+        optimizer.step()
+
+        n = pack["gt_ref"].shape[0]
+        for key, value in (
+            ("loss", loss),
+            ("l1", l1),
+            ("ang", ang),
+            ("ref", ref_loss),
+            ("phy", phy),
+            ("msi", msi),
+        ):
+            sums[key] += float(value.detach().item()) * n
+        count += n
+    return {k: v / max(count, 1) for k, v in sums.items()}
+
+
+@torch.no_grad()
+def evaluate(
+    refiner,
+    diffusion,
+    geometry,
+    projector,
+    loader,
+    *,
+    base_process,
+    p0,
+    srf,
+    radiometry,
+    args,
+    device,
+):
+    refiner.eval()
+    diffusion.eval()
+    if geometry is not None:
+        geometry.eval()
+    projector.eval()
+
+    base_sse = 0.0
+    base_values = 0
+    base_sam_sum = 0.0
+    base_sam_count = 0
+    ref_sse = 0.0
+    ref_values = 0
+    ref_sam_sum = 0.0
+    ref_sam_count = 0
+
+    region = {
+        "base_high_sum": 0.0,
+        "base_high_count": 0,
+        "base_low_sum": 0.0,
+        "base_low_count": 0,
+        "ref_high_sum": 0.0,
+        "ref_high_count": 0,
+        "ref_low_sum": 0.0,
+        "ref_low_count": 0,
+    }
+    update = {
+        "high_sum": 0.0,
+        "high_count": 0,
+        "low_sum": 0.0,
+        "low_count": 0,
+    }
+    phy_sum = 0.0
+    phy_weight = 0.0
+    msi_sum = 0.0
+    msi_weight = 0.0
+
+    for batch in loader:
+        pack = _base_bundle(
+            diffusion,
+            geometry,
+            projector,
+            batch,
+            base_process=base_process,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            args=args,
+            device=device,
+        )
+        refined, details = refiner(
+            pack["base"],
+            pack["y_m"],
+            pack["r_phy"],
+            pack["heterogeneity"],
+            return_details=True,
+        )
+        base_ref = _to_reference(pack["base"], pack["rigid"], pack["local"])
+        refined_ref = _to_reference(refined, pack["rigid"], pack["local"])
+
+        b_sse, b_values, b_sam_sum, b_sam_count = _masked_metric_sums(
+            base_ref, pack["gt_ref"], pack["mask_ref"]
+        )
+        r_sse, r_values, r_sam_sum, r_sam_count = _masked_metric_sums(
+            refined_ref, pack["gt_ref"], pack["mask_ref"]
+        )
+        base_sse += b_sse
+        base_values += b_values
+        base_sam_sum += b_sam_sum
+        base_sam_count += b_sam_count
+        ref_sse += r_sse
+        ref_values += r_values
+        ref_sam_sum += r_sam_sum
+        ref_sam_count += r_sam_count
+
+        hetero_ref = _heterogeneity_to_reference(
+            pack["heterogeneity"], pack["rigid"], pack["local"]
+        )
+        valid_ref = (
+            (pack["mask_ref"][:, 0] > 0.5)
+            & torch.isfinite(hetero_ref)
+        )
+        if valid_ref.any():
+            h = hetero_ref[valid_ref]
+            lo = torch.quantile(h, float(args.region_fraction))
+            hi = torch.quantile(h, 1.0 - float(args.region_fraction))
+            high_sel = valid_ref & (hetero_ref >= hi)
+            low_sel = valid_ref & (hetero_ref <= lo)
+
+            base_angle = _pixel_sam_deg(base_ref, pack["gt_ref"])
+            ref_angle = _pixel_sam_deg(refined_ref, pack["gt_ref"])
+            for prefix, angle in (("base", base_angle), ("ref", ref_angle)):
+                high_values = angle[high_sel & torch.isfinite(angle)]
+                low_values = angle[low_sel & torch.isfinite(angle)]
+                region[f"{prefix}_high_sum"] += float(
+                    high_values.double().sum().item()
+                )
+                region[f"{prefix}_high_count"] += int(high_values.numel())
+                region[f"{prefix}_low_sum"] += float(
+                    low_values.double().sum().item()
+                )
+                region[f"{prefix}_low_count"] += int(low_values.numel())
+
+        lr_valid = _lr_mask(pack["mask_ref"])
+        phy_value = float(
+            _masked_l1(
+                pack["process"].terminal_observation(refined),
+                pack["y_h"],
+                lr_valid,
+            ).item()
+        )
+        lr_weight = float(lr_valid[:, 0].sum().item())
+        phy_sum += phy_value * lr_weight
+        phy_weight += lr_weight
+
+        msi_value = float(
+            _masked_l1(
+                _hsi_to_msi(refined, srf),
+                pack["y_m"],
+                pack["mask_msi"],
+            ).item()
+        )
+        msi_weight_tile = float(pack["mask_msi"][:, 0].sum().item())
+        msi_sum += msi_value * msi_weight_tile
+        msi_weight += msi_weight_tile
+
+        energy = torch.linalg.vector_norm(
+            details["update"].float(), dim=1
+        )
+        hetero_msi = details["heterogeneity"]
+        valid_msi = (
+            (pack["mask_msi"][:, 0] > 0.5)
+            & torch.isfinite(hetero_msi)
+            & torch.isfinite(energy)
+        )
+        if valid_msi.any():
+            h = hetero_msi[valid_msi]
+            lo = torch.quantile(h, float(args.region_fraction))
+            hi = torch.quantile(h, 1.0 - float(args.region_fraction))
+            high_values = energy[
+                valid_msi & (hetero_msi >= hi)
+            ]
+            low_values = energy[
+                valid_msi & (hetero_msi <= lo)
+            ]
+            update["high_sum"] += float(
+                high_values.double().sum().item()
+            )
+            update["high_count"] += int(high_values.numel())
+            update["low_sum"] += float(
+                low_values.double().sum().item()
+            )
+            update["low_count"] += int(low_values.numel())
+
+    if ref_values <= 0 or base_values <= 0:
+        raise ValueError("empty/invalid evaluation loader")
+
+    base_psnr, base_sam = _metrics_from_sums(
+        base_sse, base_values, base_sam_sum, base_sam_count
+    )
+    ref_psnr, ref_sam = _metrics_from_sums(
+        ref_sse, ref_values, ref_sam_sum, ref_sam_count
+    )
+
+    def _safe_mean(total, count):
+        return total / float(count) if count > 0 else float("nan")
+
+    base_high = _safe_mean(
+        region["base_high_sum"], region["base_high_count"]
+    )
+    base_low = _safe_mean(
+        region["base_low_sum"], region["base_low_count"]
+    )
+    ref_high = _safe_mean(
+        region["ref_high_sum"], region["ref_high_count"]
+    )
+    ref_low = _safe_mean(
+        region["ref_low_sum"], region["ref_low_count"]
+    )
+    update_high = _safe_mean(
+        update["high_sum"], update["high_count"]
+    )
+    update_low = _safe_mean(
+        update["low_sum"], update["low_count"]
+    )
+    update_ratio = (
+        update_high / max(update_low, 1e-12)
+        if math.isfinite(update_high) and math.isfinite(update_low)
+        else float("nan")
+    )
+
+    return {
+        "base_ref_psnr": base_psnr,
+        "base_ref_sam": base_sam,
+        "base_ref_sam_high": base_high,
+        "base_ref_sam_low": base_low,
+        "ref_psnr": ref_psnr,
+        "ref_sam": ref_sam,
+        "ref_sam_high": ref_high,
+        "ref_sam_low": ref_low,
+        "phy": phy_sum / max(phy_weight, 1.0),
+        "msi": msi_sum / max(msi_weight, 1.0),
+        "update_high": update_high,
+        "update_low": update_low,
+        "update_ratio": update_ratio,
+    }
+
+
+def _build_frozen(args, info, device, base_process):
+    srf = torch.as_tensor(
+        info["srf_weights"], dtype=torch.float32, device=device
+    )
+    p0 = base_process.operator.to(device)
+    geometry = None
+    if args.geometry_mode == "wald_cdrdi":
+        extra = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-D2")
+        cc = extra["geometry_config"]
+        geom_cfg = dict(
+            base_channels=int(cc["base_channels"]),
+            control_grid=int(cc["control_grid"]),
+            max_translation=float(cc["max_translation"]),
+            max_rotation_deg=float(cc["max_rotation_deg"]),
+            max_local_px=float(cc["max_local_px"]),
+            initial_dx_px=float(cc["initial_dx_px"]),
+            initial_dy_px=float(cc["initial_dy_px"]),
+        )
+        geometry = LearnedPhysicalResidualSolver(4, **geom_cfg).to(device)
+        load_checkpoint(
+            geometry, args.geometry_checkpoint,
+            map_location=str(device), load_optimizer=False,
+        )
+        geometry.eval()
+        for parameter in geometry.parameters():
+            parameter.requires_grad_(False)
+    diffusion = build_model(_diffusion_config(args), info, device)
+    load_checkpoint(
+        diffusion, args.diffusion_checkpoint,
+        map_location=str(device), load_optimizer=False,
+    )
+    diffusion.eval()
+    for parameter in diffusion.parameters():
+        parameter.requires_grad_(False)
+    projector = _build_projector(info, args, device)
+    return geometry, diffusion, projector, p0, srf
+
+def _build_refiner(args, info, device):
+    return TerminalGIGISpectralRefiner(
+        n_bands=info["n_bands"],
+        n_msi_bands=info["n_msi_bands"],
+        hidden_channels=args.refine_hidden,
+        heads=args.heads,
+        variant=args.variant,
+        tangent_output=not args.disable_tangent,
+    ).to(device)
+
+
+def _best_initial(monitor):
+    return float("-inf") if monitor == "ref_psnr" else float("inf")
+
+
+def _better(value, best, monitor):
+    return value > best if monitor == "ref_psnr" else value < best
+
+
+def _run_eval_print(metrics, prefix):
+    print(
+        f"{prefix} BASE_REF_PSNR={metrics['base_ref_psnr']:.6f} "
+        f"BASE_REF_SAM={metrics['base_ref_sam']:.6f} "
+        f"BASE_REF_SAM_HIGH={metrics['base_ref_sam_high']:.6f} "
+        f"REF_PSNR={metrics['ref_psnr']:.6f} "
+        f"REF_SAM={metrics['ref_sam']:.6f} "
+        f"REF_SAM_HIGH={metrics['ref_sam_high']:.6f} "
+        f"REF_SAM_LOW={metrics['ref_sam_low']:.6f} "
+        f"dPSNR={metrics['ref_psnr']-metrics['base_ref_psnr']:+.6f} "
+        f"dSAM={metrics['ref_sam']-metrics['base_ref_sam']:+.6f} "
+        f"dSAM_HIGH={metrics['ref_sam_high']-metrics['base_ref_sam_high']:+.6f} "
+        f"PHY_L1={metrics['phy']:.8f} MSI_L1={metrics['msi']:.8f} "
+        f"UPDATE_HL_RATIO={metrics['update_ratio']:.6f}"
+    )
+
+
+def _validate_wald(args):
+    """Reject mismatched calibration, branch, held-out split and D2 weights."""
+    protocol = "Augsburg2-Wald-center-holdout-v1"
+    msi_source = "real_Sentinel_2_Wald_30m"
+    train_meta = _load_json(os.path.join(args.cache_root, "train", "meta.json"))
+    if not _wald_metadata(args.cache_root):
+        raise ValueError("Expected genuine 30m Wald observations in all splits")
+    if (train_meta.get("protocol_id") != protocol
+        or train_meta.get("msi_source") != msi_source):
+        raise ValueError("This entrypoint requires center-heldout Wald training data")
+    for split in ("validation", "test"):
+        meta = _load_json(os.path.join(args.cache_root, split, "meta.json"))
+        if meta.get("protocol_id") != protocol:
+            raise ValueError(f"Wald split protocol mismatch: {split}")
+    roi = _load_json(os.path.join(args.cache_root, "roi.json"))
+    calibration = _load_json(args.radiometry_json)
+    if (roi.get("protocol_id") != protocol
+        or calibration.get("spatial_protocol_id") != protocol
+        or calibration.get("test_pixels_used_for_calibration") is not False
+        or calibration.get("forbidden_bbox_30m") != roi.get("forbidden_bbox_30m")):
+        raise ValueError("Radiometry calibration must exclude held-out test/guard pixels")
+    if (args.train_patch_size, args.train_stride, args.eval_patch_size) != (24, 6, 48):
+        raise ValueError("Center-heldout Wald requires patch=24 stride=6 eval=48")
+    args.wald_protocol_id = protocol
+    args.test_bbox_30m = train_meta.get("test_bbox_30m")
+    args.training_entrypoint = "train_augsburg2_wald_gigi.py"
+    if not args.test_bbox_30m:
+        raise ValueError("Center-heldout test bbox is missing")
+    if args.geometry_mode == "wald_fixed":
+        if abs(args.fixed_dx_px) > 1.5 or abs(args.fixed_dy_px) > 1.5:
+            raise ValueError("Fixed Wald shift exceeds range")
+    if args.geometry_mode == "wald_cdrdi":
+        if not args.geometry_checkpoint:
+            raise ValueError("Wald C requires --geometry_checkpoint")
+        if (args.guard_window != 5 or abs(args.guard_min_jac - 0.5) > 1e-7
+            or args.guard_relative_gain < 0 or args.guard_relative_gain >= 1):
+            raise ValueError("Invalid Wald C physical closure settings")
+        c_extra = _wald_checkpoint_guard(args.geometry_checkpoint, stage="Wald-D2")
+        cfg = c_extra["geometry_config"]
+        if (c_extra.get("protocol_id") != protocol
+            or abs(float(cfg["initial_dx_px"]) - args.fixed_dx_px) > 1e-7
+            or abs(float(cfg["initial_dy_px"]) - args.fixed_dy_px) > 1e-7):
+            raise ValueError("C checkpoint has wrong spatial split or geometry seed")
+    elif args.geometry_checkpoint:
+        raise ValueError("A/B must not load any CDRDI checkpoint")
+    sigma = float(_load_json(args.psf_json)["terminal_sigma_hr_pixels"])
+    _wald_d2_extra_guard(
+        args.diffusion_checkpoint, args, msi_source=msi_source, sigma=sigma
+    )
+    try:
+        d2 = torch.load(args.diffusion_checkpoint, map_location="cpu", weights_only=False)
+    except TypeError:
+        d2 = torch.load(args.diffusion_checkpoint, map_location="cpu")
+    extra = d2.get("extra", {})
+    if (extra.get("reference_supervision_source") != "observed_30m_HSI_only"
+        or extra.get("wald_train_augmentation") is not False):
+        raise ValueError("D2 must have been trained on observed Wald 30m only")
+    return sigma
+
+
+def _validate_e_checkpoint(args, path):
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        state = torch.load(path, map_location="cpu")
+    extra = state.get("extra", {})
+    for key in (
+        "training_entrypoint", "wald_protocol_id", "test_bbox_30m",
+        "geometry_mode", "geometry_checkpoint", "diffusion_checkpoint",
+        "radiometry_json", "cache_root", "diffusion_steps",
+        "diffusion_base_channels", "spectral_hidden", "time_dim",
+        "variant", "refine_hidden", "heads", "seed",
+    ):
+        if extra.get(key) != getattr(args, key):
+            raise ValueError(f"Wald-E checkpoint differs on {key}: {path}")
+
+
+def train(args):
+    sigma = _validate_wald(args)
+    if not 0.0 < args.region_fraction < 0.5:
+        raise ValueError("--region_fraction must lie in (0,0.5)")
+    if args.from_scratch and (args.init_refiner_checkpoint or args.resume):
+        raise ValueError("--from_scratch conflicts with init_refiner_checkpoint/resume")
+    if not (args.from_scratch or args.init_refiner_checkpoint or args.resume):
+        raise ValueError("Wald-E requires --from_scratch, --init_refiner_checkpoint, or --resume")
+    if args.resume:
+        _validate_e_checkpoint(args, args.resume)
+    set_seed(args.seed)
+    device = get_device(args.device)
+    radiometry = _radiometry(args.radiometry_json, device)
+    train_loader, val_loader, _, info = build_augsburg_real_loaders(
+        args.cache_root,
+        train_patch_size=args.train_patch_size,
+        train_stride=args.train_stride,
+        eval_patch_size=args.eval_patch_size,
+        min_valid_fraction=args.min_valid_fraction,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        train_augment=False,
+    )
+    base_process = build_augsburg_real_process(
+        effective_sigma=sigma,
+        diffusion_steps=args.diffusion_steps,
+    )
+    geometry, diffusion, projector, p0, srf = _build_frozen(
+        args, info, device, base_process
+    )
+    set_seed(args.seed)  # Same terminal-GIGI initialization for A/B/C.
+    refiner = _build_refiner(args, info, device)
+    if not args.resume:
+        _load_refiner_weights(
+            refiner, args.init_refiner_checkpoint, device
+        )
+    optimizer = torch.optim.Adam(
+        refiner.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    ensure_dir(args.checkpoint_root)
+    ensure_dir(args.log_root)
+    best_path = os.path.join(
+        args.checkpoint_root, args.save_name + ".pth"
+    )
+    last_path = os.path.join(
+        args.checkpoint_root, args.save_name + "_last.pth"
+    )
+    start_epoch = 0
+    best = _best_initial(args.monitor)
+    if args.resume:
+        start_epoch, best = _load_training_refiner(
+            refiner, args.resume, device, optimizer
+        )
+
+    logger = CSVLogger(
+        os.path.join(args.log_root, args.save_name + ".csv"),
+        [
+            "epoch", "loss", "l1", "ang_rad", "ref_l1", "phy_l1", "msi_l1",
+            "base_ref_psnr", "base_ref_sam", "base_ref_sam_high",
+            "ref_psnr", "ref_sam", "ref_sam_high", "ref_sam_low",
+            "dpsnr", "dsam", "dsam_high", "update_ratio", "best",
+        ],
+    )
+    print(
+        f"AUGSBURG_WALD_E geometry_mode={args.geometry_mode} "
+        "diffusion=frozen terminal_GIGI_only output_frame=Wald_S2_30m "
+        f"scale=3 stages={base_process.stages} sigma={sigma:.6f} "
+        f"monitor={args.monitor}"
+    )
+
+    for epoch in range(start_epoch + 1, args.epochs + 1):
+        tr = train_one_epoch(
+            refiner,
+            diffusion,
+            geometry,
+            projector,
+            train_loader,
+            optimizer,
+            base_process=base_process,
+            p0=p0,
+            srf=srf,
+            radiometry=radiometry,
+            args=args,
+            device=device,
+        )
+        print(
+            f"epoch={epoch:03d}/{args.epochs} loss={tr['loss']:.7f} "
+            f"l1={tr['l1']:.7f} ang={tr['ang']:.7f} "
+            f"ref={tr['ref']:.7f} phy={tr['phy']:.7f} "
+            f"msi={tr['msi']:.7f}"
+        )
+        row = {
+            "epoch": epoch,
+            "loss": tr["loss"],
+            "l1": tr["l1"],
+            "ang_rad": tr["ang"],
+            "ref_l1": tr["ref"],
+            "phy_l1": tr["phy"],
+            "msi_l1": tr["msi"],
+            "base_ref_psnr": "",
+            "base_ref_sam": "",
+            "base_ref_sam_high": "",
+            "ref_psnr": "",
+            "ref_sam": "",
+            "ref_sam_high": "",
+            "ref_sam_low": "",
+            "dpsnr": "",
+            "dsam": "",
+            "dsam_high": "",
+            "update_ratio": "",
+            "best": best,
+        }
+        if epoch % args.eval_interval == 0 or epoch == args.epochs:
+            va = evaluate(
+                refiner,
+                diffusion,
+                geometry,
+                projector,
+                val_loader,
+                base_process=base_process,
+                p0=p0,
+                srf=srf,
+                radiometry=radiometry,
+                args=args,
+                device=device,
+            )
+            _run_eval_print(va, "REAL_E_VAL")
+            value = va[args.monitor]
+            if _better(value, best, args.monitor):
+                best = value
+                _save_refiner(
+                    refiner,
+                    optimizer,
+                    epoch,
+                    best,
+                    best_path,
+                    args,
+                )
+                print(
+                    f"SAVED_BEST {best_path} "
+                    f"{args.monitor}={best:.6f}"
+                )
+            row.update(
+                {
+                    "base_ref_psnr": va["base_ref_psnr"],
+                    "base_ref_sam": va["base_ref_sam"],
+                    "base_ref_sam_high": va["base_ref_sam_high"],
+                    "ref_psnr": va["ref_psnr"],
+                    "ref_sam": va["ref_sam"],
+                    "ref_sam_high": va["ref_sam_high"],
+                    "ref_sam_low": va["ref_sam_low"],
+                    "dpsnr": va["ref_psnr"] - va["base_ref_psnr"],
+                    "dsam": va["ref_sam"] - va["base_ref_sam"],
+                    "dsam_high": (
+                        va["ref_sam_high"]
+                        - va["base_ref_sam_high"]
+                    ),
+                    "update_ratio": va["update_ratio"],
+                    "best": best,
+                }
+            )
+        if epoch % args.save_interval == 0 or epoch == args.epochs:
+            _save_refiner(
+                refiner,
+                optimizer,
+                epoch,
+                best,
+                last_path,
+                args,
+            )
+        logger.write(row)
+
+
+def test(args):
+    _validate_wald(args)
+    if args.refiner_checkpoint:
+        _validate_e_checkpoint(args, args.refiner_checkpoint)
+    if not args.refiner_checkpoint:
+        raise ValueError("--stage test requires --refiner_checkpoint")
+    set_seed(args.seed)
+    device = get_device(args.device)
+    radiometry = _radiometry(args.radiometry_json, device)
+    _, _, test_loader, info = build_augsburg_real_loaders(
+        args.cache_root,
+        train_patch_size=args.train_patch_size,
+        train_stride=args.train_stride,
+        eval_patch_size=args.eval_patch_size,
+        min_valid_fraction=args.min_valid_fraction,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        train_augment=False,
+    )
+    base_process = build_augsburg_real_process(
+        effective_sigma=sigma,
+        diffusion_steps=args.diffusion_steps,
+    )
+    geometry, diffusion, projector, p0, srf = _build_frozen(
+        args, info, device, base_process
+    )
+    set_seed(args.seed)  # Same terminal-GIGI initialization for A/B/C.
+    refiner = _build_refiner(args, info, device)
+    epoch, best = _load_training_refiner(
+        refiner, args.refiner_checkpoint, device
+    )
+    print(
+        f"REFINER_LOAD epoch={epoch} best={best:.6f} "
+        f"path={args.refiner_checkpoint}"
+    )
+    metrics = evaluate(
+        refiner,
+        diffusion,
+        geometry,
+        projector,
+        test_loader,
+        base_process=base_process,
+        p0=p0,
+        srf=srf,
+        radiometry=radiometry,
+        args=args,
+        device=device,
+    )
+    _run_eval_print(metrics, "FINAL_AUGSBURG_WALD_E")
+
+
+def main():
+    args = parse_args()
+    if args.stage == "train":
+        train(args)
+    else:
+        test(args)
+
+
+if __name__ == "__main__":
+    main()

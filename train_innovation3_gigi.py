@@ -716,6 +716,13 @@ def test(args):
     )
     _print_eval(base_m, refined_m, mechanism)
     print(
+        "BASE_FULL_METRICS "
+        + " ".join(
+            f"{key}={base_m[key]:.6f}"
+            for key in ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
+        )
+    )
+    print(
         "FULL_METRICS "
         + " ".join(
             f"{key}={refined_m[key]:.6f}"

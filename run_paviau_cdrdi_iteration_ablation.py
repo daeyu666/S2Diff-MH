@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 import train_innovation3_gigi_cdrdi as pipeline
 from cdrdi_geometry import (
+    forward_warp,
     jacobian_determinant,
     sample_synthetic_geometry,
     sampling_coordinates,
@@ -228,7 +229,7 @@ def _identity_geometry(gt: torch.Tensor):
 
 def _closure_mse(p0, srf, observed, hr_msi, rigid, local):
     target = spectral_project(observed, srf)
-    warped_msi = pipeline.forward_warp(
+    warped_msi = forward_warp(
         hr_msi, rigid[:, 0], rigid[:, 1], rigid[:, 2], local
     )
     predicted = p0.degrade(warped_msi)
@@ -415,12 +416,10 @@ def run(args):
 
     summary_rows: List[Dict[str, object]] = []
     recursive_name = f"CDRDI_K{args.recursive_steps}"
-    recursive_reference = next(
-        row for row in patch_summaries if row["variant"] == recursive_name
-    )
+    aggregated = {}
     for name in variants:
         rows = [row for row in patch_summaries if row["variant"] == name]
-        numeric = _mean_metrics([
+        aggregated[name] = _mean_metrics([
             {key: float(row[key]) for key in METRICS + (
                 "EPE_mean_px", "EPE_p95_px", "min_jacobian",
                 "dx_abs_error_px", "dy_abs_error_px",
@@ -428,6 +427,9 @@ def run(args):
             )}
             for row in rows
         ])
+    recursive_reference = aggregated[recursive_name]
+    for name in variants:
+        numeric = aggregated[name]
         summary_rows.append({
             "Variant": (
                 "w/o CDRDI" if name == "w/o CDRDI"

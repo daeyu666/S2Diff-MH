@@ -957,7 +957,7 @@ def train(args):
 
 
 def test(args):
-    _validate_wald(args)
+    sigma = _validate_wald(args)
     if args.refiner_checkpoint:
         _validate_e_checkpoint(args, args.refiner_checkpoint)
     if not args.refiner_checkpoint:

@@ -434,7 +434,7 @@ def run(args):
             "Variant": (
                 "w/o CDRDI" if name == "w/o CDRDI"
                 else ("One-step K=1" if name == "CDRDI_K1"
-                      else ("Recursive K=9" if name == recursive_name
+                      else (f"Recursive K={args.recursive_steps}" if name == recursive_name
                             else name.replace("CDRDI_", "Depth diagnostic ")))
             ),
             **numeric,

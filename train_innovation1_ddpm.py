@@ -440,8 +440,7 @@ def run_test(args, test_loader, info, device):
     physical_process = build_progressive_process(data_cfg)
     schedule = GaussianDDPMSchedule(
         total_steps=args.total_diffusion_steps,
-        beta_start=args.beta_start,
-        beta_end=args.beta_end,
+        cosine_offset=args.cosine_offset,
         device=device,
     )
     model = build_model(args, info, device)

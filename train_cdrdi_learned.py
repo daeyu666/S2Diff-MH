@@ -501,6 +501,7 @@ def main():
                 best_closure,
                 checkpoint_path,
                 extra={
+                    **vars(args),
                     "variant": args.variant,
                     "steps": steps,
                     "loss_mode": args.loss_mode,
@@ -509,6 +510,8 @@ def main():
                     "max_rotation_deg": args.max_rotation_deg,
                     "max_local_px": args.max_local_px,
                     "control_grid": args.control_grid,
+                    "base_channels": args.base_channels,
+                    "protocol_id": "PaviaU-CDRDI-stage1-v1" if args.dataset == "PaviaU" else f"{args.dataset}-CDRDI-stage1-v1",
                 },
             )
             print(

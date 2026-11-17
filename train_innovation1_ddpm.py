@@ -198,7 +198,7 @@ def run_metadata(args, info: Dict) -> Dict:
             "training_objective": "mean_squared_error",
             "state_normalization": "reflectance_[0,1]_mapped_to_[-1,1]",
             "beta_schedule": "linear",
-            "reverse_process": "12_step_ancestral_ddpm",
+            "reverse_process": "1000_step_ancestral_ddpm",
             "condition": "normalized_adjoint_LR_HSI_plus_registered_HR_MSI_mapped_to_[-1,1]",
             "n_hsi_bands": int(info["n_bands"]),
             "n_msi_bands": int(info["n_msi_bands"]),

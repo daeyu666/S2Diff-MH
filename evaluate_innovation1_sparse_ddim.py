@@ -276,6 +276,7 @@ def diagnose_state(
         f"xt_absmax={x_t_stats['xt_absmax']:.6f} "
         f"effective_eps_mean={x_t_stats['effective_noise_mean']:.6f} "
         f"effective_eps_std={x_t_stats['effective_noise_std']:.6f} "
+        f"effective_eps_corr_init={x_t_stats['effective_noise_corr_init']:.6f} "
         f"v_mse={v_mse:.7f} v_corr={v_corr:.6f} "
         f"epsilon_mse={eps_mse:.7f} "
         f"x0_out_of_range_fraction={x_t_stats['x0_out_of_range_fraction']:.6f}"
@@ -475,6 +476,7 @@ def main():
         schedule,
         t,
         args.scale_ratio,
+        initial_noise,
     )
     rows.extend([teacher_row, free_row])
 

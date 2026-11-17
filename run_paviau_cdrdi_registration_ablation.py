@@ -310,7 +310,9 @@ def inverse_register_lr(
 
     px, py = rx.clone(), ry.clone()
     last_delta = float("inf")
-    for _ in range(int(iterations)):
+    iterations_used = 0
+    for iteration in range(int(iterations)):
+        iterations_used = iteration + 1
         grid = _grid_from_xy(px, py, h, w)
         sampled_local = F.grid_sample(
             local_lr, grid, mode="bilinear", padding_mode="border", align_corners=True
@@ -345,7 +347,7 @@ def inverse_register_lr(
         padding_mode="border", align_corners=True
     )
     diagnostics = {
-        "inverse_iterations_used": int(iterations),
+        "inverse_iterations_used": int(iterations_used),
         "inverse_fixed_point_last_delta_px": last_delta,
         "inverse_residual_mean_lr_px": float(inverse_residual.mean().item()),
         "inverse_residual_p95_lr_px": float(torch.quantile(inverse_residual.flatten(), 0.95).item()),
@@ -568,8 +570,10 @@ def run(args):
                 geometry_epe = pipeline._geometry_epe(
                     height, width, gt_phi, pred_rigid, pred_local
                 )
+                case_metrics = {}
                 for name, prediction in predictions.items():
                     metrics = _masked_metrics(prediction, gt, common_valid_hr, args.scale_ratio)
+                    case_metrics[name] = metrics
                     per_patch[name].append(metrics)
                     row = {
                         "sample": sample_index + 1,
@@ -592,10 +596,10 @@ def run(args):
                 print(
                     f"sample={sample_index+1:03d} case={case_index+1:02d} "
                     f"valid={valid_fraction:.3f} EPE={geometry_epe:.4f}px "
-                    f"EST_REG_PSNR={_masked_metrics(est_reg_pred, gt, common_valid_hr, args.scale_ratio)['PSNR']:.4f} "
-                    f"ORACLE_REG_PSNR={_masked_metrics(oracle_reg_pred, gt, common_valid_hr, args.scale_ratio)['PSNR']:.4f} "
-                    f"EST_DWA_PSNR={_masked_metrics(est_dwa_pred, gt, common_valid_hr, args.scale_ratio)['PSNR']:.4f} "
-                    f"ORACLE_DWA_PSNR={_masked_metrics(oracle_dwa_pred, gt, common_valid_hr, args.scale_ratio)['PSNR']:.4f}",
+                    f"EST_REG_PSNR={case_metrics[VARIANTS[0]]['PSNR']:.4f} "
+                    f"ORACLE_REG_PSNR={case_metrics[VARIANTS[1]]['PSNR']:.4f} "
+                    f"EST_DWA_PSNR={case_metrics[VARIANTS[2]]['PSNR']:.4f} "
+                    f"ORACLE_DWA_PSNR={case_metrics[VARIANTS[3]]['PSNR']:.4f}",
                     flush=True,
                 )
 

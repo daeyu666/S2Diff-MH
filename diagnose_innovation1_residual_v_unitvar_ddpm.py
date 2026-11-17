@@ -120,8 +120,9 @@ def main():
     p.add_argument("--total_diffusion_steps", type=int, default=1000)
     p.add_argument("--beta_start", type=float, default=1e-4)
     p.add_argument("--beta_end", type=float, default=2e-2)
-    p.add_argument("--ddim_steps", type=int, default=1000)
+    p.add_argument("--ddim_step_list", type=int, nargs="+", default=[2, 4, 8, 16, 32])
     p.add_argument("--ddim_eta", type=float, default=0.0)
+    p.add_argument("--diagnostic_timestep", type=int, default=250)
     p.add_argument("--residual_scale_factor", type=float, default=1.0)
     p.add_argument("--base_channels", type=int, default=64)
     p.add_argument("--time_dim", type=int, default=256)
@@ -249,6 +250,7 @@ def main():
             )
 
     print("\n[3] FULL ANCESTRAL REVERSE-CHAIN TRACE")
+    free_running_state_at_diagnostic_t = None
     with torch.no_grad():
         chain_seed = args.seed + 50505
         ancestral_generator = torch.Generator(device=device)
@@ -271,6 +273,9 @@ def main():
             x0_outlier_fraction = (
                 (x0_raw < -1.0) | (x0_raw > 1.0)
             ).float().mean().item()
+
+            if t == args.diagnostic_timestep:
+                free_running_state_at_diagnostic_t = x_t.detach().clone()
 
             if t in trace:
                 residual_est = denormalize_residual(
@@ -328,135 +333,94 @@ def main():
         )
 
 
-    print("\n[4] DETERMINISTIC DDIM REVERSE-CHAIN TRACE")
-    if not 1 <= args.ddim_steps <= schedule.total_steps:
-        raise ValueError(
-            f"--ddim_steps must lie in [1, {schedule.total_steps}]"
+    diagnostic_t = int(args.diagnostic_timestep)
+    if not 1 <= diagnostic_t <= schedule.total_steps:
+        raise ValueError("--diagnostic_timestep outside diffusion schedule")
+    if free_running_state_at_diagnostic_t is None:
+        raise RuntimeError(f"Missing free-running state at t={diagnostic_t}")
+    print(f"\n[3B] TEACHER-FORCED VS FREE-RUNNING AT t={diagnostic_t}")
+    with torch.no_grad():
+        diagnostic_tb = torch.full((gt.shape[0],), diagnostic_t, device=device, dtype=torch.long)
+        teacher_xt = schedule.q_sample(residual_norm, diagnostic_tb, fixed_noise)
+        teacher_v = model(teacher_xt, condition, diagnostic_tb)
+        teacher_x0 = v_to_x0(teacher_xt, teacher_v, diagnostic_tb, schedule)
+        teacher_res = denormalize_residual(teacher_x0, residual_mean, residual_scale)
+        report_reconstruction(f"TEACHER_FORCED_t{diagnostic_t}", baseline, teacher_res, gt, residual_gt)
+
+        free_xt = free_running_state_at_diagnostic_t
+        free_v = model(free_xt, condition, diagnostic_tb)
+        free_x0 = v_to_x0(free_xt, free_v, diagnostic_tb, schedule)
+        free_res = denormalize_residual(free_x0, residual_mean, residual_scale)
+        report_reconstruction(f"FREE_RUNNING_t{diagnostic_t}", baseline, free_res, gt, residual_gt)
+        stats("teacher_forced_xt", teacher_xt)
+        stats("free_running_xt", free_xt)
+        print(
+            "state_distance: "
+            f"rmse={torch.sqrt(F.mse_loss(free_xt, teacher_xt)).item():.6f} "
+            f"corr={corrcoef(free_xt, teacher_xt):.6f} "
+            f"std_ratio={(free_xt.std(unbiased=False) / teacher_xt.std(unbiased=False).clamp_min(1e-12)).item():.6f}"
         )
+
+    print("\n[4] SPARSE DETERMINISTIC DDIM STEP-COUNT SWEEP")
     if not 0.0 <= args.ddim_eta <= 1.0:
         raise ValueError("--ddim_eta must lie in [0,1]")
+    step_counts = sorted(set(int(v) for v in args.ddim_step_list))
+    if not step_counts or any(v < 1 or v > schedule.total_steps for v in step_counts):
+        raise ValueError("--ddim_step_list values must be within [1,T]")
 
-    timestep_sequence = torch.linspace(
-        schedule.total_steps,
-        0,
-        args.ddim_steps + 1,
-        dtype=torch.float64,
-    ).round().to(torch.long).tolist()
-    if any(a <= b for a, b in zip(
-        timestep_sequence[:-1], timestep_sequence[1:]
-    )):
-        raise RuntimeError("DDIM timestep sequence is not strictly descending")
-
+    init_gen = torch.Generator(device=device)
+    init_gen.manual_seed(chain_seed)
+    shared_xT = torch.randn(residual_norm.shape, device=device, dtype=residual_norm.dtype, generator=init_gen)
+    sweep_rows = []
     with torch.no_grad():
-        ddim_generator = torch.Generator(device=device)
-        ddim_generator.manual_seed(chain_seed)
-        x_t = torch.randn(
-            residual_norm.shape,
-            device=device,
-            dtype=residual_norm.dtype,
-            generator=ddim_generator,
-        )
-        for timestep, previous_timestep in zip(
-            timestep_sequence[:-1], timestep_sequence[1:]
-        ):
-            tb = torch.full(
-                (gt.shape[0],), timestep, device=device, dtype=torch.long
-            )
-            predicted_v = model(x_t, condition, tb)
-            x0_raw = v_to_x0(x_t, predicted_v, tb, schedule)
-            eps_pred = v_to_epsilon(x_t, predicted_v, tb, schedule)
-            x0 = x0_raw
+        for n_steps in step_counts:
+            ts = torch.linspace(schedule.total_steps, 0, n_steps + 1, dtype=torch.float64).round().long().tolist()
+            if any(a <= b for a, b in zip(ts[:-1], ts[1:])):
+                raise RuntimeError(f"Non-descending DDIM timestep list for {n_steps} steps")
+            x = shared_xT.clone()
+            for t, prev_t in zip(ts[:-1], ts[1:]):
+                tb = torch.full((gt.shape[0],), t, device=device, dtype=torch.long)
+                v = model(x, condition, tb)
+                x0 = v_to_x0(x, v, tb, schedule)
+                eps = v_to_epsilon(x, v, tb, schedule)
+                if t in set(selected_ts):
+                    r_now = denormalize_residual(x0, residual_mean, residual_scale)
+                    m_now = calc_metrics((baseline + r_now).clamp(0, 1), gt, args.scale_ratio)
+                    d_now = residual_diagnostics(r_now, residual_gt)
+                    print(
+                        f"ddim_steps={n_steps:2d} t={t:4d} "
+                        f"PSNR={m_now['PSNR']:.4f} SAM={m_now['SAM']:.4f} "
+                        f"residual_RMSE={d_now['rmse']:.6f} "
+                        f"corr_band_mean={d_now['corr_band_mean']:.5f} "
+                        f"std_ratio={d_now['std_ratio']:.5f}"
+                    )
+                ab_t = schedule.alpha_bars[t - 1].to(device=device, dtype=gt.dtype)
+                ab_prev = torch.ones((), device=device, dtype=gt.dtype) if prev_t == 0 else schedule.alpha_bars[prev_t - 1].to(device=device, dtype=gt.dtype)
+                sigma2 = (
+                    args.ddim_eta ** 2 * (1 - ab_prev)
+                    / (1 - ab_t).clamp_min(1e-12)
+                    * (1 - ab_t / ab_prev.clamp_min(1e-12))
+                ).clamp_min(0)
+                direction_var = (1 - ab_prev - sigma2).clamp_min(0)
+                x_prev = ab_prev.sqrt() * x0 + direction_var.sqrt() * eps
+                if args.ddim_eta > 0 and prev_t > 0:
+                    z_gen = torch.Generator(device=device)
+                    z_gen.manual_seed(chain_seed + n_steps * 100003 + t)
+                    z = torch.randn(x.shape, device=device, dtype=x.dtype, generator=z_gen)
+                    x_prev = x_prev + sigma2.sqrt() * z
+                x = x_prev
 
-            if timestep in trace:
-                residual_est = denormalize_residual(
-                    x0, residual_mean, residual_scale
-                )
-                rec = (baseline + residual_est).clamp(0.0, 1.0)
-                m = calc_metrics(rec, gt, args.scale_ratio)
-                r = residual_diagnostics(residual_est, residual_gt)
-                print(
-                    f"ddim_t={timestep:4d} xt_std={x_t.std(unbiased=False).item():.5f} "
-                    f"v_std={predicted_v.std(unbiased=False).item():.5f} "
-                    f"eps_std={eps_pred.std(unbiased=False).item():.5f} "
-                    f"x0_std={x0.std(unbiased=False).item():.5f} "
-                    f"residual_RMSE={r['rmse']:.6f} "
-                    f"corr_global={r['corr_global']:.5f} "
-                    f"corr_band_mean={r['corr_band_mean']:.5f} "
-                    f"std_ratio={r['std_ratio']:.5f} "
-                    f"mean_bias={r['mean_bias']:.5f} "
-                    f"PSNR={m['PSNR']:.4f} SAM={m['SAM']:.4f}"
-                )
+            residual_final = denormalize_residual(x, residual_mean, residual_scale)
+            metrics = calc_metrics((baseline + residual_final).clamp(0, 1), gt, args.scale_ratio)
+            diag = residual_diagnostics(residual_final, residual_gt)
+            sweep_rows.append((n_steps, metrics["PSNR"], metrics["SAM"], diag["rmse"], diag["corr_band_mean"], diag["std_ratio"], diag["mean_bias"]))
+            report_reconstruction(f"FINAL_DDIM_steps{n_steps}_eta{args.ddim_eta:g}", baseline, residual_final, gt, residual_gt)
 
-            alpha_bar_t = schedule.alpha_bars[timestep - 1].to(
-                device=device, dtype=gt.dtype
-            )
-            if previous_timestep == 0:
-                alpha_bar_previous = torch.ones(
-                    (), device=device, dtype=gt.dtype
-                )
-            else:
-                alpha_bar_previous = schedule.alpha_bars[
-                    previous_timestep - 1
-                ].to(device=device, dtype=gt.dtype)
+    print("\n[5] SPARSE DDIM SUMMARY (shared initial x_T)")
+    print("steps,PSNR,SAM,residual_RMSE,corr_band_mean,std_ratio,mean_bias")
+    for row in sweep_rows:
+        print(f"{row[0]},{row[1]:.6f},{row[2]:.6f},{row[3]:.6f},{row[4]:.6f},{row[5]:.6f},{row[6]:.6f}")
 
-            sigma_squared = (
-                args.ddim_eta ** 2
-                * (1.0 - alpha_bar_previous)
-                / (1.0 - alpha_bar_t).clamp_min(1e-12)
-                * (
-                    1.0
-                    - alpha_bar_t / alpha_bar_previous.clamp_min(1e-12)
-                )
-            ).clamp_min(0.0)
-            direction_variance = (
-                1.0 - alpha_bar_previous - sigma_squared
-            ).clamp_min(0.0)
-            x_previous = (
-                alpha_bar_previous.sqrt() * x0
-                + direction_variance.sqrt() * eps_pred
-            )
-            if args.ddim_eta > 0.0 and previous_timestep > 0:
-                z = torch.randn(
-                    residual_norm.shape,
-                    device=device,
-                    dtype=residual_norm.dtype,
-                    generator=ddim_generator,
-                )
-                x_previous = x_previous + sigma_squared.sqrt() * z
-            x_t = x_previous
-
-        ddim_final = denormalize_residual(
-            x_t, residual_mean, residual_scale
-        )
-        stats("ddim_generated_normalized_residual", x_t)
-        stats("ddim_generated_residual", ddim_final)
-        report_reconstruction(
-            f"FINAL_DDIM_eta{args.ddim_eta:g}_steps{args.ddim_steps}",
-            baseline,
-            ddim_final,
-            gt,
-            residual_gt,
-        )
-
-        helper_generator = torch.Generator(device=device)
-        helper_generator.manual_seed(chain_seed)
-        helper_result = ddim_v_sample(
-            model,
-            condition,
-            sample_shape=gt.shape,
-            schedule=schedule,
-            generator=helper_generator,
-            ddim_steps=args.ddim_steps,
-            eta=args.ddim_eta,
-            clip_x0=False,
-        )
-        if not torch.allclose(
-            x_t, helper_result, atol=2e-5, rtol=2e-5
-        ):
-            raise RuntimeError(
-                "Manual DDIM diagnostic trace does not match ddim_v_sample"
-            )
-        print("DDIM helper consistency check: PASS")
 
 
 if __name__ == "__main__":

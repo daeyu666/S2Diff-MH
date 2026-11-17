@@ -1,14 +1,12 @@
-"""Standard short-chain Gaussian DDPM and ancestral reverse sampling.
+"""Standard linear-beta Gaussian DDPM schedule and ancestral sampling.
 
-This ablation uses a 12-step cosine Gaussian schedule so the forward and
-reverse process have the same number of steps as the physical-diffusion
-baseline. Clean reflectance cubes are normalized to [-1, 1] by the trainer.
-Timesteps are integer values in [1, T].
+The forward and reverse processes use the full 1000-step Markov chain by
+default. Clean reflectance cubes are mapped from [0,1] to [-1,1] by the
+training entry point. Timesteps are integers in [1,T].
 """
 
 from __future__ import annotations
 
-import math
 from typing import Optional, Sequence
 
 import torch
@@ -16,35 +14,30 @@ from torch import Tensor, nn
 
 
 class GaussianDDPMSchedule:
-    """Cosine cumulative-alpha schedule and standard DDPM posterior."""
+    """Conventional linear-beta DDPM schedule and posterior coefficients."""
 
     def __init__(
         self,
-        total_steps: int = 12,
-        cosine_offset: float = 0.008,
+        total_steps: int = 1000,
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
         device: Optional[torch.device] = None,
     ):
         if total_steps < 2:
             raise ValueError("total_steps must be >= 2")
-        if cosine_offset < 0:
-            raise ValueError("cosine_offset must be non-negative")
+        if not 0.0 < beta_start < beta_end < 1.0:
+            raise ValueError("Require 0 < beta_start < beta_end < 1")
 
         self.total_steps = int(total_steps)
-        self.cosine_offset = float(cosine_offset)
-
-        grid = torch.linspace(
-            0, self.total_steps, self.total_steps + 1,
-            dtype=torch.float64, device=device,
-        ) / float(self.total_steps)
-        angle = (
-            (grid + self.cosine_offset)
-            / (1.0 + self.cosine_offset)
-            * (math.pi / 2.0)
+        self.beta_start = float(beta_start)
+        self.beta_end = float(beta_end)
+        self.betas = torch.linspace(
+            self.beta_start,
+            self.beta_end,
+            self.total_steps,
+            dtype=torch.float32,
+            device=device,
         )
-        alpha_bar_curve = torch.cos(angle).square()
-        alpha_bar_curve = alpha_bar_curve / alpha_bar_curve[0]
-        betas = 1.0 - alpha_bar_curve[1:] / alpha_bar_curve[:-1]
-        self.betas = betas.clamp(min=1e-8, max=0.999).float()
         self.alphas = 1.0 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
 
@@ -81,7 +74,7 @@ class GaussianDDPMSchedule:
         timesteps: Tensor,
         noise: Optional[Tensor] = None,
     ) -> Tensor:
-        """Sample q(x_t | x_0) = N(sqrt(a_bar)x_0, (1-a_bar)I)."""
+        """Sample q(x_t|x_0) = N(sqrt(alpha_bar_t)x_0, (1-alpha_bar_t)I)."""
         if x0.ndim != 4:
             raise ValueError("x0 must have shape [B,C,H,W]")
         if timesteps.ndim != 1 or timesteps.shape[0] != x0.shape[0]:
@@ -96,7 +89,8 @@ class GaussianDDPMSchedule:
         ).to(device=x0.device, dtype=x0.dtype)
         sqrt_one_minus_alpha_bar = self._extract(
             (1.0 - self.alpha_bars).clamp_min(0.0).sqrt(),
-            timesteps, x0.ndim,
+            timesteps,
+            x0.ndim,
         ).to(device=x0.device, dtype=x0.dtype)
         return sqrt_alpha_bar * x0 + sqrt_one_minus_alpha_bar * noise
 
@@ -110,10 +104,10 @@ def ddpm_sample(
     generator: Optional[torch.Generator] = None,
     clip_x0: bool = True,
 ) -> Tensor:
-    """Run the full ancestral DDPM reverse chain from x_T ~ N(0,I).
+    """Run all T ancestral reverse steps from x_T ~ N(0,I).
 
     The model contract is model(x_t, condition, timesteps) -> predicted epsilon.
-    The returned x_0 is in the same normalized [-1,1] domain used for training.
+    The returned x_0 remains in the normalized [-1,1] reflectance domain.
     """
     if len(sample_shape) != 4:
         raise ValueError("sample_shape must be [B,C,H,W]")

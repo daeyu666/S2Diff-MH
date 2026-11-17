@@ -165,7 +165,6 @@ def _validate_checkpoints(args):
         ("stride", args.stride),
         ("test_size", args.test_size),
         ("scale_ratio", args.scale_ratio),
-        ("srf_interp", args.srf_interp),
         ("max_translation", args.max_translation),
         ("max_rotation_deg", args.max_rotation_deg),
         ("max_local_px", args.max_local_px),
@@ -174,6 +173,11 @@ def _validate_checkpoints(args):
         actual = one_shot_extra.get(key)
         if actual is not None and not math.isclose(float(actual), float(expected), rel_tol=0, abs_tol=1e-8):
             raise ValueError(f"One-shot geometry metadata mismatch: {key}={actual}, expected {expected}")
+    if one_shot_extra.get("srf_interp") not in (None, args.srf_interp):
+        raise ValueError(
+            f"One-shot geometry SRF interpolation mismatch: "
+            f"{one_shot_extra.get('srf_interp')} vs {args.srf_interp}"
+        )
 
     if diffusion_extra.get("dataset") not in (None, "PaviaU"):
         raise ValueError("Stage-2D diffusion checkpoint is not a PaviaU checkpoint")

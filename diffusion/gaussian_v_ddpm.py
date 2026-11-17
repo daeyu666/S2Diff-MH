@@ -134,3 +134,100 @@ def ddpm_v_sample(
             x_t = posterior_mean
 
     return x_t.clamp(-1.0, 1.0) if clip_x0 else x_t
+
+@torch.no_grad()
+def ddim_v_sample(
+    model: nn.Module,
+    condition: Tensor,
+    sample_shape: Sequence[int],
+    schedule: GaussianDDPMSchedule,
+    generator: Optional[torch.Generator] = None,
+    ddim_steps: Optional[int] = None,
+    eta: float = 0.0,
+    clip_x0: bool = False,
+) -> Tensor:
+    """Run DDIM sampling with a v-prediction network.
+
+    eta=0 gives deterministic sampling. The sampler supports a reduced number
+    of inference steps while retaining the training-time timestep indices.
+    """
+    if len(sample_shape) != 4:
+        raise ValueError("sample_shape must be [B,C,H,W]")
+    shape = tuple(int(v) for v in sample_shape)
+    if shape[0] != condition.shape[0]:
+        raise ValueError("condition and sample batch sizes must match")
+    if shape[-2:] != tuple(condition.shape[-2:]):
+        raise ValueError("condition and sample spatial sizes must match")
+    if not 0.0 <= float(eta) <= 1.0:
+        raise ValueError("eta must lie in [0,1]")
+
+    steps = schedule.total_steps if ddim_steps is None else int(ddim_steps)
+    if steps < 1 or steps > schedule.total_steps:
+        raise ValueError(
+            f"ddim_steps must lie in [1, {schedule.total_steps}]"
+        )
+
+    # Include the clean endpoint t=0. Rounding creates a strictly descending
+    # sequence because steps cannot exceed the training diffusion length.
+    timestep_sequence = torch.linspace(
+        schedule.total_steps, 0, steps + 1, dtype=torch.float64
+    ).round().to(torch.long).tolist()
+    if any(a <= b for a, b in zip(
+        timestep_sequence[:-1], timestep_sequence[1:]
+    )):
+        raise RuntimeError("DDIM timestep sequence must be strictly descending")
+
+    device, dtype = condition.device, condition.dtype
+    x_t = torch.randn(shape, device=device, dtype=dtype, generator=generator)
+
+    for timestep, previous_timestep in zip(
+        timestep_sequence[:-1], timestep_sequence[1:]
+    ):
+        t_batch = torch.full(
+            (shape[0],), timestep, dtype=torch.long, device=device
+        )
+        predicted_v = model(x_t, condition, t_batch)
+        if predicted_v.shape != x_t.shape:
+            raise ValueError(
+                "Velocity predictor output shape must match the noisy state"
+            )
+
+        predicted_x0 = v_to_x0(x_t, predicted_v, t_batch, schedule)
+        if clip_x0:
+            predicted_x0 = predicted_x0.clamp(-1.0, 1.0)
+        predicted_epsilon = v_to_epsilon(
+            x_t, predicted_v, t_batch, schedule
+        )
+
+        alpha_bar_t = schedule.alpha_bars[timestep - 1].to(
+            device=device, dtype=dtype
+        )
+        if previous_timestep == 0:
+            alpha_bar_previous = torch.ones((), device=device, dtype=dtype)
+        else:
+            alpha_bar_previous = schedule.alpha_bars[
+                previous_timestep - 1
+            ].to(device=device, dtype=dtype)
+
+        sigma_squared = (
+            float(eta) ** 2
+            * (1.0 - alpha_bar_previous)
+            / (1.0 - alpha_bar_t).clamp_min(1e-12)
+            * (1.0 - alpha_bar_t / alpha_bar_previous.clamp_min(1e-12))
+        ).clamp_min(0.0)
+        direction_variance = (
+            1.0 - alpha_bar_previous - sigma_squared
+        ).clamp_min(0.0)
+
+        x_previous = (
+            alpha_bar_previous.sqrt() * predicted_x0
+            + direction_variance.sqrt() * predicted_epsilon
+        )
+        if eta > 0.0 and previous_timestep > 0:
+            noise = torch.randn(
+                shape, device=device, dtype=dtype, generator=generator
+            )
+            x_previous = x_previous + sigma_squared.sqrt() * noise
+        x_t = x_previous
+
+    return x_t.clamp(-1.0, 1.0) if clip_x0 else x_t

@@ -59,7 +59,7 @@ def parse_args():
     p.add_argument("--cases", type=int, default=10)
     p.add_argument("--max_samples", type=int, default=0,
                    help="0 evaluates the complete test split; positive values are smoke tests")
-    p.add_argument("--depths", type=int, nargs="+", default=[1, 3, 6, 9])
+    p.add_argument("--depths", type=int, nargs="+", default=[3, 6, 9])
     p.add_argument("--recursive_steps", type=int, default=9,
                    help="Formal current-method recursive depth; default matches Stage-2D k9")
 
@@ -335,9 +335,10 @@ def run(args):
     print("PAVIAU CDRDI ITERATION ABLATION")
     print("Registration: unregistered synthetic acquisitions")
     print("HPGC/GIGI: disabled")
-    print("w/o CDRDI: same Stage-2D weights + identity physical operator")
-    print("K=1: one update using the same K=6-trained recursive weights")
+    print("w/o CDRDI: identity geometry")
+    print("One-shot: independently trained single-update CDRDI checkpoint")
     print(f"Recursive main condition: K={args.recursive_steps}")
+    print("Stage-2D diffusion: same frozen checkpoint for all conditions")
     print("Depth diagnostics:", depths)
     print("Geometry checkpoint:", args.geometry_checkpoint)
     print("Diffusion checkpoint:", args.diffusion_checkpoint)

@@ -52,7 +52,7 @@ def parse_args():
     p.add_argument("--dataset", choices=("PaviaU",), default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--geometry_checkpoint",
-                   default="./checkpoints/PaviaU/PaviaU_recursive_k6_finalonly_500ep_lr1e4.pth")
+                   default="./checkpoints/cdrdi_stage1/PaviaU_recursive_k6_finalonly_300ep_lr1e4.pth")
     p.add_argument("--diffusion_checkpoint",
                    default="./checkpoints/PaviaU/PaviaU_estimated_deform_diffusion_k9_stage2d_A.pth")
     p.add_argument("--registered_checkpoint",

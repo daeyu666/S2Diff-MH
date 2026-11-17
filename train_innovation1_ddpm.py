@@ -1,9 +1,10 @@
 """Standard Gaussian DDPM ablation for S2Diff-MH Innovation 1.
 
-The clean HR-HSI is diffused with a 12-step cosine Gaussian Markov chain.
-The registered LR-HSI observation and HR-MSI are supplied as fixed spatial
-conditions. Training predicts Gaussian noise with the standard epsilon-MSE
-objective; inference uses the complete 12-step ancestral DDPM reverse chain.
+The clean HR-HSI is diffused with a conventional 1000-step linear-beta
+Gaussian Markov chain. The registered LR-HSI observation and HR-MSI are
+supplied as fixed spatial conditions. Training predicts Gaussian noise with
+the standard epsilon-MSE objective; inference uses the complete ancestral
+DDPM reverse chain.
 
 This entry point is intentionally separate from main.py and does not modify
 the physical Innovation-1 implementation or its checkpoints.
@@ -59,8 +60,9 @@ def parse_args():
     parser.add_argument("--psf_truncate", type=float, default=3.0)
 
     # Standard Gaussian diffusion settings.
-    parser.add_argument("--total_diffusion_steps", type=int, default=12)
-    parser.add_argument("--cosine_offset", type=float, default=0.008)
+    parser.add_argument("--total_diffusion_steps", type=int, default=1000)
+    parser.add_argument("--beta_start", type=float, default=1e-4)
+    parser.add_argument("--beta_end", type=float, default=2e-2)
 
     # Match the physical Innovation-1 Raw-MSI Direct backbone.
     parser.add_argument("--base_channels", type=int, default=64)
@@ -190,11 +192,11 @@ def run_metadata(args, info: Dict) -> Dict:
     metadata = vars(args).copy()
     metadata.update(
         {
-            "diffusion_type": "standard_12_step_cosine_gaussian_ddpm",
+            "diffusion_type": "standard_1000_step_linear_gaussian_ddpm",
             "prediction_type": "epsilon",
             "training_objective": "mean_squared_error",
             "state_normalization": "reflectance_[0,1]_mapped_to_[-1,1]",
-            "beta_schedule": "cosine",
+            "beta_schedule": "linear",
             "reverse_process": "12_step_ancestral_ddpm",
             "condition": "normalized_adjoint_LR_HSI_plus_registered_HR_MSI_mapped_to_[-1,1]",
             "n_hsi_bands": int(info["n_bands"]),
@@ -316,7 +318,8 @@ def run_train(args, train_loader, val_loader, info, device):
     physical_process = build_progressive_process(data_cfg)
     schedule = GaussianDDPMSchedule(
         total_steps=args.total_diffusion_steps,
-        cosine_offset=args.cosine_offset,
+        beta_start=args.beta_start,
+        beta_end=args.beta_end,
         device=device,
     )
     model = build_model(args, info, device)
@@ -355,7 +358,8 @@ def run_train(args, train_loader, val_loader, info, device):
 
     print(
         f"DDPM schedule: T={schedule.total_steps}, "
-        f"schedule=cosine, terminal_alpha_bar={schedule.alpha_bars[-1].item():.6e}, "
+        f"schedule=linear, beta=[{args.beta_start}, {args.beta_end}], "
+        f"terminal_alpha_bar={schedule.alpha_bars[-1].item():.6e}, "
         f"ancestral reverse steps={args.total_diffusion_steps}"
     )
     print(

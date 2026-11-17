@@ -277,7 +277,10 @@ def run_metadata(
             "diffusion_state": "HR_HSI_minus_upsampled_LR_HSI",
             "prediction_type": "epsilon",
             "training_objective": "mean_squared_error",
-            "residual_normalization": "per_band_train_split_mean_and_4std_clipped_to_minus1_plus1",
+            "residual_normalization": (
+                f"per_band_train_split_mean_and_{args.residual_scale_factor}std_"
+                "clipped_to_minus1_plus1"
+            ),
             "residual_mean": residual_mean.detach().cpu(),
             "residual_scale": residual_scale.detach().cpu(),
             "beta_schedule": "linear",
@@ -629,6 +632,11 @@ def run_test(args, test_loader, info, device):
     checkpoint = args.checkpoint or args.resume or best_path
     load_checkpoint(model, checkpoint, map_location=str(device))
     residual_mean, residual_scale = load_saved_normalizer(checkpoint, device)
+    if residual_mean.shape[1] != int(info["n_bands"]):
+        raise RuntimeError(
+            f"Checkpoint has {residual_mean.shape[1]} residual bands, "
+            f"but dataset provides {int(info['n_bands'])}"
+        )
 
     metrics = evaluate(
         model,

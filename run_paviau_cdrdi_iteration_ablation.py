@@ -159,6 +159,13 @@ def _validate_checkpoints(args):
     if one_shot_extra.get("loss_mode") not in (None, "final_only"):
         raise ValueError("One-shot checkpoint must use final_only closure supervision")
     for key, expected in (
+        ("base_channels", args.geometry_base_channels),
+        ("seed", args.seed),
+        ("patch_size", args.patch_size),
+        ("stride", args.stride),
+        ("test_size", args.test_size),
+        ("scale_ratio", args.scale_ratio),
+        ("srf_interp", args.srf_interp),
         ("max_translation", args.max_translation),
         ("max_rotation_deg", args.max_rotation_deg),
         ("max_local_px", args.max_local_px),
@@ -528,7 +535,13 @@ def run(args):
             "SAM_reduction_vs_recursive_deg": float(recursive_reference["SAM"]) - numeric["SAM"],
         })
 
-    _write_csv(output / "summary.csv", summary_rows)
+    # The main ablation table intentionally reports reconstruction metrics
+    # only. Geometry EPE/closure diagnostics remain in per_patch.csv/cases.jsonl.
+    paper_rows = [
+        {"Variant": row["Variant"], "PSNR": row["PSNR"], "SAM": row["SAM"]}
+        for row in summary_rows
+    ]
+    _write_csv(output / "summary.csv", paper_rows)
     _write_csv(output / "per_patch.csv", patch_summaries)
     manifest = {
         "protocol_id": "PaviaU-CDRDI-iteration-ablation-v1",
@@ -556,10 +569,8 @@ def run(args):
     for row in summary_rows:
         print(
             f"{row['Variant']:<24} "
-            + " ".join(f"{key}={float(row[key]):.6f}" for key in (
-                "PSNR", "SAM", "SSIM", "ERGAS",
-                "EPE_mean_px", "EPE_p95_px", "closure_mse",
-            ))
+            f"PSNR={float(row['PSNR']):.6f} "
+            f"SAM={float(row['SAM']):.6f}"
         )
     print("CSV:", output / "summary.csv")
     print("Per-patch CSV:", output / "per_patch.csv")

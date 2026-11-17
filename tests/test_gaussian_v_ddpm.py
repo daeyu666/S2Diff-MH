@@ -4,6 +4,7 @@ import torch.nn as nn
 from diffusion import (
     GaussianDDPMSchedule,
     ddpm_v_sample,
+    ddim_v_sample,
     v_prediction_target,
     v_to_epsilon,
     v_to_x0,
@@ -86,6 +87,63 @@ def test_v_sampler_can_preserve_unbounded_x0_when_clipping_is_disabled():
         sample_shape=(1, 1, 4, 4),
         schedule=schedule,
         generator=generator,
+        clip_x0=False,
+    )
+
+    assert torch.isfinite(result).all()
+    assert (result.abs() > 1.0).any()
+
+def test_deterministic_ddim_v_sampler_is_reproducible_and_finite():
+    schedule = GaussianDDPMSchedule(
+        total_steps=12, beta_start=1e-4, beta_end=2e-2
+    )
+    model = ZeroVelocityPredictor()
+    condition = torch.zeros(1, 2, 8, 8)
+
+    first_generator = torch.Generator(device="cpu").manual_seed(1234)
+    second_generator = torch.Generator(device="cpu").manual_seed(1234)
+    first = ddim_v_sample(
+        model,
+        condition,
+        sample_shape=(1, 3, 8, 8),
+        schedule=schedule,
+        generator=first_generator,
+        ddim_steps=6,
+        eta=0.0,
+        clip_x0=False,
+    )
+    second = ddim_v_sample(
+        model,
+        condition,
+        sample_shape=(1, 3, 8, 8),
+        schedule=schedule,
+        generator=second_generator,
+        ddim_steps=6,
+        eta=0.0,
+        clip_x0=False,
+    )
+
+    assert first.shape == (1, 3, 8, 8)
+    assert torch.isfinite(first).all()
+    assert torch.equal(first, second)
+
+
+def test_ddim_v_sampler_keeps_x0_unbounded_when_clipping_is_disabled():
+    schedule = GaussianDDPMSchedule(
+        total_steps=2, beta_start=0.1, beta_end=0.2
+    )
+    model = ConstantVelocityPredictor(5.0)
+    condition = torch.zeros(1, 2, 4, 4)
+    generator = torch.Generator(device="cpu").manual_seed(7)
+
+    result = ddim_v_sample(
+        model,
+        condition,
+        sample_shape=(1, 1, 4, 4),
+        schedule=schedule,
+        generator=generator,
+        ddim_steps=2,
+        eta=0.0,
         clip_x0=False,
     )
 

@@ -62,3 +62,32 @@ def test_full_ancestral_v_ddpm_sampler_returns_finite_normalized_cube():
     assert torch.isfinite(result).all()
     assert result.min() >= -1.0
     assert result.max() <= 1.0
+
+class ConstantVelocityPredictor(nn.Module):
+    def __init__(self, value):
+        super().__init__()
+        self.value = float(value)
+
+    def forward(self, x_t, condition, timesteps):
+        return torch.full_like(x_t, self.value)
+
+
+def test_v_sampler_can_preserve_unbounded_x0_when_clipping_is_disabled():
+    schedule = GaussianDDPMSchedule(
+        total_steps=2, beta_start=0.1, beta_end=0.2
+    )
+    model = ConstantVelocityPredictor(5.0)
+    condition = torch.zeros(1, 2, 4, 4)
+    generator = torch.Generator(device="cpu").manual_seed(7)
+
+    result = ddpm_v_sample(
+        model,
+        condition,
+        sample_shape=(1, 1, 4, 4),
+        schedule=schedule,
+        generator=generator,
+        clip_x0=False,
+    )
+
+    assert torch.isfinite(result).all()
+    assert (result.abs() > 1.0).any()

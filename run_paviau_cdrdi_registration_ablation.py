@@ -285,8 +285,11 @@ def inverse_register_lr(
     if observed_lr.ndim != 4 or rigid_hr.ndim != 2 or rigid_hr.shape[1] != 3:
         raise ValueError("Invalid observed LR-HSI or rigid geometry shape")
     b, _, h, w = observed_lr.shape
+    # Area-averaged LR pixel i is centered at HR coordinate
+    # scale_ratio*i + (scale_ratio-1)/2. align_corners=False uses exactly
+    # this half-pixel center mapping when downscaling by an integer factor.
     local_lr = F.interpolate(
-        local_hr, size=(h, w), mode="bilinear", align_corners=True
+        local_hr, size=(h, w), mode="bilinear", align_corners=False
     ) / float(scale_ratio)
     dx = rigid_hr[:, 0] / float(scale_ratio)
     dy = rigid_hr[:, 1] / float(scale_ratio)
@@ -640,7 +643,7 @@ def run(args):
         },
         "explicit_registration": {
             "method": "inverse-resample observed LR-HSI with phi^{-1} on LR grid",
-            "geometry_scaling": "HR displacement fields and translations divided by scale_ratio; rotation unchanged",
+            "geometry_scaling": "HR displacement fields sampled at area-averaged LR pixel centers with align_corners=False, then divided by scale_ratio; translations divided by scale_ratio; rotation unchanged",
             "inverse_solver": "fixed-point inversion of p + u(p) = R^{-1}(q-c-d)+c",
             "iterations": args.inverse_iterations,
             "valid_margin_lr": args.inverse_valid_margin_lr,

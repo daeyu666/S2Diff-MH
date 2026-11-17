@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from diffusion import GaussianDDPMSchedule
-from diffusion.gaussian_v_ddpm import ddpm_v_sample
+from diffusion.gaussian_v_ddpm import ddpm_v_sample, v_prediction_target
 from innovation1 import build_progressive_process
 from metrics import MetricAverager, calc_metrics
 from train_innovation1_ddpm import (
@@ -130,8 +130,8 @@ def build_v_model(args, info: Dict, device: torch.device):
     return model
 
 
-def validate_v_checkpoint(checkpoint_path: str) -> Dict:
-    """Reject epsilon-prediction checkpoints to prevent incompatible resumes."""
+def validate_v_checkpoint(checkpoint_path: str, args=None) -> Dict:
+    """Reject epsilon checkpoints and mismatched Gaussian schedules."""
     try:
         state = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
@@ -146,6 +146,13 @@ def validate_v_checkpoint(checkpoint_path: str) -> Dict:
             "Do not resume or evaluate an epsilon-prediction checkpoint with "
             "the v-prediction script. Start a fresh v-prediction run."
         )
+    if args is not None:
+        for key in ("total_diffusion_steps", "beta_start", "beta_end"):
+            if key in extra and not abs(float(extra[key]) - float(getattr(args, key))) < 1e-10:
+                raise RuntimeError(
+                    f"Checkpoint {key}={extra[key]} does not match "
+                    f"requested {key}={getattr(args, key)}"
+                )
     return extra
 
 
@@ -355,7 +362,7 @@ def load_saved_normalizer(
     if "residual_mean" not in extra or "residual_scale" not in extra:
         raise RuntimeError(
             "Checkpoint does not contain residual_mean/residual_scale. "
-            "Use a checkpoint produced by train_innovation1_residual_ddpm.py."
+            "Use a checkpoint produced by train_innovation1_residual_v_ddpm.py."
         )
     mean = torch.as_tensor(extra["residual_mean"], dtype=torch.float32)
     scale = torch.as_tensor(extra["residual_scale"], dtype=torch.float32)
@@ -406,14 +413,8 @@ def train_one_epoch(
         )
         noise = torch.randn_like(residual_state)
         noisy_residual = schedule.q_sample(residual_state, timesteps, noise)
-        alpha_bar = schedule.alpha_bars.gather(
-            0, timesteps - 1
-        ).view(batch_size, 1, 1, 1).to(
-            device=residual_state.device, dtype=residual_state.dtype
-        )
-        target_v = (
-            alpha_bar.sqrt() * noise
-            - (1.0 - alpha_bar).clamp_min(0.0).sqrt() * residual_state
+        target_v = v_prediction_target(
+            residual_state, noise, timesteps, schedule
         )
         predicted_v = model(noisy_residual, condition, timesteps)
 
@@ -545,7 +546,7 @@ def run_train(args, train_loader, val_loader, info, device):
             print(f"OVERWRITE_RUN removed={path}")
 
     if args.resume:
-        validate_v_checkpoint(args.resume)
+        validate_v_checkpoint(args.resume, args)
         loaded_epoch, best_psnr = load_checkpoint(
             model,
             args.resume,
@@ -685,7 +686,7 @@ def run_test(args, test_loader, info, device):
     model = build_v_model(args, info, device)
     best_path, _ = checkpoint_paths(args)
     checkpoint = args.checkpoint or args.resume or best_path
-    validate_v_checkpoint(checkpoint)
+    validate_v_checkpoint(checkpoint, args)
     load_checkpoint(model, checkpoint, map_location=str(device))
     residual_mean, residual_scale = load_saved_normalizer(checkpoint, device)
     if residual_mean.shape[1] != int(info["n_bands"]):

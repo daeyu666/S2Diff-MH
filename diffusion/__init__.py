@@ -1,5 +1,5 @@
 """Diffusion processes used by controlled ablation experiments."""
 
-from .gaussian_ddpm import GaussianDDPMSchedule, ddim_sample, ddim_timesteps
+from .gaussian_ddpm import GaussianDDPMSchedule, ddpm_sample
 
-__all__ = ["GaussianDDPMSchedule", "ddim_sample", "ddim_timesteps"]
+__all__ = ["GaussianDDPMSchedule", "ddpm_sample"]

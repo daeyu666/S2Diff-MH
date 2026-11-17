@@ -33,7 +33,7 @@ import torch.nn.functional as F
 import train_innovation3_gigi as registered_pipeline
 import train_innovation3_gigi_cdrdi as pipeline
 from cdrdi_geometry import sample_synthetic_geometry
-from utils import get_device, set_seed
+from utils import set_seed
 
 
 METRICS = ("PSNR", "SAM", "SSIM", "ERGAS", "CC", "RMSE")
@@ -230,6 +230,25 @@ def _validate_checkpoints(args):
     }
 
 
+def _resolve_device(name: str) -> torch.device:
+    if name == "cpu":
+        return torch.device("cpu")
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available")
+        return torch.device("cuda")
+    if name.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"{name} was requested but CUDA is not available")
+        index = int(name.split(":", 1)[1])
+        if index < 0 or index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"Requested {name}, but only {torch.cuda.device_count()} CUDA device(s) are visible"
+            )
+        return torch.device(name)
+    return torch.device(name)
+
+
 def _make_generator(device: torch.device, seed: int):
     try:
         generator = torch.Generator(device=device)
@@ -421,7 +440,7 @@ def _build_registered_model(args, info, device, checkpoint_info):
 @torch.no_grad()
 def run(args):
     set_seed(args.seed)
-    device = get_device(args.device)
+    device = _resolve_device(args.device)
     checkpoint_info = _validate_checkpoints(args)
 
     cfg = pipeline._config(args)

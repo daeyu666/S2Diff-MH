@@ -64,6 +64,12 @@ def parse_args():
         default=[1, 2, 4, 8, 16, 32, 1000],
     )
     p.add_argument("--capture_timestep", type=int, default=250)
+    p.add_argument(
+        "--noise_seed_offset",
+        type=int,
+        default=40404,
+        help="Offset used to create the shared initial noise; 40404 matches the fixed-t diagnostic.",
+    )
     p.add_argument("--residual_scale_factor", type=float, default=1.0)
     p.add_argument("--base_channels", type=int, default=64)
     p.add_argument("--time_dim", type=int, default=256)
@@ -187,9 +193,6 @@ def run_ddim_trajectory(
             x_t, predicted_v, t_batch, schedule
         )
 
-        alpha_bar_t = schedule.alpha_bars[timestep - 1].to(
-            device=x_t.device, dtype=x_t.dtype
-        )
         if previous_timestep == 0:
             alpha_bar_previous = torch.ones(
                 (), device=x_t.device, dtype=x_t.dtype
@@ -250,9 +253,6 @@ def diagnose_state(
     eps_mse = F.mse_loss(predicted_epsilon, effective_noise).item()
     v_corr = global_corr(predicted_v, target_v)
 
-    alpha_bar = schedule.alpha_bars[timestep - 1].to(
-        device=gt.device, dtype=gt.dtype
-    )
     x_t_stats = {
         "xt_mean": x_t.mean().item(),
         "xt_std": x_t.std(unbiased=False).item(),
@@ -356,7 +356,7 @@ def main():
 
     # One initial Gaussian tensor is reused for every inference-step count.
     noise_generator = torch.Generator(device=device)
-    noise_generator.manual_seed(args.seed + 50505)
+    noise_generator.manual_seed(args.seed + args.noise_seed_offset)
     initial_noise = torch.randn(
         residual_gt_norm.shape,
         device=device,
@@ -364,7 +364,8 @@ def main():
         generator=noise_generator,
     )
     print(
-        f"common_initial_noise mean={initial_noise.mean().item():.6f} "
+        f"common_initial_noise_seed={args.seed + args.noise_seed_offset} "
+        f"mean={initial_noise.mean().item():.6f} "
         f"std={initial_noise.std(unbiased=False).item():.6f}"
     )
 
@@ -379,7 +380,6 @@ def main():
     print("\n[1] SPARSE DETERMINISTIC DDIM SWEEP (COMMON INITIAL NOISE)")
     rows = []
     free_running_state = None
-    full_sequence = None
     for steps in step_counts:
         final_norm, captured, sequence = run_ddim_trajectory(
             model,
@@ -415,7 +415,6 @@ def main():
         })
         if steps == schedule.total_steps:
             free_running_state = captured
-            full_sequence = sequence
 
     if free_running_state is None:
         raise RuntimeError(
@@ -430,9 +429,6 @@ def main():
         f"\n[2] TEACHER-FORCED VS FREE-RUNNING AT t={args.capture_timestep}"
     )
     t = args.capture_timestep
-    t_batch = torch.full(
-        (gt.shape[0],), t, device=device, dtype=torch.long
-    )
     alpha_bar = schedule.alpha_bars[t - 1].to(
         device=device, dtype=gt.dtype
     )

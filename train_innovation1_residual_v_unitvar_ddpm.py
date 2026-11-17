@@ -152,6 +152,11 @@ def validate_unitvar_checkpoint(checkpoint_path: str, args=None) -> Dict:
             f"Checkpoint residual_normalization_mode={normalization_mode!r}; "
             "expected 'per_band_train_split_mean_std_no_clipping'."
         )
+    checkpoint_scale_factor = extra.get("residual_scale_factor")
+    if checkpoint_scale_factor is None or abs(float(checkpoint_scale_factor) - 1.0) > 1e-10:
+        raise RuntimeError(
+            f"Checkpoint residual_scale_factor={checkpoint_scale_factor!r}; expected 1.0."
+        )
     if args is not None:
         if abs(float(args.residual_scale_factor) - 1.0) > 1e-10:
             raise RuntimeError(

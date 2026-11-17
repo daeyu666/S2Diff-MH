@@ -37,7 +37,7 @@ METRICS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="PaviaU unregistered CDRDI one-step/recursive ablation"
+        description="PaviaU unregistered independent one-shot vs recursive CDRDI ablation"
     )
     p.add_argument("--dataset", choices=("PaviaU",), default="PaviaU")
     p.add_argument("--data_root", default="./data/raw")
@@ -53,7 +53,7 @@ def parse_args():
         "--one_shot_geometry_checkpoint",
         default="./checkpoints/PaviaU/PaviaU_one_shot_independent_finalonly_500ep_lr1e4.pth",
     )
-    p.add_argument("--output_dir", default="./results/ablation_cdrdi_iteration/PaviaU")
+    p.add_argument("--output_dir", default="./results/ablation_cdrdi_iteration/PaviaU_independent_oneshot")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--cases", type=int, default=10)
@@ -340,7 +340,8 @@ def run(args):
     print(f"Recursive main condition: K={args.recursive_steps}")
     print("Stage-2D diffusion: same frozen checkpoint for all conditions")
     print("Depth diagnostics:", depths)
-    print("Geometry checkpoint:", args.geometry_checkpoint)
+    print("Recursive geometry checkpoint:", args.geometry_checkpoint)
+    print("Independent one-shot checkpoint:", args.one_shot_geometry_checkpoint)
     print("Diffusion checkpoint:", args.diffusion_checkpoint)
     print("=" * 96)
 
@@ -572,7 +573,7 @@ def main():
         raise ValueError("--recursive_steps must be >=2")
     if args.dry_run:
         print(json.dumps(vars(args), ensure_ascii=False, indent=2))
-        for value in (args.geometry_checkpoint, args.diffusion_checkpoint):
+        for value in (args.geometry_checkpoint, args.one_shot_geometry_checkpoint, args.diffusion_checkpoint):
             if not Path(value).is_file():
                 raise FileNotFoundError(value)
         print("DRY_RUN_OK: checkpoint paths exist; no models or data were loaded.")

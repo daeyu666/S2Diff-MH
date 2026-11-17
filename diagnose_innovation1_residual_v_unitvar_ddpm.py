@@ -251,6 +251,7 @@ def main():
 
     print("\n[3] FULL ANCESTRAL REVERSE-CHAIN TRACE")
     free_running_state_at_diagnostic_t = None
+    free_running_initial_noise = None
     with torch.no_grad():
         chain_seed = args.seed + 50505
         ancestral_generator = torch.Generator(device=device)
@@ -261,6 +262,7 @@ def main():
             dtype=residual_norm.dtype,
             generator=ancestral_generator,
         )
+        free_running_initial_noise = x_t.detach().clone()
         trace = set(selected_ts)
         for t in range(schedule.total_steps, 0, -1):
             tb = torch.full(
@@ -341,7 +343,7 @@ def main():
     print(f"\n[3B] TEACHER-FORCED VS FREE-RUNNING AT t={diagnostic_t}")
     with torch.no_grad():
         diagnostic_tb = torch.full((gt.shape[0],), diagnostic_t, device=device, dtype=torch.long)
-        teacher_xt = schedule.q_sample(residual_norm, diagnostic_tb, fixed_noise)
+        teacher_xt = schedule.q_sample(residual_norm, diagnostic_tb, free_running_initial_noise)
         teacher_v = model(teacher_xt, condition, diagnostic_tb)
         teacher_x0 = v_to_x0(teacher_xt, teacher_v, diagnostic_tb, schedule)
         teacher_res = denormalize_residual(teacher_x0, residual_mean, residual_scale)

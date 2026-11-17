@@ -1,9 +1,9 @@
 """Standard Gaussian DDPM ablation for S2Diff-MH Innovation 1.
 
-The clean HR-HSI is diffused with a conventional 1000-step Gaussian process.
+The clean HR-HSI is diffused with a 12-step cosine Gaussian Markov chain.
 The registered LR-HSI observation and HR-MSI are supplied as fixed spatial
 conditions. Training predicts Gaussian noise with the standard epsilon-MSE
-objective; inference uses 12-step deterministic DDIM by default.
+objective; inference uses the complete 12-step ancestral DDPM reverse chain.
 
 This entry point is intentionally separate from main.py and does not modify
 the physical Innovation-1 implementation or its checkpoints.
@@ -60,10 +60,6 @@ def parse_args():
 
     # Standard Gaussian diffusion settings.
     parser.add_argument("--total_diffusion_steps", type=int, default=12)
-    parser.add_argument(
-        "--sampling_steps", type=int, default=12,
-        help="Must equal total_diffusion_steps; standard ancestral DDPM uses every step.",
-    )
     parser.add_argument("--cosine_offset", type=float, default=0.008)
 
     # Match the physical Innovation-1 Raw-MSI Direct backbone.
@@ -273,7 +269,6 @@ def evaluate(
     device: torch.device,
     *,
     scale_ratio: int,
-    sampling_steps: int,
     seed: int,
 ) -> Dict[str, float]:
     model.eval()
@@ -401,7 +396,6 @@ def run_train(args, train_loader, val_loader, info, device):
                 schedule,
                 device,
                 scale_ratio=args.scale_ratio,
-                sampling_steps=args.sampling_steps,
                 seed=args.seed + 100000,
             )
             print("val", format_metrics(metrics))
@@ -455,7 +449,6 @@ def run_test(args, test_loader, info, device):
         schedule,
         device,
         scale_ratio=args.scale_ratio,
-        sampling_steps=args.sampling_steps,
         seed=args.seed + 200000,
     )
     print("test", format_metrics(metrics))
@@ -463,11 +456,6 @@ def run_test(args, test_loader, info, device):
 
 def main():
     args = parse_args()
-    if args.sampling_steps != args.total_diffusion_steps:
-        raise ValueError(
-            "Standard ancestral DDPM must use all steps: set sampling_steps "
-            "equal to total_diffusion_steps."
-        )
     for key, value in vars(args).items():
         print(f"{key}: {value}")
 

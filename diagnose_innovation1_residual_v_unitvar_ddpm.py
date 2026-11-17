@@ -50,21 +50,56 @@ def corrcoef(a, b):
     b = b.detach().float().reshape(-1)
     a = a - a.mean()
     b = b - b.mean()
-    den = torch.sqrt(a.square().sum() * b.square().sum()).clamp_min(1e-12)
+    den = torch.sqrt(a.square().sum() * b.square().sum())
+    if den.item() < 1e-12:
+        return float("nan")
     return (a * b).sum().div(den).item()
+
+
+def per_band_corrcoef(a, b):
+    if a.ndim != 4 or b.shape != a.shape:
+        raise ValueError("Per-band residual correlation expects matching [B,C,H,W] tensors")
+    dims = (0, 2, 3)
+    a_centered = a.float() - a.float().mean(dim=dims, keepdim=True)
+    b_centered = b.float() - b.float().mean(dim=dims, keepdim=True)
+    numerator = (a_centered * b_centered).sum(dim=dims)
+    denominator = torch.sqrt(
+        a_centered.square().sum(dim=dims)
+        * b_centered.square().sum(dim=dims)
+    )
+    valid = denominator > 1e-12
+    if not valid.any():
+        return float("nan")
+    return (numerator[valid] / denominator[valid]).mean().item()
+
+
+def residual_diagnostics(residual_pred, residual_gt):
+    pred = residual_pred.detach().float()
+    target = residual_gt.detach().float()
+    target_std = target.std(unbiased=False)
+    pred_std = pred.std(unbiased=False)
+    return {
+        "rmse": torch.sqrt(F.mse_loss(pred, target)).item(),
+        "corr_global": corrcoef(pred, target),
+        "corr_band_mean": per_band_corrcoef(pred, target),
+        "std_ratio": (pred_std / target_std.clamp_min(1e-12)).item(),
+        "mean_bias": (pred.mean() - target.mean()).item(),
+    }
 
 
 def report_reconstruction(tag, baseline, residual_pred, gt, residual_gt):
     pred = (baseline + residual_pred).clamp(0.0, 1.0)
     m = calc_metrics(pred, gt, 4)
-    residual_rmse = torch.sqrt(F.mse_loss(residual_pred, residual_gt)).item()
-    residual_corr = corrcoef(residual_pred, residual_gt)
+    r = residual_diagnostics(residual_pred, residual_gt)
     print(
         f"{tag}: PSNR={m['PSNR']:.6f} SAM={m['SAM']:.6f} "
         f"RMSE={m['RMSE']:.6f} ERGAS={m['ERGAS']:.6f} "
         f"SSIM={m['SSIM']:.6f} CC={m['CC']:.6f} "
-        f"residual_RMSE={residual_rmse:.6f} "
-        f"residual_corr={residual_corr:.6f}"
+        f"residual_RMSE={r['rmse']:.6f} "
+        f"residual_corr_global={r['corr_global']:.6f} "
+        f"residual_corr_band_mean={r['corr_band_mean']:.6f} "
+        f"residual_std_ratio={r['std_ratio']:.6f} "
+        f"residual_mean_bias={r['mean_bias']:.6f}"
     )
 
 
@@ -242,17 +277,18 @@ def main():
                 )
                 rec = (baseline + residual_est).clamp(0.0, 1.0)
                 m = calc_metrics(rec, gt, args.scale_ratio)
-                r_rmse = torch.sqrt(
-                    F.mse_loss(residual_est, residual_gt)
-                ).item()
-                r_corr = corrcoef(residual_est, residual_gt)
+                r = residual_diagnostics(residual_est, residual_gt)
                 print(
                     f"reverse_t={t:4d} xt_std={x_t.std(unbiased=False).item():.5f} "
                     f"v_std={predicted_v.std(unbiased=False).item():.5f} "
                     f"eps_std={eps_pred.std(unbiased=False).item():.5f} "
                     f"x0_std={x0.std(unbiased=False).item():.5f} "
                     f"x0_out_of_range_fraction={x0_outlier_fraction:.5f} "
-                    f"residual_RMSE={r_rmse:.6f} residual_corr={r_corr:.5f} "
+                    f"residual_RMSE={r['rmse']:.6f} "
+                    f"corr_global={r['corr_global']:.5f} "
+                    f"corr_band_mean={r['corr_band_mean']:.5f} "
+                    f"std_ratio={r['std_ratio']:.5f} "
+                    f"mean_bias={r['mean_bias']:.5f} "
                     f"PSNR={m['PSNR']:.4f} SAM={m['SAM']:.4f}"
                 )
 
@@ -336,16 +372,17 @@ def main():
                 )
                 rec = (baseline + residual_est).clamp(0.0, 1.0)
                 m = calc_metrics(rec, gt, args.scale_ratio)
-                r_rmse = torch.sqrt(
-                    F.mse_loss(residual_est, residual_gt)
-                ).item()
-                r_corr = corrcoef(residual_est, residual_gt)
+                r = residual_diagnostics(residual_est, residual_gt)
                 print(
                     f"ddim_t={timestep:4d} xt_std={x_t.std(unbiased=False).item():.5f} "
                     f"v_std={predicted_v.std(unbiased=False).item():.5f} "
                     f"eps_std={eps_pred.std(unbiased=False).item():.5f} "
                     f"x0_std={x0.std(unbiased=False).item():.5f} "
-                    f"residual_RMSE={r_rmse:.6f} residual_corr={r_corr:.5f} "
+                    f"residual_RMSE={r['rmse']:.6f} "
+                    f"corr_global={r['corr_global']:.5f} "
+                    f"corr_band_mean={r['corr_band_mean']:.5f} "
+                    f"std_ratio={r['std_ratio']:.5f} "
+                    f"mean_bias={r['mean_bias']:.5f} "
                     f"PSNR={m['PSNR']:.4f} SAM={m['SAM']:.4f}"
                 )
 

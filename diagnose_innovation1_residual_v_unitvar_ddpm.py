@@ -85,6 +85,7 @@ def main():
     p.add_argument("--total_diffusion_steps", type=int, default=1000)
     p.add_argument("--beta_start", type=float, default=1e-4)
     p.add_argument("--beta_end", type=float, default=2e-2)
+    p.add_argument("--residual_scale_factor", type=float, default=1.0)
     p.add_argument("--base_channels", type=int, default=64)
     p.add_argument("--time_dim", type=int, default=256)
     p.add_argument("--spectral_hidden", type=int, default=8)
@@ -139,7 +140,7 @@ def main():
     stats("condition_[-1,1]", condition)
     stats("true_residual", residual_gt)
     stats("true_normalized_residual", residual_norm)
-    print(f"val_residual_clip_fraction={clip_fraction.item():.6%}")
+    print(f"val_residual_out_of_range_fraction={clip_fraction.item():.6%}")
     report_reconstruction(
         "BASELINE_ONLY", baseline, torch.zeros_like(residual_gt), gt, residual_gt
     )

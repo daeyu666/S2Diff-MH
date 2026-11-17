@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from config import TrainConfig
 from data_loader import build_loaders, build_train_val_test_loaders
-from diffusion import GaussianDDPMSchedule, ddim_sample
+from diffusion import GaussianDDPMSchedule, ddpm_sample
 from innovation1 import build_progressive_process
 from metrics import MetricAverager, calc_metrics
 from models import RawMSIDirectPredictor
@@ -59,10 +59,12 @@ def parse_args():
     parser.add_argument("--psf_truncate", type=float, default=3.0)
 
     # Standard Gaussian diffusion settings.
-    parser.add_argument("--total_diffusion_steps", type=int, default=1000)
-    parser.add_argument("--sampling_steps", type=int, default=12)
-    parser.add_argument("--beta_start", type=float, default=1e-4)
-    parser.add_argument("--beta_end", type=float, default=2e-2)
+    parser.add_argument("--total_diffusion_steps", type=int, default=12)
+    parser.add_argument(
+        "--sampling_steps", type=int, default=12,
+        help="Must equal total_diffusion_steps; standard ancestral DDPM uses every step.",
+    )
+    parser.add_argument("--cosine_offset", type=float, default=0.008)
 
     # Match the physical Innovation-1 Raw-MSI Direct backbone.
     parser.add_argument("--base_channels", type=int, default=64)
@@ -165,6 +167,7 @@ def build_condition(
             target_size=tuple(gt.shape[-2:]),
         )
         condition = torch.cat([lr_hsi_up, hr_msi], dim=1)
+        condition = condition.mul(2.0).sub(1.0)
     if condition.shape[-2:] != gt.shape[-2:]:
         raise RuntimeError("Condition and HR-HSI spatial grids do not match")
     return condition, lr_hsi_up
@@ -191,10 +194,13 @@ def run_metadata(args, info: Dict) -> Dict:
     metadata = vars(args).copy()
     metadata.update(
         {
-            "diffusion_type": "standard_gaussian_ddpm",
+            "diffusion_type": "standard_12_step_cosine_gaussian_ddpm",
             "prediction_type": "epsilon",
             "training_objective": "mean_squared_error",
-            "condition": "normalized_adjoint_LR_HSI_plus_registered_HR_MSI",
+            "state_normalization": "reflectance_[0,1]_mapped_to_[-1,1]",
+            "beta_schedule": "cosine",
+            "reverse_process": "12_step_ancestral_ddpm",
+            "condition": "normalized_adjoint_LR_HSI_plus_registered_HR_MSI_mapped_to_[-1,1]",
             "n_hsi_bands": int(info["n_bands"]),
             "n_msi_bands": int(info["n_msi_bands"]),
             "condition_channels": int(info["n_bands"]) + int(info["n_msi_bands"]),
@@ -229,8 +235,10 @@ def train_one_epoch(
             device=device,
             dtype=torch.long,
         )
-        noise = torch.randn_like(gt)
-        noisy_hsi = schedule.q_sample(gt, timesteps, noise)
+        # Standard DDPM is trained in a zero-centered data domain.
+        x0 = gt.mul(2.0).sub(1.0)
+        noise = torch.randn_like(x0)
+        noisy_hsi = schedule.q_sample(x0, timesteps, noise)
         predicted_noise = model(noisy_hsi, condition, timesteps)
 
         if predicted_noise.shape != noise.shape:
@@ -282,15 +290,15 @@ def evaluate(
         hr_msi = batch["hr_msi"].to(device, non_blocking=True)
         condition, lr_hsi_up = build_condition(gt, hr_msi, physical_process)
 
-        prediction = ddim_sample(
+        prediction_normalized = ddpm_sample(
             model,
             condition,
             sample_shape=gt.shape,
             schedule=schedule,
-            sampling_steps=sampling_steps,
             generator=generator,
             clip_x0=True,
         )
+        prediction = ((prediction_normalized + 1.0) * 0.5).clamp(0.0, 1.0)
         final_meter.update(calc_metrics(prediction, gt, scale_ratio))
         initial_meter.update(calc_metrics(lr_hsi_up, gt, scale_ratio))
 
@@ -313,8 +321,7 @@ def run_train(args, train_loader, val_loader, info, device):
     physical_process = build_progressive_process(data_cfg)
     schedule = GaussianDDPMSchedule(
         total_steps=args.total_diffusion_steps,
-        beta_start=args.beta_start,
-        beta_end=args.beta_end,
+        cosine_offset=args.cosine_offset,
         device=device,
     )
     model = build_model(args, info, device)
@@ -353,8 +360,8 @@ def run_train(args, train_loader, val_loader, info, device):
 
     print(
         f"DDPM schedule: T={schedule.total_steps}, "
-        f"beta=[{args.beta_start}, {args.beta_end}], "
-        f"DDIM sampling steps={args.sampling_steps}"
+        f"schedule=cosine, terminal_alpha_bar={schedule.alpha_bars[-1].item():.6e}, "
+        f"ancestral reverse steps={args.total_diffusion_steps}"
     )
     print(
         f"Physical LR-HSI condition: scale={args.scale_ratio}, "
@@ -457,6 +464,11 @@ def run_test(args, test_loader, info, device):
 
 def main():
     args = parse_args()
+    if args.sampling_steps != args.total_diffusion_steps:
+        raise ValueError(
+            "Standard ancestral DDPM must use all steps: set sampling_steps "
+            "equal to total_diffusion_steps."
+        )
     for key, value in vars(args).items():
         print(f"{key}: {value}")
 

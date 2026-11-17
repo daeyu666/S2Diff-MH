@@ -232,10 +232,7 @@ def main():
             )
             rec = (baseline + residual_est).clamp(0.0, 1.0)
             m = calc_metrics(rec, gt, args.scale_ratio)
-            r_rmse = torch.sqrt(
-                F.mse_loss(residual_est, residual_gt)
-            ).item()
-            r_corr = corrcoef(residual_est, residual_gt)
+            r = residual_diagnostics(residual_est, residual_gt)
             print(
                 f"t={t:4d} v_mse={v_mse:.7f} v_corr={v_corr:.5f} "
                 f"v_std={predicted_v.std(unbiased=False).item():.5f} "
@@ -243,7 +240,11 @@ def main():
                 f"eps_std={eps_pred.std(unbiased=False).item():.5f} "
                 f"x0_norm_std={x0_raw.std(unbiased=False).item():.5f} "
                 f"x0_out_of_range_fraction={x0_outlier_fraction:.5f} "
-                f"residual_RMSE={r_rmse:.6f} residual_corr={r_corr:.5f} "
+                f"residual_RMSE={r['rmse']:.6f} "
+                f"corr_global={r['corr_global']:.5f} "
+                f"corr_band_mean={r['corr_band_mean']:.5f} "
+                f"std_ratio={r['std_ratio']:.5f} "
+                f"mean_bias={r['mean_bias']:.5f} "
                 f"PSNR={m['PSNR']:.4f} SAM={m['SAM']:.4f}"
             )
 

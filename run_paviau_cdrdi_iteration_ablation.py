@@ -1,15 +1,10 @@
-"""PaviaU unregistered CDRDI iteration-depth ablation.
+"""PaviaU unregistered CDRDI one-shot-vs-recursive ablation.
 
-Formal comparison:
-  1) w/o CDRDI: same Stage-2D diffusion checkpoint, identity physical operator.
-  2) one-step: the migrated recursive geometry checkpoint, truncated to K=1.
-  3) recursive: the same geometry checkpoint unrolled to K=9 (the Stage-2D
-     inference depth recorded by the current k9 adapted diffusion protocol).
-
-K=3 and K=6 are retained as depth diagnostics. Every path receives exactly
-the same synthetic nonregistered LR-HSI observation and HR-MSI. HPGC/GIGI is
-not loaded or applied. This is an inference-time ablation of CDRDI iteration;
-K=1 is NOT a separately trained one-shot geometry network.
+One-shot is an independently trained single-update geometry estimator.
+K=3/K=6/K=9 are inference-depth diagnostics of the separately trained
+recursive CDRDI. All conditions receive identical synthetic unregistered
+observations and share the same frozen Stage-2D diffusion checkpoint.
+HPGC/GIGI is disabled throughout.
 """
 from __future__ import annotations
 
@@ -33,7 +28,8 @@ from cdrdi_geometry import (
     sampling_coordinates,
     spectral_project,
 )
-from utils import get_device, set_seed
+from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
+from utils import get_device, load_checkpoint, set_seed
 
 
 METRICS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
@@ -52,6 +48,10 @@ def parse_args():
     p.add_argument(
         "--diffusion_checkpoint",
         default="./checkpoints/PaviaU/PaviaU_estimated_deform_diffusion_k9_stage2d_A.pth",
+    )
+    p.add_argument(
+        "--one_shot_geometry_checkpoint",
+        default="./checkpoints/PaviaU/PaviaU_one_shot_independent_finalonly_500ep_lr1e4.pth",
     )
     p.add_argument("--output_dir", default="./results/ablation_cdrdi_iteration/PaviaU")
     p.add_argument("--device", default="cuda:0")
@@ -118,20 +118,25 @@ def _sha256_tensor(value: torch.Tensor) -> str:
 
 def _validate_checkpoints(args):
     geometry_path = Path(args.geometry_checkpoint)
+    one_shot_path = Path(args.one_shot_geometry_checkpoint)
     diffusion_path = Path(args.diffusion_checkpoint)
-    for path in (geometry_path, diffusion_path):
+    for path in (geometry_path, one_shot_path, diffusion_path):
         if not path.is_file():
             raise FileNotFoundError(path)
 
     geometry_state = _read_checkpoint(geometry_path)
+    one_shot_state = _read_checkpoint(one_shot_path)
     diffusion_state = _read_checkpoint(diffusion_path)
-    if not isinstance(geometry_state, dict) or not isinstance(diffusion_state, dict):
-        raise TypeError("Both checkpoints must be PyTorch checkpoint dictionaries")
+    if not all(isinstance(x, dict) for x in (geometry_state, one_shot_state, diffusion_state)):
+        raise TypeError("All checkpoints must be PyTorch checkpoint dictionaries")
 
     geometry_extra = geometry_state.get("extra", {})
+    one_shot_extra = one_shot_state.get("extra", {})
     diffusion_extra = diffusion_state.get("extra", {})
     if not isinstance(geometry_extra, dict):
         geometry_extra = {}
+    if not isinstance(one_shot_extra, dict):
+        one_shot_extra = {}
     if not isinstance(diffusion_extra, dict):
         diffusion_extra = {}
 
@@ -143,8 +148,25 @@ def _validate_checkpoints(args):
         raise ValueError("Expected the final_only recursive CDRDI checkpoint")
     if geometry_extra.get("steps") not in (None, 6):
         raise ValueError(
-            f"Expected a K=6-trained geometry checkpoint, got steps={geometry_extra.get('steps')}"
+            f"Expected a K=6-trained recursive geometry checkpoint, got steps={geometry_extra.get('steps')}"
         )
+    if one_shot_extra.get("dataset") not in (None, "PaviaU"):
+        raise ValueError("One-shot geometry checkpoint is not a PaviaU checkpoint")
+    if one_shot_extra.get("variant") != "one_shot":
+        raise ValueError("One-shot checkpoint must be independently trained with --variant one_shot")
+    if one_shot_extra.get("steps") not in (None, 1):
+        raise ValueError("One-shot checkpoint must contain exactly one trained update")
+    if one_shot_extra.get("loss_mode") not in (None, "final_only"):
+        raise ValueError("One-shot checkpoint must use final_only closure supervision")
+    for key, expected in (
+        ("max_translation", args.max_translation),
+        ("max_rotation_deg", args.max_rotation_deg),
+        ("max_local_px", args.max_local_px),
+        ("control_grid", args.control_grid),
+    ):
+        actual = one_shot_extra.get(key)
+        if actual is not None and not math.isclose(float(actual), float(expected), rel_tol=0, abs_tol=1e-8):
+            raise ValueError(f"One-shot geometry metadata mismatch: {key}={actual}, expected {expected}")
 
     if diffusion_extra.get("dataset") not in (None, "PaviaU"):
         raise ValueError("Stage-2D diffusion checkpoint is not a PaviaU checkpoint")
@@ -181,6 +203,13 @@ def _validate_checkpoints(args):
             "epoch": geometry_state.get("epoch"),
             "best_metric": geometry_state.get("best_metric"),
             "extra": geometry_extra,
+        },
+        "one_shot_geometry": {
+            "path": str(one_shot_path.resolve()),
+            "sha256": _sha256_file(one_shot_path),
+            "epoch": one_shot_state.get("epoch"),
+            "best_metric": one_shot_state.get("best_metric"),
+            "extra": one_shot_extra,
         },
         "diffusion": {
             "path": str(diffusion_path.resolve()),
@@ -271,15 +300,32 @@ def run(args):
     geometry_model.eval().requires_grad_(False)
     diffusion_model.eval().requires_grad_(False)
 
+    one_shot_model = LearnedPhysicalResidualSolver(
+        info["n_msi_bands"],
+        base_channels=args.geometry_base_channels,
+        control_grid=args.control_grid,
+        max_translation=args.max_translation,
+        max_rotation_deg=args.max_rotation_deg,
+        max_local_px=args.max_local_px,
+    ).to(device)
+    load_checkpoint(
+        one_shot_model,
+        args.one_shot_geometry_checkpoint,
+        map_location=str(device),
+        load_optimizer=False,
+        strict=True,
+    )
+    one_shot_model.eval().requires_grad_(False)
+
     depths = sorted(set(int(x) for x in args.depths))
-    if any(x < 1 for x in depths):
-        raise ValueError("--depths values must be >=1")
-    if 1 not in depths or args.recursive_steps not in depths:
-        raise ValueError("--depths must include K=1 and --recursive_steps")
+    if any(x < 2 for x in depths):
+        raise ValueError("--depths are recursive depth diagnostics; values must be >=2")
+    if args.recursive_steps not in depths:
+        raise ValueError("--depths must include --recursive_steps")
     if args.cases < 1:
         raise ValueError("--cases must be >=1")
 
-    variants = ["w/o CDRDI"] + [f"CDRDI_K{k}" for k in depths]
+    variants = ["w/o CDRDI", "One-shot"] + [f"CDRDI_K{k}" for k in depths]
     patch_summaries: List[Dict[str, object]] = []
     case_path = Path(args.output_dir) / "cases.jsonl"
     output = Path(args.output_dir)
@@ -354,6 +400,44 @@ def run(args):
                     "observed_sha256": observed_hash,
                     "metrics": no_cdrdi_metrics,
                     "geometry": no_cdrdi_geo,
+                }, allow_nan=False) + "\n")
+
+                # Independently trained one-shot geometry predictor: exactly one update.
+                one_rigid, one_local = pipeline._estimate_geometry(
+                    one_shot_model,
+                    y_h=observed,
+                    hr_msi=hr_msi,
+                    p0=p0,
+                    srf=srf,
+                    steps=1,
+                )
+                one_process = pipeline._process_from_estimate(
+                    base_process, one_rigid, one_local
+                )
+                one_prediction = pipeline.reconstruct_from_terminal_lr(
+                    diffusion_model, one_process, observed,
+                    target_size=(height, width), hr_msi=hr_msi,
+                )
+                one_metrics = pipeline.calc_metrics(
+                    one_prediction, gt, args.scale_ratio
+                )
+                one_geo = _geometry_metrics(
+                    gt_phi, one_rigid, one_local,
+                    height=height, width=width,
+                )
+                one_geo["closure_mse"] = _closure_mse(
+                    p0, srf, observed, hr_msi, one_rigid, one_local
+                )
+                sample_values["One-shot"].append({**one_metrics, **one_geo})
+                case_file.write(json.dumps({
+                    "sample": sample_index + 1,
+                    "case": case_index + 1,
+                    "variant": "One-shot",
+                    "geometry_steps": 1,
+                    "observed_sha256": observed_hash,
+                    "metrics": one_metrics,
+                    "geometry": one_geo,
+                    "estimated_rigid": one_rigid[0].detach().cpu().tolist(),
                 }, allow_nan=False) + "\n")
 
                 for depth in depths:
@@ -433,7 +517,7 @@ def run(args):
         summary_rows.append({
             "Variant": (
                 "w/o CDRDI" if name == "w/o CDRDI"
-                else ("One-step K=1" if name == "CDRDI_K1"
+                else ("One-shot" if name == "One-shot"
                       else (f"Recursive K={args.recursive_steps}" if name == recursive_name
                             else name.replace("CDRDI_", "Depth diagnostic ")))
             ),
@@ -451,8 +535,8 @@ def run(args):
         "hpgc_refiner": False,
         "same_diffusion_checkpoint_for_all_conditions": True,
         "no_cdrdi_definition": "identity geometry with the same frozen Stage-2D diffusion weights",
-        "one_step_definition": "K=1 inference using the same K=6-trained recursive CDRDI weights; not an independently trained one-shot network",
-        "recursive_definition": f"K={args.recursive_steps} inference using the same K=6-trained recursive CDRDI weights",
+        "one_shot_definition": "independently trained CDRDI checkpoint with variant=one_shot and steps=1; evaluated with the same frozen Stage-2D diffusion checkpoint as recursive conditions",
+        "recursive_definition": f"K={args.recursive_steps} inference using the K=6-trained recursive CDRDI weights",
         "depth_diagnostics": depths,
         "same_observation_per_case": True,
         "geometry_sampler": "sample_synthetic_geometry; seed reset to seed+70000 per test patch",

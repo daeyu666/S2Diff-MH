@@ -291,10 +291,7 @@ def main():
         )
 
 
-if __name__ == "__main__":
-    main()
-
-    print("\\n[4] DETERMINISTIC DDIM REVERSE-CHAIN TRACE")
+    print("\n[4] DETERMINISTIC DDIM REVERSE-CHAIN TRACE")
     if not 1 <= args.ddim_steps <= schedule.total_steps:
         raise ValueError(
             f"--ddim_steps must lie in [1, {schedule.total_steps}]"
@@ -422,3 +419,7 @@ if __name__ == "__main__":
                 "Manual DDIM diagnostic trace does not match ddim_v_sample"
             )
         print("DDIM helper consistency check: PASS")
+
+
+if __name__ == "__main__":
+    main()

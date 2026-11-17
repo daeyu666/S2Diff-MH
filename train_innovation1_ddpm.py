@@ -79,7 +79,8 @@ def parse_args():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--eval_interval", type=int, default=5)
+    # Full 1000-step ancestral validation is expensive; evaluate every 20 epochs.
+    parser.add_argument("--eval_interval", type=int, default=20)
     parser.add_argument("--save_interval", type=int, default=20)
 
     parser.add_argument("--resume", default="")

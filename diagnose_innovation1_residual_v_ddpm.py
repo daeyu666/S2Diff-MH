@@ -111,7 +111,7 @@ def main():
         beta_end=args.beta_end,
         device=device,
     )
-    validate_v_checkpoint(args.checkpoint)
+    validate_v_checkpoint(args.checkpoint, args)
     model = build_v_model(args, info, device)
     epoch, best = load_checkpoint(
         model, args.checkpoint, map_location=str(device)

@@ -227,6 +227,7 @@ def diagnose_state(
     schedule: GaussianDDPMSchedule,
     timestep: int,
     scale_ratio: int,
+    reference_noise: torch.Tensor,
 ):
     t_batch = torch.full(
         (gt.shape[0],), timestep, device=gt.device, dtype=torch.long
@@ -259,7 +260,7 @@ def diagnose_state(
         "effective_noise_mean": effective_noise.mean().item(),
         "effective_noise_std": effective_noise.std(unbiased=False).item(),
         "effective_noise_corr_init": global_corr(
-            effective_noise, effective_noise.new_tensor(effective_noise)
+            effective_noise, reference_noise
         ),
         "x0_out_of_range_fraction": (
             (predicted_x0_norm < -1.0) | (predicted_x0_norm > 1.0)
@@ -453,6 +454,7 @@ def main():
         schedule,
         t,
         args.scale_ratio,
+        initial_noise,
     )
 
     effective_free_noise = (

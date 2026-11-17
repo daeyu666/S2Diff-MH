@@ -261,7 +261,7 @@ def fit_residual_normalizer(
     # Measure the fraction outside [-1,1] for diagnostics only; do not clip.
     if has_augment:
         dataset.augment = False
-    clip_loader = DataLoader(
+    outlier_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
@@ -273,7 +273,7 @@ def fit_residual_normalizer(
         with torch.no_grad():
             mean_device = mean.to(device=device, dtype=torch.float32)
             scale_device = scale.to(device=device, dtype=torch.float32)
-            for batch in clip_loader:
+            for batch in outlier_loader:
                 gt = batch["gt"].to(device, non_blocking=True)
                 hr_msi = batch["hr_msi"].to(device, non_blocking=True)
                 _, baseline = build_condition(gt, hr_msi, physical_process)
@@ -399,7 +399,7 @@ def train_one_epoch(
 ) -> Tuple[float, float]:
     model.train()
     loss_meter = AverageMeter()
-    clip_meter = AverageMeter()
+    outlier_meter = AverageMeter()
 
     for batch in loader:
         gt = batch["gt"].to(device, non_blocking=True)
@@ -407,7 +407,7 @@ def train_one_epoch(
         condition, baseline = build_condition(gt, hr_msi, physical_process)
 
         residual = gt - baseline
-        residual_state, clip_fraction = normalize_residual(
+        residual_state, outlier_fraction = normalize_residual(
             residual, residual_mean, residual_scale
         )
 
@@ -446,9 +446,9 @@ def train_one_epoch(
         optimizer.step()
 
         loss_meter.update(loss.item(), batch_size)
-        clip_meter.update(clip_fraction.item(), batch_size)
+        outlier_meter.update(outlier_fraction.item(), batch_size)
 
-    return loss_meter.avg, clip_meter.avg
+    return loss_meter.avg, outlier_meter.avg
 
 
 @torch.no_grad()
@@ -467,7 +467,7 @@ def evaluate(
     model.eval()
     final_meter = MetricAverager()
     initial_meter = MetricAverager()
-    clip_meter = AverageMeter()
+    outlier_meter = AverageMeter()
 
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed))
@@ -478,10 +478,10 @@ def evaluate(
         condition, baseline = build_condition(gt, hr_msi, physical_process)
 
         target_residual = gt - baseline
-        _, clip_fraction = normalize_residual(
+        _, outlier_fraction = normalize_residual(
             target_residual, residual_mean, residual_scale
         )
-        clip_meter.update(clip_fraction.item(), gt.shape[0])
+        outlier_meter.update(outlier_fraction.item(), gt.shape[0])
 
         normalized_residual = ddpm_v_sample(
             model,
@@ -503,7 +503,7 @@ def evaluate(
     initial = initial_meter.average()
     metrics["INIT_PSNR"] = initial.get("PSNR", float("nan"))
     metrics["INIT_SAM"] = initial.get("SAM", float("nan"))
-    metrics["RES_OUTLIER_FRAC"] = clip_meter.avg
+    metrics["RES_OUTLIER_FRAC"] = outlier_meter.avg
     return metrics
 
 

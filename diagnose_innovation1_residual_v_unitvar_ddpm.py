@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from data_loader import build_train_val_test_loaders
-from diffusion import GaussianDDPMSchedule
+from diffusion import GaussianDDPMSchedule, ddim_v_sample
 from diffusion.gaussian_v_ddpm import (
     v_prediction_target,
     v_to_epsilon,
@@ -85,6 +85,8 @@ def main():
     p.add_argument("--total_diffusion_steps", type=int, default=1000)
     p.add_argument("--beta_start", type=float, default=1e-4)
     p.add_argument("--beta_end", type=float, default=2e-2)
+    p.add_argument("--ddim_steps", type=int, default=1000)
+    p.add_argument("--ddim_eta", type=float, default=0.0)
     p.add_argument("--residual_scale_factor", type=float, default=1.0)
     p.add_argument("--base_channels", type=int, default=64)
     p.add_argument("--time_dim", type=int, default=256)
@@ -162,13 +164,13 @@ def main():
 
     selected_ts = [1000, 750, 500, 250, 100, 50, 10, 1]
     selected_ts = [t for t in selected_ts if t <= schedule.total_steps]
-    generator = torch.Generator(device=device)
-    generator.manual_seed(args.seed + 40404)
+    fixed_noise_generator = torch.Generator(device=device)
+    fixed_noise_generator.manual_seed(args.seed + 40404)
     fixed_noise = torch.randn(
         residual_norm.shape,
         device=device,
         dtype=residual_norm.dtype,
-        generator=generator,
+        generator=fixed_noise_generator,
     )
 
     print("\n[2] FIXED-T V-PREDICTION AND X0 DIAGNOSTICS")
@@ -212,11 +214,14 @@ def main():
 
     print("\n[3] FULL ANCESTRAL REVERSE-CHAIN TRACE")
     with torch.no_grad():
+        chain_seed = args.seed + 50505
+        ancestral_generator = torch.Generator(device=device)
+        ancestral_generator.manual_seed(chain_seed)
         x_t = torch.randn(
             residual_norm.shape,
             device=device,
             dtype=residual_norm.dtype,
-            generator=generator,
+            generator=ancestral_generator,
         )
         trace = set(selected_ts)
         for t in range(schedule.total_steps, 0, -1):
@@ -266,7 +271,7 @@ def main():
                     residual_norm.shape,
                     device=device,
                     dtype=residual_norm.dtype,
-                    generator=generator,
+                    generator=ancestral_generator,
                 )
                 x_t = posterior_mean + variance.clamp_min(0.0).sqrt() * z
             else:
@@ -288,3 +293,132 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    print("\\n[4] DETERMINISTIC DDIM REVERSE-CHAIN TRACE")
+    if not 1 <= args.ddim_steps <= schedule.total_steps:
+        raise ValueError(
+            f"--ddim_steps must lie in [1, {schedule.total_steps}]"
+        )
+    if not 0.0 <= args.ddim_eta <= 1.0:
+        raise ValueError("--ddim_eta must lie in [0,1]")
+
+    timestep_sequence = torch.linspace(
+        schedule.total_steps,
+        0,
+        args.ddim_steps + 1,
+        dtype=torch.float64,
+    ).round().to(torch.long).tolist()
+    if any(a <= b for a, b in zip(
+        timestep_sequence[:-1], timestep_sequence[1:]
+    )):
+        raise RuntimeError("DDIM timestep sequence is not strictly descending")
+
+    with torch.no_grad():
+        ddim_generator = torch.Generator(device=device)
+        ddim_generator.manual_seed(chain_seed)
+        x_t = torch.randn(
+            residual_norm.shape,
+            device=device,
+            dtype=residual_norm.dtype,
+            generator=ddim_generator,
+        )
+        for timestep, previous_timestep in zip(
+            timestep_sequence[:-1], timestep_sequence[1:]
+        ):
+            tb = torch.full(
+                (gt.shape[0],), timestep, device=device, dtype=torch.long
+            )
+            predicted_v = model(x_t, condition, tb)
+            x0_raw = v_to_x0(x_t, predicted_v, tb, schedule)
+            eps_pred = v_to_epsilon(x_t, predicted_v, tb, schedule)
+            x0 = x0_raw
+
+            if timestep in trace:
+                residual_est = denormalize_residual(
+                    x0, residual_mean, residual_scale
+                )
+                rec = (baseline + residual_est).clamp(0.0, 1.0)
+                m = calc_metrics(rec, gt, args.scale_ratio)
+                r_rmse = torch.sqrt(
+                    F.mse_loss(residual_est, residual_gt)
+                ).item()
+                r_corr = corrcoef(residual_est, residual_gt)
+                print(
+                    f"ddim_t={timestep:4d} xt_std={x_t.std(unbiased=False).item():.5f} "
+                    f"v_std={predicted_v.std(unbiased=False).item():.5f} "
+                    f"eps_std={eps_pred.std(unbiased=False).item():.5f} "
+                    f"x0_std={x0.std(unbiased=False).item():.5f} "
+                    f"residual_RMSE={r_rmse:.6f} residual_corr={r_corr:.5f} "
+                    f"PSNR={m['PSNR']:.4f} SAM={m['SAM']:.4f}"
+                )
+
+            alpha_bar_t = schedule.alpha_bars[timestep - 1].to(
+                device=device, dtype=gt.dtype
+            )
+            if previous_timestep == 0:
+                alpha_bar_previous = torch.ones(
+                    (), device=device, dtype=gt.dtype
+                )
+            else:
+                alpha_bar_previous = schedule.alpha_bars[
+                    previous_timestep - 1
+                ].to(device=device, dtype=gt.dtype)
+
+            sigma_squared = (
+                args.ddim_eta ** 2
+                * (1.0 - alpha_bar_previous)
+                / (1.0 - alpha_bar_t).clamp_min(1e-12)
+                * (
+                    1.0
+                    - alpha_bar_t / alpha_bar_previous.clamp_min(1e-12)
+                )
+            ).clamp_min(0.0)
+            direction_variance = (
+                1.0 - alpha_bar_previous - sigma_squared
+            ).clamp_min(0.0)
+            x_previous = (
+                alpha_bar_previous.sqrt() * x0
+                + direction_variance.sqrt() * eps_pred
+            )
+            if args.ddim_eta > 0.0 and previous_timestep > 0:
+                z = torch.randn(
+                    residual_norm.shape,
+                    device=device,
+                    dtype=residual_norm.dtype,
+                    generator=ddim_generator,
+                )
+                x_previous = x_previous + sigma_squared.sqrt() * z
+            x_t = x_previous
+
+        ddim_final = denormalize_residual(
+            x_t, residual_mean, residual_scale
+        )
+        stats("ddim_generated_normalized_residual", x_t)
+        stats("ddim_generated_residual", ddim_final)
+        report_reconstruction(
+            f"FINAL_DDIM_eta{args.ddim_eta:g}_steps{args.ddim_steps}",
+            baseline,
+            ddim_final,
+            gt,
+            residual_gt,
+        )
+
+        helper_generator = torch.Generator(device=device)
+        helper_generator.manual_seed(chain_seed)
+        helper_result = ddim_v_sample(
+            model,
+            condition,
+            sample_shape=gt.shape,
+            schedule=schedule,
+            generator=helper_generator,
+            ddim_steps=args.ddim_steps,
+            eta=args.ddim_eta,
+            clip_x0=False,
+        )
+        if not torch.allclose(
+            x_t, helper_result, atol=2e-5, rtol=2e-5
+        ):
+            raise RuntimeError(
+                "Manual DDIM diagnostic trace does not match ddim_v_sample"
+            )
+        print("DDIM helper consistency check: PASS")

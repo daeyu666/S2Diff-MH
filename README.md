@@ -2,6 +2,13 @@
 
 Clean research repository for hyperspectral image super-resolution / HSI-MSI fusion.
 
+With `comparison_experiments` next to this checkout, run
+`python benchmark_paviau.py --device cuda:0` for the shared PaviaU complexity table
+(parameters, counted FLOPs, and latency). The CSV is written in
+`../comparison_experiments/outputs/benchmark_paviau/summary.csv`; for checkpoint
+overrides and measurement conventions, see the comparison repository's
+`BENCHMARK_PAVIAU.md`.
+
 The repository currently contains:
 
 1. **Innovation 1: sensor-degradation-consistent progressive diffusion**;

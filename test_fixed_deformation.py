@@ -31,7 +31,7 @@ def parse_args(argv=None):
     return args
 
 
-def build_predictor(args, info, base_process, device, *, include_registered=False):
+def build_predictor(args, info, base_process, device, *, include_registered=False, profile_modules=None):
     """Model inference consumes Y_H/Y_M only; synthesis geometry stays private."""
     geometry_model, diffusion_model = pipeline._build_frozen_models(args, info, device)
     projector = pipeline._build_projector(args, info, device)
@@ -43,6 +43,8 @@ def build_predictor(args, info, base_process, device, *, include_registered=Fals
         raise ValueError("refiner checkpoint/test dataset mismatch")
     epoch, best = pipeline._load_training_checkpoint(refiner, path, device)
     refiner.eval()
+    if profile_modules is not None:
+        profile_modules.extend((geometry_model, diffusion_model, refiner))
     srf = torch.as_tensor(info["srf_weights"], device=device, dtype=torch.float32)
     p0 = base_process.operator
 

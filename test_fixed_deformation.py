@@ -31,17 +31,20 @@ def parse_args(argv=None):
     return args
 
 
-def build_predictor(args, info, base_process, device, *, include_registered=False, profile_modules=None):
+def build_predictor(args, info, base_process, device, *, include_registered=False,
+                    profile_modules=None, load_weights=True):
     """Model inference consumes Y_H/Y_M only; synthesis geometry stays private."""
-    geometry_model, diffusion_model = pipeline._build_frozen_models(args, info, device)
+    geometry_model, diffusion_model = pipeline._build_frozen_models(args, info, device, load_weights=load_weights)
     projector = pipeline._build_projector(args, info, device)
     refiner = pipeline._build_refiner(args, info, device)
-    path = args.refiner_checkpoint or pipeline._checkpoint_path(args)
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    checkpoint_dataset = state.get("extra", {}).get("dataset")
-    if checkpoint_dataset is not None and checkpoint_dataset != args.dataset:
-        raise ValueError("refiner checkpoint/test dataset mismatch")
-    epoch, best = pipeline._load_training_checkpoint(refiner, path, device)
+    path = epoch = best = None
+    if load_weights:
+        path = args.refiner_checkpoint or pipeline._checkpoint_path(args)
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint_dataset = state.get("extra", {}).get("dataset")
+        if checkpoint_dataset is not None and checkpoint_dataset != args.dataset:
+            raise ValueError("refiner checkpoint/test dataset mismatch")
+        epoch, best = pipeline._load_training_checkpoint(refiner, path, device)
     refiner.eval()
     if profile_modules is not None:
         profile_modules.extend((geometry_model, diffusion_model, refiner))
@@ -73,7 +76,7 @@ def build_predictor(args, info, base_process, device, *, include_registered=Fals
         residual = pipeline._physical_residual(base_process, projector, lr_hsi, base)
         return refiner(base, hr_msi, residual, pipeline.ranked_msi_heterogeneity(hr_msi))
 
-    details = {"refiner_checkpoint": str(path), "checkpoint_epoch": epoch,
+    details = {"refiner_checkpoint": str(path) if path else None, "checkpoint_epoch": epoch,
                "best_training_monitor": best, "geometry_checkpoint": args.geometry_checkpoint,
                "diffusion_checkpoint": args.diffusion_checkpoint,
                "geometry_steps": args.geometry_steps, "diffusion_steps": args.diffusion_steps,

@@ -8,6 +8,8 @@ With `comparison_experiments` next to this checkout, run
 `../comparison_experiments/outputs/benchmark_paviau/summary.csv`; for checkpoint
 overrides and measurement conventions, see the comparison repository's
 `BENCHMARK_PAVIAU.md`.
+Use `--no_checkpoints --emr_width 128` to benchmark initialized models without
+collecting their trained checkpoints; this writes to `benchmark_paviau_initialized` instead.
 
 The repository currently contains:
 

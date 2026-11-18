@@ -14,6 +14,30 @@ entry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(entry)
 
 
+def test_initialized_small_models_predict_without_reading_weights(tmp_path, monkeypatch):
+    args = entry.parse_args([
+        "--device", "cpu", "--geometry_base_channels", "8", "--diffusion_base_channels", "8",
+        "--time_dim", "32", "--spectral_hidden", "2", "--refine_hidden", "8", "--heads", "1",
+        "--geometry_steps", "1", "--diffusion_steps", "4",
+    ])
+    args.checkpoint_root = str(tmp_path / "unused")
+    info = {"n_bands": 103, "n_msi_bands": 4, "srf_weights": [[1 / 103] * 103] * 4}
+    process = entry.pipeline.build_progressive_process(entry.pipeline._config(args))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Initialized inference must not read checkpoints")
+
+    monkeypatch.setattr(torch, "load", unexpected)
+    models = []
+    predict, details = entry.build_predictor(args, info, process, torch.device("cpu"),
+                                             profile_modules=models, load_weights=False)
+    prediction = predict(torch.rand(1, 103, 8, 8), torch.rand(1, 4, 32, 32))
+    assert prediction.shape == (1, 103, 32, 32)
+    assert torch.isfinite(prediction).all()
+    assert len(models) == 3 and details["checkpoint_epoch"] is None
+    assert not (tmp_path / "unused").exists()
+
+
 def test_actual_small_models_load_and_predict_without_gt_geometry(tmp_path):
     previous = torch.get_num_threads()
     torch.set_num_threads(1)

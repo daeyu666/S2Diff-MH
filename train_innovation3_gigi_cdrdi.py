@@ -349,17 +349,18 @@ def _geometry_epe(
     return float(epe.mean().item())
 
 
-def _build_frozen_models(args, info, device):
-    _checkpoint_sensor_preflight(
-        args.geometry_checkpoint,
-        expected_msi_bands=info["n_msi_bands"],
-        role="geometry",
-    )
-    if not os.path.exists(args.diffusion_checkpoint):
-        raise FileNotFoundError(
-            f"diffusion checkpoint for {args.dataset} is missing: "
-            f"{args.diffusion_checkpoint}"
+def _build_frozen_models(args, info, device, *, load_weights=True):
+    if load_weights:
+        _checkpoint_sensor_preflight(
+            args.geometry_checkpoint,
+            expected_msi_bands=info["n_msi_bands"],
+            role="geometry",
         )
+        if not os.path.exists(args.diffusion_checkpoint):
+            raise FileNotFoundError(
+                f"diffusion checkpoint for {args.dataset} is missing: "
+                f"{args.diffusion_checkpoint}"
+            )
     geometry_model = LearnedPhysicalResidualSolver(
         info["n_msi_bands"],
         base_channels=args.geometry_base_channels,
@@ -368,27 +369,12 @@ def _build_frozen_models(args, info, device):
         max_rotation_deg=args.max_rotation_deg,
         max_local_px=args.max_local_px,
     ).to(device)
-    load_checkpoint(
-        geometry_model,
-        args.geometry_checkpoint,
-        map_location=str(device),
-        load_optimizer=False,
-    )
-    geometry_model.eval()
-    for p in geometry_model.parameters():
-        p.requires_grad_(False)
-
-    cfg = _config(args)
-    diffusion_model = build_model(cfg, info, device)
-    load_checkpoint(
-        diffusion_model,
-        args.diffusion_checkpoint,
-        map_location=str(device),
-        load_optimizer=False,
-    )
-    diffusion_model.eval()
-    for p in diffusion_model.parameters():
-        p.requires_grad_(False)
+    diffusion_model = build_model(_config(args), info, device)
+    for model, role in ((geometry_model, "geometry"), (diffusion_model, "diffusion")):
+        if load_weights:
+            load_checkpoint(model, getattr(args, f"{role}_checkpoint"),
+                            map_location=str(device), load_optimizer=False)
+        model.eval().requires_grad_(False)
 
     return geometry_model, diffusion_model
 

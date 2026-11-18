@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+from inspect import signature
 import json
 from pathlib import Path
 import runpy
@@ -9,6 +11,23 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent
+
+
+def load_benchmark_predictor(root):
+    path = root / "test_fixed_deformation.py"
+    if not path.is_file():
+        raise RuntimeError(f"Missing {path}. Update the complete S2Diff-MH checkout.")
+    spec = importlib.util.spec_from_file_location("_s2diff_benchmark_fixed_deformation", path)
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    if not {"profile_modules", "load_weights"} <= signature(entry.build_predictor).parameters.keys():
+        raise RuntimeError(f"S2Diff-MH benchmark requires a newer {path}; "
+                           "update the complete checkout or use --s2diff_root with a clean checkout.")
+    pipeline = entry.pipeline
+    if "load_weights" not in signature(pipeline._build_frozen_models).parameters:
+        raise RuntimeError(f"S2Diff-MH benchmark requires a newer {pipeline.__file__}; "
+                           "update the complete checkout or use --s2diff_root with a clean checkout.")
+    return entry.build_predictor, pipeline
 
 
 def profile_ours(argv):
@@ -29,8 +48,11 @@ def profile_ours(argv):
     # repository to sys.path: both repos have a config and model namespace.
     common = runpy.run_path(str(opts._runner))
     import os
-    import train_innovation3_gigi_cdrdi as pipeline
-    from test_fixed_deformation import build_predictor
+    # Make the S2Diff checkout take precedence for its internal imports (also
+    # when Python is configured not to prepend the script directory).
+    if not sys.path or sys.path[0] != str(ROOT):
+        sys.path.insert(0, str(ROOT))
+    build_predictor, pipeline = load_benchmark_predictor(ROOT)
 
     device = common["runtime"](opts.device, opts.cpu_threads, opts.seed)
     lr, msi, srf = common["load_pair"](opts._pair, device)

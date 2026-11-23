@@ -149,3 +149,117 @@ unclipped normalized observation residuals, paired exports and input hashes,
 original-state-only refinement, and strict loading/running of small actual
 geometry/diffusion architectures with temporary initialized checkpoints.
 These local tests do not replace the experiment using your trained server weights.
+
+## Independent per-step prediction-error decomposition
+
+Keep `state_x0` as the formal output. To instrument the SAME inference trajectory
+without changing Eq. (10), training, weights or refiner inputs, run:
+
+```bash
+python diagnose_diffusion_endpoint.py \
+  --device cuda:0 \
+  --cases 10 --max_samples 0 \
+  --error_decomposition \
+  --output_dir outputs/diffusion_endpoint/PaviaU_decomposition_10cases
+```
+
+Use the same `--geometry_checkpoint`, `--diffusion_checkpoint`, seed, geometry
+depth and other settings as the preceding ten-case endpoint experiment. Default
+checkpoint paths are shown above. The deterministic private geometry generator
+reproduces those cases when these inputs match; compare the observation hashes
+in `traces.json` and checkpoint hashes in `manifest.json` to audit pairing.
+
+The old archives do not contain every intermediate network prediction. A new
+inference pass is needed for an **independent** accumulation; no retraining is
+needed. Defining C as `state_x0-GT-delta` from the old archives would make the
+closure test circular, so this script never uses that shortcut.
+
+At each actual step t, an observer gets a copy of the network prediction after
+the production update has completed. It does not receive or modify the reverse
+state, return a correction to the model, or consume random numbers. It computes:
+
+```
+e_t    = prediction_t - GT
+c_t    = L_(t-1)(e_t) - L_t(e_t)
+C_pred = sum(t=T,...,1) c_t
+```
+
+After the reverse pass it checks:
+
+```
+state_x0 - GT = delta_T + C_pred
+```
+
+This decomposition requires **fixed linear** L_t and L_0=I. These conditions
+hold for the physical operator with a fixed estimated sampling grid and
+image-independent normalized-adjoint denominator. The observer uses the full
+raw error field as the operator input; no clipping, image normalization, or ROI
+mask is inserted inside L_t. A numerical closure failure stops the diagnostic
+instead of being reported as evidence for a mechanism. Operator evaluation is
+float32; accumulation, norms and energy statistics are float64.
+
+Additional outputs:
+
+| File | Contents |
+| --- | --- |
+| `error_decomposition.csv` | Each condition/patch/case, both full and ROI scopes: delta, C, delta+C and actual-error L2/RMS norms; cosine; cross and squared-energy terms; closure errors; net-compensation flag |
+| `error_decomposition_summary.csv` | Separate condition/scope summaries, case counts with opposing components and with net compensation, defined-cosine count, mean norms/energies and maximum closure error |
+| `error_decomposition_steps.csv` | For every actual timestep: e_t L2/RMS, c_t L2/RMS, cumulative C L2/RMS, both scopes |
+| `error_decomposition.json` | Per-case decomposition with undefined cosines represented as JSON null |
+| Existing per-case `.npz` | Additional independently accumulated `C_pred_diagnostic_only` field, stored float64 |
+
+Append `--save_step_errors` if you also need all raw `prediction_error_t12`,
+..., `prediction_error_t01` cubes in the archives. This can consume substantial
+disk space; by default only per-step scalar statistics and the final C field
+are added. The original endpoint summary and tensors are still exported.
+Summary norms are means of per-case norms, not norms of averaged vectors.
+
+### Interpreting compensation
+
+For vectors restricted to one common support,
+
+```
+||delta+C||^2 - ||delta||^2 = 2<delta,C> + ||C||^2
+```
+
+`cos_delta_C < 0` means the cross term is negative; it does **not** by itself
+mean that the final error is smaller. An oversized opposing C can overshoot.
+`net_compensation=True` requires
+`2*mean(delta*C)+mean(C^2)<0`, beyond numerical tolerance, against the **oracle
+offset baseline** `GT+delta`. The actual error-energy change is also reported,
+and must also be negative beyond tolerance. The tolerance includes the measured
+actual-vs-decomposed MSE discrepancy, so floating-point closure error cannot be
+counted as net compensation. Both changes can be compared directly.
+
+Zero delta or zero C makes cosine undefined (blank in CSV, null in JSON), not
+zero. Registered cases therefore should not be interpreted as compensation of
+a nonzero anchor offset. Counts are reported separately for Registered and
+Warp, full and ROI; neither an averaged cosine nor one favorable case proves
+a general mechanism. All calculations here use unclipped errors and should
+not be identified with the clipped PSNR/SAM scores.
+
+This decomposition quantifies where actual reconstruction error comes from.
+Even verified cancellation on these samples is not proof that the model was
+trained to cancel delta, does not establish a causal advantage over the last
+prediction, and does not resolve the ideal-predictor clean-endpoint issue:
+when every e_t=0, C=0 and the original state remains `GT+delta`.
+
+Oracle-only controls can also exercise the decomposition without data/weights:
+
+```bash
+python diagnose_diffusion_endpoint.py --oracle_only --error_decomposition \
+  --output_dir outputs/diffusion_endpoint/oracle_decomposition
+```
+
+Both controls must give C=0, including the genuinely nonzero-delta control.
+Additional tests:
+
+```bash
+python -m pytest -q tests/test_diffusion_error_decomposition.py \
+  tests/test_diffusion_endpoint_diagnostic.py \
+  tests/test_estimated_geometry_trajectory.py tests/test_deformation_aware_diffusion.py
+```
+
+They check independent per-step accumulation, zero/nonzero oracle controls,
+unchanged production state and RNG, negative-cosine overshoot, rejection of an
+invalid nonlinear trajectory, paired exports, and the full command entry point.

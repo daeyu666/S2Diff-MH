@@ -189,7 +189,7 @@ def test_help_and_dry_run_do_not_load_torch_or_data():
 def test_complete_entrypoint_with_frozen_refiner_and_manifest(tmp_path, monkeypatch):
     args, _ = setup_process(tmp_path, ["--geometry_base_channels", "8", "--diffusion_base_channels", "8",
         "--time_dim", "32", "--spectral_hidden", "2", "--geometry_steps", "1",
-        "--refine_hidden", "8", "--heads", "1", "--cases", "1"])
+        "--refine_hidden", "8", "--heads", "1", "--cases", "1", "--error_decomposition"])
     info = {"n_bands": 31, "n_msi_bands": 2, "srf_weights": np.full((2, 31), 1/31), "protocol": "synthetic test fixture"}
     device = torch.device("cpu")
     geometry, diffusion = pipeline._build_frozen_models(args, info, device, load_weights=False)
@@ -216,6 +216,9 @@ def test_complete_entrypoint_with_frozen_refiner_and_manifest(tmp_path, monkeypa
     assert len(manifest["summary"]) == 6
     assert set(manifest["checkpoints"]) == {"geometry", "diffusion", "refiner"}
     assert all(row["passed"] for row in manifest["oracle_controls"])
+    assert manifest["error_decomposition"]["enabled"] is True
+    assert (Path(args.output_dir) / "error_decomposition_summary.csv").is_file()
+    assert all(row["error_decomposition"][0]["C_pred_L2"] == 0 for row in manifest["oracle_controls"])
     # Existing artifacts are protected on a repeated command.
     with pytest.raises(FileExistsError):
         entry.main([])

@@ -43,6 +43,8 @@ def parse_args(argv=None):
     p.add_argument("--disable_tangent", action="store_true")
     p.add_argument("--output_dir", default="outputs/diffusion_endpoint/PaviaU")
     p.add_argument("--overwrite_output", action="store_true")
+    p.add_argument("--error_decomposition", action="store_true", help="Independently accumulate per-step L_(t-1)(e_t)-L_t(e_t); diagnostic only")
+    p.add_argument("--save_step_errors", action="store_true", help="Also archive every e_t cube; requires --error_decomposition and more disk space")
     p.add_argument("--oracle_only", action="store_true", help="CPU controls only; no data/checkpoints required")
     p.add_argument("--dry_run", action="store_true")
     p.set_defaults(stage="test", batch_size=1, num_workers=0)
@@ -55,6 +57,8 @@ def parse_args(argv=None):
         p.error("control_grid>=2 and 0<min_jacobian<=1 required")
     if min(args.max_translation, args.max_rotation_deg, args.max_local_px) < 0:
         p.error("geometry bounds must be nonnegative")
+    if args.save_step_errors and not args.error_decomposition:
+        p.error("--save_step_errors requires --error_decomposition")
     return args
 
 
@@ -100,11 +104,13 @@ def checkpoint_record(path, dataset):
             "epoch": state.get("epoch"), "extra": json.loads(json.dumps(extra, default=str))}
 
 
-def reconstruct_pair(model, process, observed, *, target_size, hr_msi):
+def reconstruct_pair(model, process, observed, *, target_size, hr_msi, step_observer=None):
     """Same operations/order as innovation1; retain last prediction as well.
 
     This function receives neither GT nor GT geometry. It never estimates a
     residual from GT or corrects the production trajectory with such a residual.
+    An optional read-only observer receives a copied prediction AFTER each
+    update. Its return value is ignored; it never receives the reverse state.
     """
     import torch
     from innovation1 import model_predict
@@ -120,6 +126,8 @@ def reconstruct_pair(model, process, observed, *, target_size, hr_msi):
                 last = prediction.clone()
                 last_model_state = process.state_at(last, 1)
             x_t = process.reverse_update(x_t, prediction, t)
+            if step_observer is not None:
+                step_observer(t, prediction.detach().clone())
         for value in (x_t, last):
             if value.shape != terminal.shape or not torch.isfinite(value).all():
                 raise FloatingPointError("Nonfinite or incorrectly shaped endpoint")
@@ -130,7 +138,7 @@ def reconstruct_pair(model, process, observed, *, target_size, hr_msi):
                 "gap_identity_max_abs": float((gap - expected_gap).abs().max())}
 
 
-def oracle_controls():
+def oracle_controls(*, error_decomposition=False):
     """Exact-X predictors with exact/mismatched geometry, independent of weights."""
     import torch
     from degradations.physical import PhysicalDegradation
@@ -157,7 +165,12 @@ def oracle_controls():
                          ("nonzero_residual", torch.tensor([[1.4, -.6, .7]]))):
         process = DeformationAwareProgressiveDegradation(base, rigid=rigid, local_field=local)
         delta = process.terminal_state(observed, target_size=(32, 32)) - process.state_at(gt, 12)
-        pair = reconstruct_pair(Oracle(gt), process, observed, target_size=(32, 32), hr_msi=None)
+        collector = None
+        if error_decomposition:
+            from diffusion_error_decomposition import PredictionErrorCollector
+            collector = PredictionErrorCollector(process, gt, torch.ones(1, 1, 32, 32, dtype=torch.bool))
+        pair = reconstruct_pair(Oracle(gt), process, observed, target_size=(32, 32), hr_msi=None,
+                                step_observer=collector.observe if collector is not None else None)
         error = float((pair["state_x0"] - (gt + delta)).abs().max())
         prediction_error = float((pair["last_prediction"] - gt).abs().max())
         delta_rms = float(delta.square().mean().sqrt())
@@ -170,6 +183,8 @@ def oracle_controls():
                      "prediction_minus_GT_raw_RMSE": float((pair["last_prediction"] - gt).square().mean().sqrt()),
                      "state_minus_GT_plus_delta_max_abs": error,
                      "gap_identity_max_abs": pair["gap_identity_max_abs"], "passed": True})
+        if collector is not None:
+            rows[-1]["error_decomposition"] = collector.finish(pair)[0]
     return rows
 
 
@@ -255,7 +270,7 @@ def run_diagnostic(args, test_set, process, diffusion, estimate, srf, device, re
     count = min(len(test_set), args.max_samples) if args.max_samples else len(test_set)
     if not count:
         raise ValueError("Empty test split")
-    rows, traces = [], []
+    rows, traces, decomposition_rows, step_rows = [], [], [], []
     for condition in args.conditions:
         for sample in range(count):
             item = test_set[sample]
@@ -280,10 +295,16 @@ def run_diagnostic(args, test_set, process, diffusion, estimate, srf, device, re
                     observed = pipeline._process_from_geometry(process, truth).terminal_observation(gt)
                     rigid, local = estimate(observed, msi)
                     acquisition = pipeline._process_from_estimate(process, rigid, local)
-                pair = reconstruct_pair(diffusion, acquisition, observed, target_size=(h, w), hr_msi=msi)
+                hr_mask, lr_mask, margin = valid_masks(process, truth_rigid, truth_local, rigid, local)
+                collector = None
+                if args.error_decomposition:
+                    from diffusion_error_decomposition import PredictionErrorCollector
+                    collector = PredictionErrorCollector(acquisition, gt, hr_mask,
+                                                         save_step_errors=args.save_step_errors)
+                pair = reconstruct_pair(diffusion, acquisition, observed, target_size=(h, w), hr_msi=msi,
+                                        step_observer=collector.observe if collector is not None else None)
                 # GT used only after reconstruction for diagnostic scoring/offset audit.
                 delta = pair["terminal_state"] - acquisition.state_at(gt, acquisition.total_steps)
-                hr_mask, lr_mask, margin = valid_masks(process, truth_rigid, truth_local, rigid, local)
                 endpoints = {key: pair[key] for key in ("state_x0", "last_prediction")}
                 if refiner is not None:
                     endpoints["state_x0_refined"] = refine(pair["state_x0"], msi, observed, acquisition)
@@ -296,11 +317,28 @@ def run_diagnostic(args, test_set, process, diffusion, estimate, srf, device, re
                            "true_rigid": truth_rigid, "true_local": truth_local,
                            "estimated_rigid": rigid, "estimated_local": local,
                            **{k: v for k, v in pair.items() if torch.is_tensor(v)}, **endpoints}
+                case_decomposition = None
+                if collector is not None:
+                    case_decomposition, diagnostic_tensors = collector.finish(pair)
+                    tensors.update(diagnostic_tensors)
                 np.savez_compressed(archive, **{k: v.detach().cpu().numpy() for k, v in tensors.items()})
                 common = {"condition": condition, "sample": sample+1, "case": case+1,
                           "archive": str(archive.relative_to(output)),
                           "gt_sha256": tensor_hash(gt), "msi_sha256": tensor_hash(msi),
                           "observed_sha256": tensor_hash(observed), "mask_margin_hr": margin}
+                if case_decomposition is not None:
+                    decomposition_rows.extend({**common, **row} for row in case_decomposition)
+                    step_rows.extend({**common, **row} for row in collector.steps)
+                    from diffusion_error_decomposition import summarize_decomposition
+                    write_csv(output / "error_decomposition.csv", decomposition_rows)
+                    write_csv(output / "error_decomposition_steps.csv", step_rows)
+                    write_csv(output / "error_decomposition_summary.csv", summarize_decomposition(decomposition_rows))
+                    write_json(output / "error_decomposition.json", decomposition_rows)
+                    full = case_decomposition[0]
+                    print(f"DECOMPOSITION {condition} sample={sample+1} case={case+1} "
+                          f"delta_RMS={full['delta_RMS']:.7f} C_RMS={full['C_pred_RMS']:.7f} "
+                          f"cos={full['cos_delta_C']} net_compensation={full['net_compensation']} "
+                          f"closure_max={full['decomposition_max_abs_error']:.3g}", flush=True)
                 trace = {**common, "gap_identity_max_abs": pair["gap_identity_max_abs"],
                          "state_prediction_gap_raw_RMSE": float(pair["state_minus_prediction"].square().mean().sqrt()),
                          "delta_T_raw_RMSE": float(delta.square().mean().sqrt()),
@@ -342,7 +380,7 @@ def main(argv=None):
     import torch
     # CPU oracle checks are cheap and require neither data nor learned weights.
     with torch.no_grad():
-        controls = oracle_controls()
+        controls = oracle_controls(error_decomposition=args.error_decomposition)
     write_json(output / "oracle_controls.json", controls)
     print("ORACLE_CONTROLS: zero/nonzero residual passed", flush=True)
     if args.oracle_only:
@@ -395,6 +433,14 @@ def main(argv=None):
                 "aggregation": "equal cases within each patch then equal patches; primary metrics use masks; full_* provides original full-frame convention",
                 "archive_layout": "batch-first B,C,H,W; raw float32; boolean masks; never normalized per output",
                 "refiner": "original state_x0 input only; same frozen weights; no retraining",
+                "error_decomposition": {"enabled": args.error_decomposition,
+                    "formula": "x0-X = delta_T + sum_t (L_(t-1)(e_t)-L_t(e_t)), e_t=prediction_t-X",
+                    "assumptions": "L0=I, fixed geometry, image-independent linear L_t; verified numerically",
+                    "independent_accumulation": "C is computed from each actual prediction error, NOT final-error-minus-delta",
+                    "net_compensation": "2*mean(delta*C)+mean(C^2)<0, beyond tolerance; negative cosine alone is insufficient",
+                    "precision": "operator evaluations float32; C accumulation and vector/energy statistics float64; no clipping",
+                    "scopes": "full and common HR ROI; valid masks are never inserted inside L_t",
+                    "save_step_errors": args.save_step_errors},
                 "oracle_controls": controls}
     write_json(output / "manifest.json", manifest)
     with torch.no_grad():

@@ -67,6 +67,11 @@ use identical observations and support.
 
 ## 2. Train a new PaviaU HPGC Refiner on corrected inputs
 
+The independently registered HPGC requires its own adaptation as well. Use
+`train_innovation3_gigi.py`, its original registered diffusion backbone and the
+steps in [REGISTERED_CORRECTION_REFINER.md](REGISTERED_CORRECTION_REFINER.md).
+That experiment is distinct from the mixed model's Registered test condition.
+
 Reuse the original refiner experiment's training budget, seed, architecture,
 loss weights, monitoring criterion, and initialization policy. Change the
 diffusion-output mode and create a new run. Example using repository defaults:

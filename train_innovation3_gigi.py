@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from config import TrainConfig
 from data_loader import build_loaders, build_train_val_test_loaders
 from innovation1 import build_progressive_process, reconstruct_from_terminal_lr
+from diffusion_output_mode import MODES, output_mode, mode_stem, check_checkpoint_mode
 from losses import SAMLoss
 from metrics import MetricAverager, calc_metrics
 from models import (
@@ -40,7 +41,7 @@ from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, set_seed
 VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full")
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Innovation-3 terminal GIGI spectral-fidelity refinement"
     )
@@ -88,6 +89,8 @@ def parse_args():
     )
     p.add_argument("--refiner_checkpoint", default="")
     p.add_argument("--resume", default="")
+    p.add_argument("--diffusion_output", choices=MODES, default="state")
+    p.add_argument("--config_from_checkpoint", default="", help="Reuse recorded training hyperparameters only; does not initialize/resume refiner weights")
 
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch_size", type=int, default=2)
@@ -115,7 +118,23 @@ def parse_args():
             "Without this flag, a fresh train run refuses to overwrite prior results."
         ),
     )
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if args.config_from_checkpoint:
+        try:
+            state = torch.load(args.config_from_checkpoint, map_location="cpu", weights_only=False)
+        except TypeError:
+            state = torch.load(args.config_from_checkpoint, map_location="cpu")
+        cfg = state.get("extra", {})
+        if not isinstance(cfg, dict) or not cfg:
+            p.error("config_from_checkpoint requires nonempty registered-training metadata in extra")
+        if "geometry_checkpoint" in cfg or "diffusion_checkpoint" in cfg:
+            p.error("Use an independently REGISTERED HPGC checkpoint, not a mixed CDRDI refiner")
+        controls = {"stage", "resume", "refiner_checkpoint", "save_name", "checkpoint_root", "log_root",
+                    "overwrite_run", "diffusion_output", "config_from_checkpoint"}
+        known = {action.dest for action in p._actions}
+        p.set_defaults(**{k:v for k,v in cfg.items() if k in known and k not in controls})
+        args = p.parse_args(argv)  # Explicit CLI options override recorded defaults.
+    return args
 
 
 def _config(args) -> TrainConfig:
@@ -199,6 +218,7 @@ def _build_refiner(args, info, device):
         variant=args.variant,
         tangent_output=not args.disable_tangent,
     ).to(device)
+    model.diffusion_output_mode = output_mode(args)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"REFINER variant={args.variant} hidden={args.refine_hidden} heads={args.heads} "
@@ -209,8 +229,8 @@ def _build_refiner(args, info, device):
 
 def _run_stem(args) -> str:
     if args.save_name:
-        return os.path.splitext(os.path.basename(args.save_name))[0]
-    return f"{args.dataset}_innovation3_gigi_{args.variant}"
+        return mode_stem(os.path.splitext(os.path.basename(args.save_name))[0], output_mode(args))
+    return mode_stem(f"{args.dataset}_innovation3_gigi_{args.variant}", output_mode(args))
 
 
 def _checkpoint_path(args) -> str:
@@ -218,6 +238,8 @@ def _checkpoint_path(args) -> str:
     name = args.save_name or f"{args.dataset}_innovation3_gigi_{args.variant}.pth"
     if not name.endswith(".pth"):
         name += ".pth"
+    stem, ext = os.path.splitext(name)
+    name = mode_stem(stem, output_mode(args)) + ext
     return os.path.join(args.checkpoint_root, name)
 
 
@@ -269,6 +291,7 @@ def _load_refiner_checkpoint(model, path, device, optimizer=None):
         state = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         state = torch.load(path, map_location=device)
+    check_checkpoint_mode(state, getattr(model, "diffusion_output_mode", "state"))
     if state.get("variant", model.variant) != model.variant:
         raise ValueError(
             f"checkpoint variant={state.get('variant')} but model variant={model.variant}"
@@ -386,7 +409,7 @@ def _mechanism_stats(details, fraction: float) -> Dict[str, float]:
 
 
 @torch.no_grad()
-def _reconstruct_base(baseline, process, gt, hr_msi):
+def _reconstruct_base(baseline, process, gt, hr_msi, diffusion_output="state"):
     terminal_lr = process.terminal_observation(gt)
     base = reconstruct_from_terminal_lr(
         baseline,
@@ -394,6 +417,7 @@ def _reconstruct_base(baseline, process, gt, hr_msi):
         terminal_lr,
         target_size=tuple(gt.shape[-2:]),
         hr_msi=hr_msi,
+        output_mode=diffusion_output,
     )
     return terminal_lr, base
 
@@ -408,6 +432,7 @@ def evaluate(
     device,
     scale_ratio: int,
     region_fraction: float,
+    diffusion_output="state",
 ):
     refiner.eval()
     base_meter = MetricAverager()
@@ -426,6 +451,7 @@ def evaluate(
             process,
             gt,
             hr_msi,
+            diffusion_output=diffusion_output,
         )
         r_phy = _physical_residual(process, projector, terminal_lr, base)
         heterogeneity = ranked_msi_heterogeneity(hr_msi)
@@ -547,6 +573,7 @@ def train(args):
 
     print(
         "TRAINING_POLICY diffusion=frozen terminal_refinement=one_shot "
+        f"diffusion_output={output_mode(args)} "
         "heterogeneity_role=query_not_gain "
         "physical_residual=U_T[Y_H-D_T(X_hat)]_C4L_tangent"
     )
@@ -571,6 +598,7 @@ def train(args):
                     process,
                     gt,
                     hr_msi,
+                    diffusion_output=output_mode(args),
                 )
                 r_phy = _physical_residual(
                     process,
@@ -647,6 +675,7 @@ def train(args):
                 device,
                 args.scale_ratio,
                 args.region_fraction,
+                diffusion_output=output_mode(args),
             )
             _print_eval(base_m, refined_m, mechanism)
             row.update(
@@ -713,6 +742,7 @@ def test(args):
         device,
         args.scale_ratio,
         args.region_fraction,
+        diffusion_output=output_mode(args),
     )
     _print_eval(base_m, refined_m, mechanism)
     print(
@@ -733,6 +763,9 @@ def test(args):
 
 def main():
     args = parse_args()
+    print(f"REFINER_RUN stage={args.stage} dataset={args.dataset} diffusion_output={output_mode(args)} "
+          f"epochs={args.epochs} batch_size={args.batch_size} lr={args.lr} seed={args.seed} "
+          f"baseline={args.baseline_checkpoint} config_from={args.config_from_checkpoint or 'CLI'}")
     if args.stage == "train":
         train(args)
     else:

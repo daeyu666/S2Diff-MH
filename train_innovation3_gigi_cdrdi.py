@@ -44,6 +44,7 @@ from evaluation_protocol import evaluate_all_samples
 from data_loader import build_loaders, build_train_val_test_loaders
 from degradations.deformation_aware import DeformationAwareProgressiveDegradation
 from innovation1 import build_progressive_process, reconstruct_from_terminal_lr
+from diffusion_output_mode import MODES, output_mode, mode_stem, check_checkpoint_mode
 from losses import SAMLoss
 from main import build_model
 from metrics import MetricAverager, calc_metrics
@@ -129,6 +130,8 @@ def build_arg_parser(*, fixed_suite=False):
     )
     p.add_argument("--refiner_checkpoint", default="")
     p.add_argument("--resume", default="")
+    p.add_argument("--diffusion_output", choices=MODES, default="state")
+    p.add_argument("--from_scratch", action="store_true", help="Train a new refiner without registered-refiner initialization")
 
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=2)
@@ -217,7 +220,7 @@ def _resolve_dataset_checkpoints(args):
             f"./checkpoints/cdrdi_stage2/"
             f"{dataset}_estimated_deform_diffusion_k9_stage2d_A.pth"
         )
-    if not args.init_refiner_checkpoint:
+    if not args.init_refiner_checkpoint and not getattr(args, "from_scratch", False):
         args.init_refiner_checkpoint = (
             f"./checkpoints/innovation3_gigi/"
             f"{dataset}_innovation3_gigi_full.pth"
@@ -401,6 +404,7 @@ def _build_refiner(args, info, device):
         variant=args.variant,
         tangent_output=not args.disable_tangent,
     ).to(device)
+    model.diffusion_output_mode = output_mode(args)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"REFINER variant={args.variant} hidden={args.refine_hidden} heads={args.heads} "
@@ -432,8 +436,8 @@ def _load_refiner_weights(model, path: str, device):
 
 def _run_stem(args):
     if args.save_name:
-        return os.path.splitext(os.path.basename(args.save_name))[0]
-    return f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}"
+        return mode_stem(os.path.splitext(os.path.basename(args.save_name))[0], output_mode(args))
+    return mode_stem(f"{args.dataset}_innovation3_gigi_cdrdi_{args.variant}", output_mode(args))
 
 
 def _checkpoint_path(args):
@@ -444,6 +448,8 @@ def _checkpoint_path(args):
     )
     if not name.endswith(".pth"):
         name += ".pth"
+    stem, ext = os.path.splitext(name)
+    name = mode_stem(stem, output_mode(args)) + ext
     return os.path.join(args.checkpoint_root, name)
 
 
@@ -493,6 +499,7 @@ def _load_training_checkpoint(model, path, device, optimizer=None):
         state = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         state = torch.load(path, map_location=device)
+    check_checkpoint_mode(state, getattr(model, "diffusion_output_mode", "state"))
     if state.get("variant", model.variant) != model.variant:
         raise ValueError("checkpoint/refiner variant mismatch")
     model.load_state_dict(state["model"], strict=True)
@@ -609,6 +616,7 @@ def _registered_pair(
     base_process,
     gt,
     hr_msi,
+    diffusion_output="state",
 ):
     y_h = base_process.terminal_observation(gt)
     base = reconstruct_from_terminal_lr(
@@ -617,6 +625,7 @@ def _registered_pair(
         y_h,
         target_size=tuple(gt.shape[-2:]),
         hr_msi=hr_msi,
+        output_mode=diffusion_output,
     )
     r_phy = _physical_residual(base_process, projector, y_h, base)
     heterogeneity = ranked_msi_heterogeneity(hr_msi)
@@ -643,6 +652,7 @@ def _warp_pair(
     hr_msi,
     gt_phi,
     geometry_steps: int,
+    diffusion_output="state",
 ):
     true_process = _process_from_geometry(base_process, gt_phi)
     y_h = true_process.terminal_observation(gt)
@@ -661,6 +671,7 @@ def _warp_pair(
         y_h,
         target_size=tuple(gt.shape[-2:]),
         hr_msi=hr_msi,
+        output_mode=diffusion_output,
     )
     r_phy = _physical_residual(estimated_process, projector, y_h, base)
     heterogeneity = ranked_msi_heterogeneity(hr_msi)
@@ -729,6 +740,7 @@ def evaluate(
         base_process,
         gt,
         hr_msi,
+        diffusion_output=output_mode(args),
     )
     reg_base_metrics = calc_metrics(reg_base, gt, args.scale_ratio)
     reg_ref_metrics = calc_metrics(reg_refined, gt, args.scale_ratio)
@@ -762,6 +774,7 @@ def evaluate(
             hr_msi,
             gt_phi,
             args.geometry_steps,
+            diffusion_output=output_mode(args),
         )
         epes.append(epe)
 
@@ -866,6 +879,8 @@ def _is_better(value: float, best: float, mode: str) -> bool:
 
 
 def train(args):
+    if getattr(args, "from_scratch", False) and (args.resume or args.init_refiner_checkpoint):
+        raise ValueError("--from_scratch conflicts with resume/init_refiner_checkpoint")
     if not 0.0 < args.region_fraction < 0.5:
         raise ValueError("--region_fraction must lie in (0,0.5)")
     if args.geometry_steps < 1:
@@ -1001,6 +1016,7 @@ def train(args):
                     y_h,
                     target_size=(h, w),
                     hr_msi=hr_msi,
+                    output_mode=output_mode(args),
                 )
                 r_phy = _physical_residual(
                     estimated_process,

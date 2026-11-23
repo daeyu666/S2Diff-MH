@@ -23,6 +23,7 @@ from augsburg_real_process import build_augsburg_real_process
 from cdrdi_geometry import spectral_project
 from config import TrainConfig
 from innovation1 import reconstruct_from_terminal_lr
+from diffusion_output_mode import MODES, output_mode
 from main import build_model
 from train_augsburg_real_diffusion import _apply_radiometry, _radiometry
 from utils import get_device, load_checkpoint, set_seed
@@ -44,6 +45,7 @@ def parse_args():
     p.add_argument("--spectral_hidden", type=int, default=8)
     p.add_argument("--dropout", type=float, default=0.)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--diffusion_output", choices=MODES, default="state")
     p.add_argument("--seed", type=int, default=10)
     p.add_argument("--write_tif", action="store_true")
     p.add_argument("--skip_qnr", action="store_true",
@@ -68,6 +70,8 @@ def parse_args():
         p.error("--checkpoint is required without --center_holdout")
     if args.center_holdout and args.skip_qnr:
         p.error("--center_holdout requires QNR output; omit --skip_qnr")
+    if output_mode(args) == "terminal_correction":
+        args.save_root = os.path.join(args.save_root, "terminal_correction")
     return args
 
 
@@ -208,6 +212,7 @@ def main():
             pred = reconstruct_from_terminal_lr(
                 model, process, y_h,
                 target_size=(ts, ts), hr_msi=y_m,
+                output_mode=output_mode(args),
             )
             array = pred[0].permute(1, 2, 0).cpu().numpy()
             sum_cube[top:top + ts, left:left + ts, :] += array
@@ -274,6 +279,7 @@ def main():
         print(f"FULL_OUTPUT_GEOTIFF={raster_path}")
     report_path = os.path.join(args.save_root, f"Augsburg2_Wald_{output_suffix}_protocol.json")
     report = {
+        "diffusion_output": output_mode(args),
         "model": "S2Diff-MH",
         "stage": "original_10m_inference",
         "spatial_protocol_id": split_protocol_id,

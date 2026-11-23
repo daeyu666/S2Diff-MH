@@ -1,6 +1,9 @@
 # Experimental last-step terminal residual correction
 
-The formal algorithm and checkpoints remain unchanged. This script evaluates
+For the formal 10-seed x 10-case bank, paired statistics, candidate HPGC training
+and native Augsburg mode, see [CORRECTION_CANDIDATE_VALIDATION.md](CORRECTION_CANDIDATE_VALIDATION.md).
+
+The default algorithm and existing checkpoints remain unchanged. This script evaluates
 the proposed **full-strength last-step correction** as a separate experiment:
 
 ```

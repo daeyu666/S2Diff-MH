@@ -151,14 +151,32 @@ def reconstruct_from_terminal_lr(
     *,
     target_size: Tuple[int, int],
     hr_msi: Optional[torch.Tensor] = None,
+    output_mode: str = "state",
 ) -> torch.Tensor:
+    if output_mode not in ("state", "terminal_correction"):
+        raise ValueError(f"Unknown diffusion output_mode={output_mode!r}")
     model.eval()
     x_t = process.terminal_state(lr_hsi, target_size=target_size)
+    terminal = x_t.clone() if output_mode == "terminal_correction" else None
     for t in range(process.total_steps, 0, -1):
         timestep = torch.full((x_t.shape[0],), t, dtype=torch.long, device=x_t.device)
         pred_x0 = model_predict(model, x_t, timestep, hr_msi)
         x_t = process.reverse_update(x_t, pred_x0, t)
+    if output_mode == "terminal_correction":
+        x_t, _ = terminal_residual_correction(x_t, pred_x0, terminal, process)
     return x_t
+
+
+@torch.no_grad()
+def terminal_residual_correction(state_x0, last_prediction, terminal_state, process):
+    """Inference-computable full-strength correction; no GT or clipping."""
+    if state_x0.shape != last_prediction.shape or state_x0.shape != terminal_state.shape:
+        raise ValueError("Endpoint and terminal-state shapes must match")
+    delta_hat = terminal_state - process.state_at(last_prediction, process.total_steps)
+    corrected = state_x0 - delta_hat
+    if not torch.isfinite(corrected).all():
+        raise FloatingPointError("Nonfinite terminal-corrected output")
+    return corrected, delta_hat
 
 
 @torch.no_grad()

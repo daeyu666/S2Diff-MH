@@ -35,15 +35,8 @@ def parse_args(argv=None):
 
 def correct_endpoint(state_x0, last_prediction, terminal_state, acquisition):
     """Full-strength correction, no GT/mask/clipping/refiner or learned parameter."""
-    import torch
-    with torch.no_grad():
-        if state_x0.shape != last_prediction.shape or state_x0.shape != terminal_state.shape:
-            raise ValueError("Endpoint and terminal-state shapes must match")
-        delta_hat = terminal_state - acquisition.state_at(last_prediction, acquisition.total_steps)
-        corrected = state_x0 - delta_hat
-        if not torch.isfinite(corrected).all():
-            raise FloatingPointError("Nonfinite terminal-corrected output")
-        return corrected, delta_hat
+    from innovation1 import terminal_residual_correction
+    return terminal_residual_correction(state_x0, last_prediction, terminal_state, acquisition)
 
 
 def make_process(recorded_args):
@@ -160,8 +153,9 @@ def replay(args, manifest):
     if not traces:
         raise ValueError("Source has no cases")
     expected_count = min(recorded["full_test_samples"], recorded["args"]["max_samples"]) if recorded["args"]["max_samples"] else recorded["full_test_samples"]
+    case_multiplier = len(recorded["args"]["geometry_seeds"]) if recorded["args"].get("protocol") == "main_table" else 1
     expected = {(c, sample+1, case+1) for c in recorded["args"]["conditions"]
-                for sample in range(expected_count) for case in range(1 if c == "registered" else recorded["args"]["cases"])}
+                for sample in range(expected_count) for case in range(1 if c == "registered" else recorded["args"]["cases"]*case_multiplier)}
     identities = [(r["condition"], r["sample"], r["case"]) for r in traces]
     if set(identities) != expected or len(identities) != len(expected):
         raise ValueError("Source trace case coverage differs from its completed manifest")
@@ -218,6 +212,7 @@ def replay(args, manifest):
             raise AssertionError(f"Replayed terminal state differs from archive: {terminal_error:.6g}")
         corrected, delta_hat = correct_endpoint(tensors["state_x0"], tensors["last_prediction"], tensors["terminal_state"], acquisition)
         common = {"condition": trace["condition"], "sample": trace["sample"], "case": trace["case"],
+                  "geometry_seed": trace.get("geometry_seed"), "case_within_seed": trace.get("case_within_seed"),
                   "archive": str(archive_relative), "observed_sha256": trace["observed_sha256"]}
         if has_c:
             decompositions.extend({**common, **row} for row in check_decomposition(acquisition, tensors, corrected, delta_hat))
@@ -225,6 +220,11 @@ def replay(args, manifest):
         for name, prediction in endpoints.items():
             row = {**common, "output": name, **endpoint_metrics(prediction, gt, tensors["observed_lr_hsi"], tensors["hr_msi"],
                         acquisition, tensors["srf"], tensors["hr_valid_mask"], tensors["lr_valid_mask"], recorded["args"]["scale_ratio"])}
+            row["estimated_terminal_residual_L2"] = float(delta_hat.double().norm())
+            row["estimated_terminal_residual_RMS"] = float(delta_hat.double().square().mean().sqrt())
+            if recorded["args"].get("protocol") == "main_table":
+                from fixed_deformation_protocol import calc_metrics
+                row.update({"full_"+k:v for k,v in calc_metrics(prediction,gt,recorded["args"]["scale_ratio"]).items()})
             rows.append(row)
             print(f"CORRECTION {trace['condition']} sample={trace['sample']} case={trace['case']} {name} "
                   f"FULL_PSNR={row['full_PSNR']:.5f} FULL_SAM={row['full_SAM']:.5f} "
@@ -261,6 +261,9 @@ def replay(args, manifest):
                            "full_ERGAS_reduction": reference["full_ERGAS"]-corrected["full_ERGAS"],
                            "E_H_change": corrected["E_H"]-reference["E_H"], "E_M_change": corrected["E_M"]-reference["E_M"]})
     write_csv(output / "paired_changes.csv", paired)
+    from correction_validation_statistics import validation_reports
+    for name, report in validation_reports(rows).items():
+        write_csv(output / name, report)
     manifest.update(complete=True, decomposition_complete=all(r["independent_C_pred_available"] for r in provenance), summary=summary)
     write_json(output / "manifest.json", manifest)
     if not manifest["decomposition_complete"]:
@@ -282,7 +285,8 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     if args.overwrite_output:
         for name in ("summary.csv", "per_sample.csv", "paired_changes.csv", "corrected_decomposition.csv",
-                     "corrected_decomposition.json", "provenance.json"):
+                     "corrected_decomposition.json", "provenance.json", "validation_statistics.csv",
+                     "validation_per_seed.csv", "improvement_rates.csv", "gain_correlations.csv"):
             (output / name).unlink(missing_ok=True)
     manifest = {"complete": False, "protocol": "offline-terminal-residual-correction-v1", "args": vars(args),
                 "source_dir": str(source), "formal_output_changed": False,

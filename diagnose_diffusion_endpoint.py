@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from statistics import mean
 
@@ -22,7 +23,10 @@ def parse_args(argv=None):
     p.add_argument("--data_root", default="./data/raw")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=10)
-    p.add_argument("--cases", type=int, default=3)
+    p.add_argument("--cases", type=int, default=None)
+    p.add_argument("--protocol", choices=["legacy", "main_table"], default="legacy")
+    p.add_argument("--geometry_seeds", type=int, nargs="+", default=list(range(10001, 10011)))
+    p.add_argument("--eval_seed", type=int, default=1234)
     p.add_argument("--max_samples", type=int, default=1, help="0=full test split")
     p.add_argument("--conditions", nargs="+", choices=["registered", "warp"], default=["registered", "warp"])
     p.add_argument("--geometry_checkpoint", default="./checkpoints/PaviaU/PaviaU_recursive_k6_finalonly_500ep_lr1e4.pth")
@@ -49,6 +53,14 @@ def parse_args(argv=None):
     p.add_argument("--dry_run", action="store_true")
     p.set_defaults(stage="test", batch_size=1, num_workers=0)
     args = p.parse_args(argv)
+    if args.cases is None:
+        args.cases = 10 if args.protocol == "main_table" else 3
+    if not args.geometry_seeds or len(set(args.geometry_seeds)) != len(args.geometry_seeds) or min(args.geometry_seeds) < 0:
+        p.error("geometry_seeds must be distinct nonnegative integers")
+    if args.protocol == "main_table" and (args.test_size, args.patch_size, args.stride, args.scale_ratio,
+            args.mtf_nyquist, args.psf_truncate, args.max_translation, args.max_rotation_deg,
+            args.max_local_px, args.control_grid, args.min_jacobian) != (128,64,32,4,.2,3.,4.,2.,4.,5,.5):
+        p.error("main_table requires the existing fixed benchmark settings")
     if args.cases < 1 or args.max_samples < 0 or min(args.geometry_steps, args.diffusion_steps) < 1:
         p.error("cases and steps must be positive; max_samples must be nonnegative")
     if len(set(args.conditions)) != len(args.conditions):
@@ -279,35 +291,57 @@ def run_diagnostic(args, test_set, process, diffusion, estimate, srf, device, re
             h, w = gt.shape[-2:]
             # Exactly the legacy random evaluation sampler: reset per patch.
             generator = pipeline._make_generator(device, args.seed + 70000)
-            for case in range(1 if condition == "registered" else args.cases):
-                if condition == "registered":
-                    truth_rigid = gt.new_zeros((1, 3))
-                    truth_local = gt.new_zeros((1, 2, h, w))
-                    observed = process.terminal_observation(gt)
-                    rigid, local, acquisition = truth_rigid, truth_local, process
-                else:
-                    truth = sample_synthetic_geometry(h, w, device=device, dtype=gt.dtype,
-                        generator=generator, max_translation=args.max_translation,
-                        max_rotation_deg=args.max_rotation_deg, max_local_px=args.max_local_px,
-                        control_grid=args.control_grid, min_jacobian=args.min_jacobian)
-                    truth_rigid = torch.stack([truth.dx, truth.dy, truth.theta_deg], dim=1)
-                    truth_local = truth.local_field
-                    observed = pipeline._process_from_geometry(process, truth).terminal_observation(gt)
-                    rigid, local = estimate(observed, msi)
-                    acquisition = pipeline._process_from_estimate(process, rigid, local)
-                hr_mask, lr_mask, margin = valid_masks(process, truth_rigid, truth_local, rigid, local)
-                collector = None
-                if args.error_decomposition:
-                    from diffusion_error_decomposition import PredictionErrorCollector
-                    collector = PredictionErrorCollector(acquisition, gt, hr_mask,
-                                                         save_step_errors=args.save_step_errors)
-                pair = reconstruct_pair(diffusion, acquisition, observed, target_size=(h, w), hr_msi=msi,
-                                        step_observer=collector.observe if collector is not None else None)
-                # GT used only after reconstruction for diagnostic scoring/offset audit.
-                delta = pair["terminal_state"] - acquisition.state_at(gt, acquisition.total_steps)
-                endpoints = {key: pair[key] for key in ("state_x0", "last_prediction")}
-                if refiner is not None:
-                    endpoints["state_x0_refined"] = refine(pair["state_x0"], msi, observed, acquisition)
+            total_cases = args.cases * (len(args.geometry_seeds) if args.protocol == "main_table" else 1)
+            for case in range(1 if condition == "registered" else total_cases):
+                geometry_seed, local_case, reconstruction_seed = None, case, None
+                if args.protocol == "main_table":
+                    from multiseed_deformation_protocol import sample_geometry, reconstruction_rng, private_seed
+                    geometry_seed = args.geometry_seeds[case // args.cases] if condition == "warp" else None
+                    local_case = case % args.cases if condition == "warp" else 0
+                    reconstruction_seed = private_seed("reconstruction", args.eval_seed, sample, local_case)
+                rng_context = reconstruction_rng(device, reconstruction_seed) if args.protocol == "main_table" else nullcontext()
+                with rng_context:
+                    if condition == "registered":
+                        truth_rigid = gt.new_zeros((1, 3))
+                        truth_local = gt.new_zeros((1, 2, h, w))
+                        observed = process.terminal_observation(gt)
+                        rigid, local, acquisition = truth_rigid, truth_local, process
+                    elif args.protocol == "main_table":
+                        from cdrdi_geometry import SyntheticGeometry
+                        from fixed_deformation_protocol import warp_hsi
+                        phi, _ = sample_geometry(h, w, geometry_seed=geometry_seed, sample_index=sample,
+                            case_index=local_case, max_translation=args.max_translation,
+                            max_rotation_deg=args.max_rotation_deg, max_local_px=args.max_local_px,
+                            control_grid=args.control_grid, min_jacobian=args.min_jacobian)
+                        truth = SyntheticGeometry(**{k: v.to(gt) for k,v in vars(phi).items()})
+                        truth_rigid = torch.stack([truth.dx, truth.dy, truth.theta_deg], dim=1)
+                        truth_local = truth.local_field
+                        observed = process.operator.degrade(warp_hsi(gt, truth))
+                        rigid, local = estimate(observed, msi)
+                        acquisition = pipeline._process_from_estimate(process, rigid, local)
+                    else:
+                        truth = sample_synthetic_geometry(h, w, device=device, dtype=gt.dtype,
+                            generator=generator, max_translation=args.max_translation,
+                            max_rotation_deg=args.max_rotation_deg, max_local_px=args.max_local_px,
+                            control_grid=args.control_grid, min_jacobian=args.min_jacobian)
+                        truth_rigid = torch.stack([truth.dx, truth.dy, truth.theta_deg], dim=1)
+                        truth_local = truth.local_field
+                        observed = pipeline._process_from_geometry(process, truth).terminal_observation(gt)
+                        rigid, local = estimate(observed, msi)
+                        acquisition = pipeline._process_from_estimate(process, rigid, local)
+                    hr_mask, lr_mask, margin = valid_masks(process, truth_rigid, truth_local, rigid, local)
+                    collector = None
+                    if args.error_decomposition:
+                        from diffusion_error_decomposition import PredictionErrorCollector
+                        collector = PredictionErrorCollector(acquisition, gt, hr_mask,
+                                                             save_step_errors=args.save_step_errors)
+                    pair = reconstruct_pair(diffusion, acquisition, observed, target_size=(h, w), hr_msi=msi,
+                                            step_observer=collector.observe if collector is not None else None)
+                    # GT used only after reconstruction for diagnostic scoring/offset audit.
+                    delta = pair["terminal_state"] - acquisition.state_at(gt, acquisition.total_steps)
+                    endpoints = {key: pair[key] for key in ("state_x0", "last_prediction")}
+                    if refiner is not None:
+                        endpoints["state_x0_refined"] = refine(pair["state_x0"], msi, observed, acquisition)
                 stem = f"{condition}/sample{sample+1:04d}_case{case+1:03d}"
                 archive = output / (stem + ".npz")
                 archive.parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +357,8 @@ def run_diagnostic(args, test_set, process, diffusion, estimate, srf, device, re
                     tensors.update(diagnostic_tensors)
                 np.savez_compressed(archive, **{k: v.detach().cpu().numpy() for k, v in tensors.items()})
                 common = {"condition": condition, "sample": sample+1, "case": case+1,
+                          "geometry_seed": geometry_seed, "case_within_seed": local_case+1,
+                          "reconstruction_seed": reconstruction_seed,
                           "archive": str(archive.relative_to(output)),
                           "gt_sha256": tensor_hash(gt), "msi_sha256": tensor_hash(msi),
                           "observed_sha256": tensor_hash(observed), "mask_margin_hr": margin}
@@ -348,6 +384,9 @@ def run_diagnostic(args, test_set, process, diffusion, estimate, srf, device, re
                 for name, prediction in endpoints.items():
                     row = {**common, "output": name, **endpoint_metrics(prediction, gt, observed, msi,
                                acquisition, srf, hr_mask, lr_mask, args.scale_ratio)}
+                    if args.protocol == "main_table":
+                        from fixed_deformation_protocol import calc_metrics
+                        row.update({"full_"+k:v for k,v in calc_metrics(prediction,gt,args.scale_ratio).items()})
                     rows.append(row)
                     print(f"ENDPOINT {condition} sample={sample+1} case={case+1} {name} "
                           f"ROI_PSNR={row['PSNR']:.5f} ROI_SAM={row['SAM']:.5f} "
@@ -425,7 +464,8 @@ def main(argv=None):
                 "source_commit": source_commit, "torch_version": str(torch.__version__),
                 "checkpoints": records, "srf_sha256": tensor_hash(srf),
                 "test_protocol": str(info.get("protocol", "")), "full_test_samples": len(test_loader.dataset),
-                "random_geometry": "legacy sampler; seed+70000 reset per patch; no identity mixture or strength scaling",
+                "random_geometry": ("main-table-random-geometry-10x10-v1; exact shared CPU sampler and reconstruction RNG"
+                                    if args.protocol == "main_table" else "legacy sampler; seed+70000 reset per patch; no identity mixture or strength scaling"),
                 "registered": "same adapted diffusion checkpoint; identity acquisition; bypass CDRDI as production REGISTERED does",
                 "scoring": "PSNR/SAM clipped [0,1]; ERGAS raw (eps=1e-8); common HR support. full_* uses repository metrics.py on full image",
                 "observation_residuals": "E_H/E_M: un-clipped RMS over all valid channel-pixel elements, not a physics guarantee",

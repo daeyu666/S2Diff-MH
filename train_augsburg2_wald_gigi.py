@@ -21,6 +21,7 @@ from augsburg_real_process import build_augsburg_real_process
 from cdrdi_geometry import forward_warp, spectral_project
 from config import TrainConfig
 from innovation1 import reconstruct_from_terminal_lr
+from diffusion_output_mode import MODES, output_mode, mode_stem, check_checkpoint_mode
 from main import build_model
 from models import (
     HeterogeneityGuidedSpectralRefiner,
@@ -71,6 +72,7 @@ def parse_args():
     p.add_argument("--from_scratch", action="store_true", help="Randomly initialize GIGI for Wald-E")
     p.add_argument("--refiner_checkpoint", default="")
     p.add_argument("--resume", default="")
+    p.add_argument("--diffusion_output", choices=MODES, default="state")
     p.add_argument("--checkpoint_root", default="./checkpoints/augsburg_real")
     p.add_argument("--log_root", default="./logs/augsburg_real")
     p.add_argument("--save_name", default="Augsburg2_Wald_center_E_A_gigi_full")
@@ -113,7 +115,9 @@ def parse_args():
     p.add_argument("--monitor", choices=["ref_sam_high", "ref_sam", "ref_psnr"], default="ref_sam_high")
     p.add_argument("--eval_interval", type=int, default=5)
     p.add_argument("--save_interval", type=int, default=10)
-    return p.parse_args()
+    args = p.parse_args()
+    args.save_name = mode_stem(args.save_name, output_mode(args))
+    return args
 
 
 def _diffusion_config(args):
@@ -308,6 +312,7 @@ def _base_bundle(
     base = reconstruct_from_terminal_lr(
         diffusion, process, y_h,
         target_size=tuple(gt_ref.shape[-2:]), hr_msi=y_m,
+        output_mode=output_mode(args),
     )
     r_phy = _physical_residual(process, projector, y_h, base)
     heterogeneity = ranked_msi_heterogeneity(y_m)
@@ -769,6 +774,7 @@ def _validate_e_checkpoint(args, path):
     except TypeError:
         state = torch.load(path, map_location="cpu")
     extra = state.get("extra", {})
+    check_checkpoint_mode(state, output_mode(args))
     for key in (
         "training_entrypoint", "wald_protocol_id", "test_bbox_30m",
         "geometry_mode", "geometry_checkpoint", "diffusion_checkpoint",

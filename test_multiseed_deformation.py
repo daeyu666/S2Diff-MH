@@ -37,6 +37,7 @@ def parse_args(argv=None):
         name = f"{args.variant}_{len(args.geometry_seeds)}seeds_{args.cases}cases_{tag}_eval{args.eval_seed}"
         if args.max_samples:
             name += f"_SMOKE{args.max_samples}"
+        name = pipeline.mode_stem(name, pipeline.output_mode(args))
         args.output_dir = str(Path("outputs/multiseed_deformation") / args.dataset / name)
     return args
 

@@ -61,6 +61,7 @@ def build_predictor(args, info, base_process, device, *, include_registered=Fals
         base = pipeline.reconstruct_from_terminal_lr(
             diffusion_model, process, lr_hsi, target_size=tuple(hr_msi.shape[-2:]),
             hr_msi=hr_msi,
+            output_mode=pipeline.output_mode(args),
         )
         residual = pipeline._physical_residual(process, projector, lr_hsi, base)
         heterogeneity = pipeline.ranked_msi_heterogeneity(hr_msi)
@@ -72,6 +73,7 @@ def build_predictor(args, info, base_process, device, *, include_registered=Fals
         base = pipeline.reconstruct_from_terminal_lr(
             diffusion_model, base_process, lr_hsi,
             target_size=tuple(hr_msi.shape[-2:]), hr_msi=hr_msi,
+            output_mode=pipeline.output_mode(args),
         )
         residual = pipeline._physical_residual(base_process, projector, lr_hsi, base)
         return refiner(base, hr_msi, residual, pipeline.ranked_msi_heterogeneity(hr_msi))

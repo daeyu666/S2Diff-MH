@@ -1,5 +1,9 @@
 # PaviaU diffusion endpoint diagnostic
 
+For the separate last-step terminal residual correction experiment, see
+[TERMINAL_RESIDUAL_CORRECTION.md](TERMINAL_RESIDUAL_CORRECTION.md). It can replay
+these saved archives without another model inference or training run.
+
 This is a diagnostic of **existing frozen weights**, not a training change.
 `innovation1.py`, the default inference return value, all training trajectories,
 and HPGC training remain unchanged. The script retains both outputs from one

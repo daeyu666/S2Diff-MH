@@ -17,21 +17,25 @@ import sys
 from pathlib import Path
 
 import torch
+from diffusion_output_mode import mode_stem
+from models import build_terminal_refiner
 
 
 METRICS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
 TRAIN_VARIANTS = {
     "gigi_phy": "PaviaU_HPGC_wo_Heterogeneity",
     "gigi_hetero": "PaviaU_HPGC_wo_PhysResidual",
+    "residual": "PaviaU_HPGC_Residual_Matched",
 }
 LABELS = {
     "gigi_phy": "w/o Heterogeneity",
     "gigi_hetero": "w/o Phys. Residual",
     "full": "Full Model",
+    "residual": "Residual Refiner (matched)",
 }
 
 
-def parser():
+def parser(argv=None):
     p = argparse.ArgumentParser(description="PaviaU registered HPGC ablation")
     p.add_argument("--stage", choices=("train", "test", "all"), required=True)
     p.add_argument("--data_root", default="./data/raw")
@@ -40,9 +44,15 @@ def parser():
     p.add_argument("--log_dir", default="./logs/ablation_hpgc")
     p.add_argument("--result_dir", default="./results/ablation_hpgc")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--variants", nargs="+", choices=tuple(TRAIN_VARIANTS), default=list(TRAIN_VARIANTS),
+                   help="Train/test only the selected controls; Full reference is always tested")
+    p.add_argument("--full_checkpoint", type=Path, help="Registered Full refiner supplying the matched training configuration")
+    p.add_argument("--baseline_checkpoint", type=Path, help="Override the frozen registered diffusion path")
+    p.add_argument("--diffusion_output", choices=("state", "terminal_correction"),
+                   help="Default: mode recorded in Full checkpoint; mismatches are rejected")
     p.add_argument("--overwrite_run", action="store_true")
     p.add_argument("--dry_run", action="store_true")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def load_full(path):
@@ -57,6 +67,8 @@ def load_full(path):
         raise ValueError("Full HPGC checkpoint lacks experiment metadata")
     if metadata.get("dataset", "PaviaU") != "PaviaU":
         raise ValueError("Full model was not trained on PaviaU")
+    if "geometry_checkpoint" in metadata or "diffusion_checkpoint" in metadata:
+        raise ValueError("Use the independently registered Full checkpoint for this registered ablation")
     return metadata
 
 
@@ -65,6 +77,7 @@ def shared_cli(cfg, args, baseline_path):
         ("dataset", "PaviaU"),
         ("data_root", args.data_root),
         ("device", args.device),
+        ("diffusion_output", cfg.get("diffusion_output", "state")),
         ("baseline_checkpoint", baseline_path),
         ("baseline_checkpoint_type", cfg.get("baseline_checkpoint_type", "legacy")),
         ("patch_size", cfg.get("patch_size", 64)),
@@ -119,9 +132,8 @@ def execute(cmd, *, dry_run=False, capture=False):
 
 
 def ablation_script():
-    script = Path("train_innovation3_gigi_ablation.py")
-    if script.is_file():
-        return script
+    # Prefer the maintained entrypoint: older local ablation copies may not
+    # implement residual or corrected diffusion-output routing.
     script = Path("train_innovation3_gigi.py")
     if not script.is_file():
         raise FileNotFoundError("Missing registered GIGI training script")
@@ -150,7 +162,8 @@ def extract_metrics(output, prefix):
 def train(args, cfg, cli, script):
     args.ablation_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     args.log_dir.mkdir(parents=True, exist_ok=True)
-    for variant, stem in TRAIN_VARIANTS.items():
+    for variant in dict.fromkeys(args.variants):
+        stem = TRAIN_VARIANTS[variant]
         cmd = [sys.executable, str(script), "--stage", "train",
                "--variant", variant, *cli,
                "--checkpoint_root", str(args.ablation_checkpoint_dir),
@@ -161,14 +174,35 @@ def train(args, cfg, cli, script):
         execute(cmd, dry_run=args.dry_run)
 
 
+def _parameter_counts(cfg, full_path, variants):
+    state = torch.load(full_path, map_location="cpu", weights_only=False)
+    payload = state["model"]
+    bands = payload["hsi_encoder.net.0.weight"].shape[1]
+    msi_bands = payload["msi_encoder.net.0.weight"].shape[1]
+    kwargs = dict(n_bands=bands, n_msi_bands=msi_bands,
+                  hidden_channels=cfg.get("refine_hidden", 64), heads=cfg.get("heads", 4),
+                  tangent_output=not cfg.get("disable_tangent", False))
+    counts, reports = {}, {}
+    for variant in ("full", *dict.fromkeys(variants)):
+        model = build_terminal_refiner(variant=variant, **kwargs)
+        if variant == "full":
+            model.load_state_dict(payload, strict=True)
+        counts[variant] = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if variant == "residual":
+            reports[variant] = model.parameter_report()
+    return counts, reports
+
+
 def test(args, cfg, cli, script, full_path):
     check_metrics_capable(script)
     args.log_dir.mkdir(parents=True, exist_ok=True)
     args.result_dir.mkdir(parents=True, exist_ok=True)
     rows = []
-    for variant in ("full", "gigi_phy", "gigi_hetero"):
+    counts, parameter_reports = _parameter_counts(cfg, full_path, args.variants)
+    for variant in ("full", *dict.fromkeys(args.variants)):
         checkpoint = (full_path if variant == "full"
-                      else args.ablation_checkpoint_dir / (TRAIN_VARIANTS[variant] + ".pth"))
+                      else args.ablation_checkpoint_dir /
+                      (mode_stem(TRAIN_VARIANTS[variant], cfg.get("diffusion_output", "state")) + ".pth"))
         if not args.dry_run and not checkpoint.is_file():
             raise FileNotFoundError(str(checkpoint))
         cmd = [sys.executable, str(script), "--stage", "test",
@@ -180,18 +214,25 @@ def test(args, cfg, cli, script, full_path):
         (args.log_dir / f"test_{variant}.log").write_text(output, encoding="utf-8")
         if variant == "full":
             rows.append({"Variant": "w/o Refiner",
+                         "Params_refiner": 0,
                          **extract_metrics(output, "BASE_FULL_METRICS")})
         rows.append({"Variant": LABELS[variant],
+                     "Params_refiner": counts[variant],
                      **extract_metrics(output, "FULL_METRICS")})
 
     if args.dry_run:
         return
-    order = ("w/o Refiner", "w/o Heterogeneity",
+    order = ("w/o Refiner", "Residual Refiner (matched)", "w/o Heterogeneity",
              "w/o Phys. Residual", "Full Model")
-    rows.sort(key=lambda row: order.index(row["Variant"]))
-    csv_path = args.result_dir / "PaviaU_HPGC_Registered_Ablation.csv"
+    csv_path = args.result_dir / (mode_stem("PaviaU_HPGC_Registered_Ablation", cfg.get("diffusion_output", "state")) + ".csv")
+    saved = {}
+    if csv_path.is_file():
+        with csv_path.open(newline="", encoding="utf-8-sig") as old:
+            saved = {row["Variant"]: row for row in csv.DictReader(old)}
+    saved.update({row["Variant"]: row for row in rows})
+    rows = sorted(saved.values(), key=lambda row: order.index(row["Variant"]))
     with csv_path.open("w", newline="", encoding="utf-8") as out:
-        writer = csv.DictWriter(out, fieldnames=["Variant", *METRICS])
+        writer = csv.DictWriter(out, fieldnames=["Variant", "Params_refiner", *METRICS])
         writer.writeheader()
         writer.writerows(rows)
     json_path = csv_path.with_suffix(".json")
@@ -199,27 +240,39 @@ def test(args, cfg, cli, script, full_path):
         "dataset": "PaviaU", "registration": "registered",
         "refiner": "HPGC-Refiner", "results": rows,
         "full_checkpoint": str(full_path),
+        "diffusion_output": cfg.get("diffusion_output", "state"),
+        "configuration": cfg,
+        "parameter_matching": parameter_reports,
     }, indent=2), encoding="utf-8")
     print("\n=== PAVIAU REGISTERED HPGC ABLATION ===")
     for row in rows:
         print(f"{row['Variant']:<21} " +
-              " ".join(f"{metric}={row[metric]:.6f}" for metric in METRICS))
+              " ".join(f"{metric}={float(row[metric]):.6f}" for metric in METRICS))
     print("CSV:", csv_path)
     print("JSON:", json_path)
 
 
-def main():
-    a = parser()
+def main(argv=None):
+    a = parser(argv)
     a.checkpoint_dir = Path(a.checkpoint_dir)
     a.ablation_checkpoint_dir = Path(a.ablation_checkpoint_dir)
     a.log_dir = Path(a.log_dir)
     a.result_dir = Path(a.result_dir)
 
-    full = a.checkpoint_dir / "PaviaU_innovation3_gigi_full.pth"
-    baseline = a.checkpoint_dir / "PaviaU_innovation1_physical_raw_direct.pth"
-    if not full.is_file() or not baseline.is_file():
-        raise FileNotFoundError(f"Expected migrated checkpoints: {baseline}; {full}")
+    full = a.full_checkpoint or a.checkpoint_dir / "PaviaU_innovation3_gigi_full.pth"
+    if not full.is_file():
+        raise FileNotFoundError(full)
     cfg = load_full(full)
+    if a.diffusion_output is not None and a.diffusion_output != cfg.get("diffusion_output", "state"):
+        raise ValueError("diffusion_output differs from the Full checkpoint; compare refiners trained on the same output mode")
+    if a.baseline_checkpoint:
+        baseline = a.baseline_checkpoint
+    elif cfg.get("baseline_checkpoint") and Path(cfg["baseline_checkpoint"]).is_file():
+        baseline = Path(cfg["baseline_checkpoint"])
+    else:
+        baseline = a.checkpoint_dir / "PaviaU_innovation1_physical_raw_direct.pth"
+    if not baseline.is_file():
+        raise FileNotFoundError(f"Frozen diffusion checkpoint missing: {baseline}")
     shared = shared_cli(cfg, a, str(baseline))
     script = ablation_script()
     print("HPGC ABLATION PaviaU registered; physical diffusion frozen")

@@ -15,6 +15,7 @@ physical-residual ablation where repeated in-loop injection was inferior.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from typing import Dict, Iterable, List, Tuple
@@ -32,13 +33,14 @@ from models import (
     HeterogeneityGuidedSpectralRefiner,
     RawMSIDirectPredictor,
     TerminalGIGISpectralRefiner,
+    build_terminal_refiner,
     load_legacy_raw_direct_checkpoint,
     ranked_msi_heterogeneity,
 )
 from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, set_seed
 
 
-VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full")
+VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full", "residual")
 
 
 def parse_args(argv=None):
@@ -210,7 +212,7 @@ def _build_projector(args, info, device):
 
 
 def _build_refiner(args, info, device):
-    model = TerminalGIGISpectralRefiner(
+    model = build_terminal_refiner(
         n_bands=info["n_bands"],
         n_msi_bands=info["n_msi_bands"],
         hidden_channels=args.refine_hidden,
@@ -219,6 +221,8 @@ def _build_refiner(args, info, device):
         tangent_output=not args.disable_tangent,
     ).to(device)
     model.diffusion_output_mode = output_mode(args)
+    if args.variant == "residual":
+        print("RESIDUAL_PARAMETER_MATCH", json.dumps(model.parameter_report()), flush=True)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"REFINER variant={args.variant} hidden={args.refine_hidden} heads={args.heads} "
@@ -276,6 +280,7 @@ def _save_checkpoint(model, optimizer, epoch, best_high_sam, path, args):
             "epoch": int(epoch),
             "best_high_sam": float(best_high_sam),
             "variant": model.variant,
+            "refiner_parameter_match": model.parameter_report() if model.variant == "residual" else None,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "extra": vars(args),
@@ -574,7 +579,7 @@ def train(args):
     print(
         "TRAINING_POLICY diffusion=frozen terminal_refinement=one_shot "
         f"diffusion_output={output_mode(args)} "
-        "heterogeneity_role=query_not_gain "
+        f"heterogeneity_role={'concat_input' if args.variant == 'residual' else 'query_not_gain'} "
         "physical_residual=U_T[Y_H-D_T(X_hat)]_C4L_tangent"
     )
     print(

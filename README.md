@@ -544,3 +544,12 @@ without CDRDI or HPGC-Refiner.
 The CDRDI iteration ablation table includes EPE and EPE95 in HR pixels alongside PSNR/SAM.
 Existing completed runs can regenerate the table with `--summarize_only`, without inference.
 See [CDRDI_ABLATION_EPE.md](CDRDI_ABLATION_EPE.md) for the exact case/patch averaging definition and command.
+
+## Parameter-matched ordinary Residual Refiner
+
+Both registered and mixed refiner entrypoints support `--variant residual`.
+The ordinary convolutional residual control receives the same four inputs and output constraint;
+its active trainable parameter count exactly matches default Full HPGC (544,431 on PaviaU).
+Use `run_paviau_hpgc_ablation.py --stage all --variants residual --full_checkpoint ...`
+to inherit the reference training budget and add the control to the ablation CSV.
+See [RESIDUAL_REFINER_CONTROL.md](RESIDUAL_REFINER_CONTROL.md) for commands and initialization requirements.

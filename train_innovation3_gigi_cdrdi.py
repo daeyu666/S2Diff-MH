@@ -25,6 +25,7 @@ CDRDI output distribution.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 from statistics import mean
@@ -51,6 +52,7 @@ from metrics import MetricAverager, calc_metrics
 from models import (
     HeterogeneityGuidedSpectralRefiner,
     TerminalGIGISpectralRefiner,
+    build_terminal_refiner,
     ranked_msi_heterogeneity,
 )
 from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
@@ -58,7 +60,7 @@ from train_cdrdi_diffusion_oracle import sample_training_geometry
 from utils import CSVLogger, ensure_dir, get_device, load_checkpoint, set_seed
 
 
-VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full")
+VARIANTS = ("conv", "gigi", "gigi_hetero", "gigi_phy", "full", "residual")
 METRIC_KEYS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
 
 
@@ -221,10 +223,14 @@ def _resolve_dataset_checkpoints(args):
             f"{dataset}_estimated_deform_diffusion_k9_stage2d_A.pth"
         )
     if not args.init_refiner_checkpoint and not getattr(args, "from_scratch", False):
-        args.init_refiner_checkpoint = (
-            f"./checkpoints/innovation3_gigi/"
-            f"{dataset}_innovation3_gigi_full.pth"
-        )
+        if args.variant == "residual":
+            stem = mode_stem(f"{dataset}_innovation3_gigi_residual", output_mode(args))
+            args.init_refiner_checkpoint = f"./checkpoints/innovation3_gigi/{stem}.pth"
+        else:
+            args.init_refiner_checkpoint = (
+                f"./checkpoints/innovation3_gigi/"
+                f"{dataset}_innovation3_gigi_full.pth"
+            )
     return args
 
 
@@ -396,7 +402,7 @@ def _build_projector(args, info, device):
 
 
 def _build_refiner(args, info, device):
-    model = TerminalGIGISpectralRefiner(
+    model = build_terminal_refiner(
         n_bands=info["n_bands"],
         n_msi_bands=info["n_msi_bands"],
         hidden_channels=args.refine_hidden,
@@ -405,6 +411,8 @@ def _build_refiner(args, info, device):
         tangent_output=not args.disable_tangent,
     ).to(device)
     model.diffusion_output_mode = output_mode(args)
+    if args.variant == "residual":
+        print("RESIDUAL_PARAMETER_MATCH", json.dumps(model.parameter_report()), flush=True)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
         f"REFINER variant={args.variant} hidden={args.refine_hidden} heads={args.heads} "
@@ -486,6 +494,7 @@ def _save_checkpoint(model, optimizer, epoch, best_value, path, args):
             "best_metric": float(best_value),
             "monitor": args.monitor,
             "variant": model.variant,
+            "refiner_parameter_match": model.parameter_report() if model.variant == "residual" else None,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "extra": vars(args),
@@ -965,7 +974,8 @@ def train(args):
     sam_fn = SAMLoss()
     train_generator = _make_generator(device, args.seed + 93000)
     print(
-        "TRAINING_POLICY geometry=frozen diffusion=frozen terminal_GIGI_only "
+        "TRAINING_POLICY geometry=frozen diffusion=frozen terminal_refiner_only "
+        f"variant={args.variant} "
         f"geometry_steps={args.geometry_steps} init_registered_GIGI={init_from_registered}"
     )
     print(

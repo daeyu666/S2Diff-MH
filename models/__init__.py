@@ -16,6 +16,7 @@ from .innovation3_gigi_refiner import (
     GlobalInterGuidedInteraction,
     TerminalGIGISpectralRefiner,
 )
+from .residual_refiner import ParameterMatchedResidualRefiner, build_terminal_refiner
 
 __all__ = [
     "CleanHSIPredictor",
@@ -30,4 +31,6 @@ __all__ = [
     "ranked_msi_heterogeneity",
     "GlobalInterGuidedInteraction",
     "TerminalGIGISpectralRefiner",
+    "ParameterMatchedResidualRefiner",
+    "build_terminal_refiner",
 ]

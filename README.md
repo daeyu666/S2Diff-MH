@@ -529,3 +529,12 @@ separate Sentinel-2A V4.0 resource; the two protocols are not mixed.
 以及10个形变种子×每个种子每个test patch 10个case的Warp mean±std。
 与comparison_experiments使用同一套CPU形变/指标/统计代码，支持完成种子的续跑。
 完整命令与新旧协议区别见 [MULTISEED_MAIN_TABLE_TEST.md](MULTISEED_MAIN_TABLE_TEST.md)。
+
+## Matched-backbone reconstruction controls
+
+Single-step Direct Reconstruction and endpoint-matched Generic Cold Diffusion are available through
+`train_reconstruction_controls.py`. They share the Raw-MSI Direct backbone, observations, losses and
+training budget; optional `physical_cold` runs the matched physical reference through the same engine.
+See [RECONSTRUCTION_CONTROLS.md](RECONSTRUCTION_CONTROLS.md) for the exact boundary definition,
+training/test commands and the combined result CSV. These controls evaluate the diffusion backbone
+without CDRDI or HPGC-Refiner.

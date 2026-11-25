@@ -538,3 +538,9 @@ training budget; optional `physical_cold` runs the matched physical reference th
 See [RECONSTRUCTION_CONTROLS.md](RECONSTRUCTION_CONTROLS.md) for the exact boundary definition,
 training/test commands and the combined result CSV. These controls evaluate the diffusion backbone
 without CDRDI or HPGC-Refiner.
+
+## CDRDI deformation-estimation EPE metrics
+
+The CDRDI iteration ablation table includes EPE and EPE95 in HR pixels alongside PSNR/SAM.
+Existing completed runs can regenerate the table with `--summarize_only`, without inference.
+See [CDRDI_ABLATION_EPE.md](CDRDI_ABLATION_EPE.md) for the exact case/patch averaging definition and command.

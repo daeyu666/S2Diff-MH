@@ -33,9 +33,19 @@ from utils import get_device, load_checkpoint, set_seed
 
 
 METRICS = ("PSNR", "SSIM", "ERGAS", "SAM", "CC", "RMSE")
+GEOMETRY_METRIC_DEFINITION = {
+    "units": "HR pixels",
+    "coordinates": "full forward acquisition sampling coordinates: local deformation followed by rigid motion",
+    "pixel_error": "sqrt((pred_x-gt_x)^2 + (pred_y-gt_y)^2)",
+    "EPE": "mean pixel_error over the full HR test-patch grid",
+    "EPE95": "95th percentile of pixel_error within each deformation case, torch.quantile interpolation=linear",
+    "domain": "all HR patch pixels; sampling coordinates are not clipped at image boundaries",
+    "aggregation": "equal-weight mean over cases within each patch, then equal-weight mean over patches; EPE95 is not a pooled percentile",
+    "source_fields": {"EPE": "EPE_mean_px", "EPE95": "EPE_p95_px"},
+}
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="PaviaU unregistered independent one-shot vs recursive CDRDI ablation"
     )
@@ -91,7 +101,9 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--overwrite_output", action="store_true")
     p.add_argument("--dry_run", action="store_true")
-    return p.parse_args()
+    p.add_argument("--summarize_only", action="store_true",
+                   help="Add EPE/EPE95 to summary.csv using existing manifest.json; no model/data loading")
+    return p.parse_args(argv)
 
 
 def _read_checkpoint(path: Path):
@@ -240,6 +252,7 @@ def _geometry_metrics(
     height: int,
     width: int,
 ):
+    """Full composed forward-field error, in HR pixels (no coordinate clipping)."""
     gt_x, gt_y = sampling_coordinates(
         height, width, gt_phi.dx, gt_phi.dy, gt_phi.theta_deg, gt_phi.local_field
     )
@@ -286,10 +299,59 @@ def _write_csv(path: Path, rows: List[Dict[str, object]]):
     if not rows:
         return
     fields = list(dict.fromkeys(key for row in rows for key in row))
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+    tmp.replace(path)
+
+
+def _paper_rows(summary_rows):
+    if not summary_rows:
+        raise ValueError("No completed ablation summary rows")
+    rows = []
+    variants = set()
+    for row in summary_rows:
+        if row.get("Variant") in variants or not row.get("Variant"):
+            raise ValueError("Missing or duplicate Variant in ablation summary")
+        variants.add(row["Variant"])
+        try:
+            paper = {"Variant": row["Variant"], "PSNR": float(row["PSNR"]), "SAM": float(row["SAM"]),
+                     "EPE": float(row["EPE_mean_px"]), "EPE95": float(row["EPE_p95_px"])}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Stored summary lacks valid PSNR/SAM/EPE_mean_px/EPE_p95_px; cannot recover EPE without geometry records") from exc
+        if not all(math.isfinite(value) for key, value in paper.items() if key != "Variant"):
+            raise ValueError("Nonfinite metrics in stored ablation summary")
+        if paper["EPE"] < 0 or paper["EPE95"] < 0:
+            raise ValueError("Negative endpoint error in stored ablation summary")
+        rows.append(paper)
+    return rows
+
+
+def _print_paper_rows(rows):
+    for row in rows:
+        print(f"{row['Variant']:<24} PSNR={row['PSNR']:.6f} SAM={row['SAM']:.6f} "
+              f"EPE={row['EPE']:.6f}px EPE95={row['EPE95']:.6f}px")
+
+
+def summarize_existing(output):
+    """Recover already-computed geometry metrics without re-running inference."""
+    output = Path(output)
+    path = output / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("protocol_id") != "PaviaU-CDRDI-iteration-ablation-v1":
+        raise ValueError(f"Not a CDRDI iteration-ablation manifest: {path}")
+    rows = _paper_rows(manifest.get("summary"))
+    if len(rows) != len(manifest["depth_diagnostics"]) + 2:
+        raise ValueError("Stored manifest does not contain all declared ablation conditions")
+    _write_csv(output / "summary.csv", rows)
+    (output / "epe_metric_definition.json").write_text(
+        json.dumps(GEOMETRY_METRIC_DEFINITION, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _print_paper_rows(rows)
+    print("CSV:", output / "summary.csv")
+    print("Recovered stored geometry metrics; no checkpoints or data loaded.")
+    return rows
 
 
 @torch.no_grad()
@@ -539,12 +601,7 @@ def run(args):
             "SAM_reduction_vs_recursive_deg": float(recursive_reference["SAM"]) - numeric["SAM"],
         })
 
-    # The main ablation table intentionally reports reconstruction metrics
-    # only. Geometry EPE/closure diagnostics remain in per_patch.csv/cases.jsonl.
-    paper_rows = [
-        {"Variant": row["Variant"], "PSNR": row["PSNR"], "SAM": row["SAM"]}
-        for row in summary_rows
-    ]
+    paper_rows = _paper_rows(summary_rows)
     _write_csv(output / "summary.csv", paper_rows)
     _write_csv(output / "per_patch.csv", patch_summaries)
     manifest = {
@@ -560,6 +617,7 @@ def run(args):
         "same_observation_per_case": True,
         "geometry_sampler": "sample_synthetic_geometry; seed reset to seed+70000 per test patch",
         "aggregation": "mean over cases within each patch, then equal-weight mean over test patches",
+        "geometry_metrics": GEOMETRY_METRIC_DEFINITION,
         "args": vars(args),
         "checkpoints": checkpoint_info,
         "summary": summary_rows,
@@ -570,20 +628,19 @@ def run(args):
     )
 
     print("\n=== PAVIAU CDRDI ITERATION ABLATION SUMMARY ===")
-    for row in summary_rows:
-        print(
-            f"{row['Variant']:<24} "
-            f"PSNR={float(row['PSNR']):.6f} "
-            f"SAM={float(row['SAM']):.6f}"
-        )
+    _print_paper_rows(paper_rows)
     print("CSV:", output / "summary.csv")
     print("Per-patch CSV:", output / "per_patch.csv")
     print("Case details:", case_path)
     print("Manifest:", output / "manifest.json")
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
+    if args.summarize_only:
+        if args.dry_run or args.overwrite_output:
+            raise ValueError("--summarize_only cannot be combined with --dry_run/--overwrite_output")
+        return summarize_existing(args.output_dir)
     if args.recursive_steps < 2:
         raise ValueError("--recursive_steps must be >=2")
     if args.dry_run:

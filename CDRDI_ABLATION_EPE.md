@@ -38,4 +38,6 @@ python run_paviau_cdrdi_iteration_ablation.py \
 缺失 EPE 原始记录或 manifest 不完整时会报错，不会生成替代数值。
 
 重新执行完整实验时沿用原命令，主表会自动包含新增两列，无需额外参数。
-该更新仅补充几何评价，不改变已有消融所采用的扩散输出模式。
+默认仍为旧 `state` 输出。重新评价校正版时，在完整命令中添加
+`--diffusion_output terminal_correction`，所有几何条件使用同一输出模式，
+并记录在 manifest 中。请使用新的 output_dir 区分两种实验版本。

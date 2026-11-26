@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_paviau_cdrdi_iteration_ablation as ablation
@@ -83,3 +84,46 @@ def test_incomplete_or_invalid_stored_metrics_never_overwrite_old_table(tmp_path
     with pytest.raises(ValueError, match="all declared"):
         ablation.summarize_existing(tmp_path)
     assert old.read_text() == "original table"
+
+
+@pytest.mark.parametrize("mode", ["state", "terminal_correction"])
+def test_full_rerun_routes_all_geometry_conditions_through_the_same_output_mode(tmp_path, monkeypatch, mode):
+    from models import RawMSIDirectPredictor
+    from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
+    args = ablation.parse_args(["--device", "cpu", "--cases", "1", "--depths", "9",
+        "--geometry_base_channels", "8", "--diffusion_base_channels", "8", "--time_dim", "32",
+        "--spectral_hidden", "2", "--diffusion_steps", "4", "--diffusion_output", mode,
+        "--output_dir", str(tmp_path / mode)])
+    geometry = LearnedPhysicalResidualSolver(3, base_channels=8, control_grid=5,
+        max_translation=4., max_rotation_deg=2., max_local_px=4.)
+    diffusion = RawMSIDirectPredictor(31,3,total_steps=4,base_channels=8,time_dim=32,spectral_hidden=2)
+    for role, model, extra in [
+        ("geometry", geometry, {"dataset":"PaviaU", "variant":"recursive", "steps":6}),
+        ("one_shot_geometry", geometry, {"dataset":"PaviaU", "variant":"one_shot", "steps":1}),
+        ("diffusion", diffusion, {"dataset":"PaviaU", "geometry_steps":9})]:
+        path = tmp_path / (role + ".pth")
+        torch.save({"model":model.state_dict(), "extra":extra}, path)
+        setattr(args, role + "_checkpoint", str(path))
+    gt = torch.rand(1,31,64,64)
+    sample = {"gt":gt, "hr_msi":gt[:,:3]}
+    info = dict(n_bands=31,n_msi_bands=3,srf_weights=np.full((3,31),1/31))
+    monkeypatch.setattr(ablation.pipeline, "build_loaders", lambda cfg:(None,[sample],info))
+    calls=[]
+    original=ablation.pipeline.reconstruct_from_terminal_lr
+    def reconstruct(*a, **kw):
+        calls.append((kw["output_mode"], ablation._sha256_tensor(a[2])))
+        return original(*a, **kw)
+    monkeypatch.setattr(ablation.pipeline, "reconstruct_from_terminal_lr", reconstruct)
+    old = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        ablation.run(args)
+    finally:
+        torch.set_num_threads(old)
+    assert len(calls)==3 and all(value[0]==mode for value in calls)
+    assert len({value[1] for value in calls})==1
+    manifest=json.loads((tmp_path / mode / "manifest.json").read_text())
+    assert manifest["diffusion_output"]==mode
+    with (tmp_path / mode / "summary.csv").open() as stream:
+        rows=list(csv.DictReader(stream))
+    assert len(rows)==3 and all("EPE" in row and "EPE95" in row for row in rows)

@@ -80,6 +80,8 @@ def parse_args(argv=None):
     p.add_argument("--scale_ratio", type=int, default=4)
     p.add_argument("--srf_interp", choices=("pchip", "linear"), default="pchip")
     p.add_argument("--diffusion_steps", type=int, default=12)
+    p.add_argument("--diffusion_output", choices=("state", "terminal_correction"), default="state",
+                   help="Use the same diffusion output mode for every geometry condition")
     p.add_argument("--mtf_nyquist", type=float, default=0.2)
     p.add_argument("--psf_truncate", type=float, default=3.0)
 
@@ -412,6 +414,7 @@ def run(args):
     print("One-shot: independently trained single-update CDRDI checkpoint")
     print(f"Recursive main condition: K={args.recursive_steps}")
     print("Stage-2D diffusion: same frozen checkpoint for all conditions")
+    print("Diffusion output:", args.diffusion_output)
     print("Depth diagnostics:", depths)
     print("Recursive geometry checkpoint:", args.geometry_checkpoint)
     print("Independent one-shot checkpoint:", args.one_shot_geometry_checkpoint)
@@ -453,6 +456,7 @@ def run(args):
                 no_cdrdi_pred = pipeline.reconstruct_from_terminal_lr(
                     diffusion_model, base_process, observed,
                     target_size=(height, width), hr_msi=hr_msi,
+                    output_mode=args.diffusion_output,
                 )
                 no_cdrdi_metrics = pipeline.calc_metrics(
                     no_cdrdi_pred, gt, args.scale_ratio
@@ -492,6 +496,7 @@ def run(args):
                 one_prediction = pipeline.reconstruct_from_terminal_lr(
                     diffusion_model, one_process, observed,
                     target_size=(height, width), hr_msi=hr_msi,
+                    output_mode=args.diffusion_output,
                 )
                 one_metrics = pipeline.calc_metrics(
                     one_prediction, gt, args.scale_ratio
@@ -530,6 +535,7 @@ def run(args):
                     prediction = pipeline.reconstruct_from_terminal_lr(
                         diffusion_model, estimated_process, observed,
                         target_size=(height, width), hr_msi=hr_msi,
+                        output_mode=args.diffusion_output,
                     )
                     metrics = pipeline.calc_metrics(
                         prediction, gt, args.scale_ratio
@@ -609,6 +615,7 @@ def run(args):
         "dataset": "PaviaU",
         "registration": "unregistered",
         "hpgc_refiner": False,
+        "diffusion_output": args.diffusion_output,
         "same_diffusion_checkpoint_for_all_conditions": True,
         "no_cdrdi_definition": "identity geometry with the same frozen Stage-2D diffusion weights",
         "one_shot_definition": "independently trained CDRDI checkpoint with variant=one_shot and steps=1; evaluated with the same frozen Stage-2D diffusion checkpoint as recursive conditions",

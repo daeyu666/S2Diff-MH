@@ -41,3 +41,7 @@ python run_paviau_cdrdi_iteration_ablation.py \
 默认仍为旧 `state` 输出。重新评价校正版时，在完整命令中添加
 `--diffusion_output terminal_correction`，所有几何条件使用同一输出模式，
 并记录在 manifest 中。请使用新的 output_dir 区分两种实验版本。
+
+需要额外报告 K=1 时，使用 `--depths 1 3 6 9 --recursive_steps 9`。
+其中 K=1 是递归 CDRDI 权重只执行一次更新；One-shot 是独立训练的单步权重，
+结果表分别列为 `Depth diagnostic K1` 与 `One-shot`。

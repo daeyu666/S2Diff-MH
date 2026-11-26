@@ -90,7 +90,7 @@ def test_incomplete_or_invalid_stored_metrics_never_overwrite_old_table(tmp_path
 def test_full_rerun_routes_all_geometry_conditions_through_the_same_output_mode(tmp_path, monkeypatch, mode):
     from models import RawMSIDirectPredictor
     from models.cdrdi_residual_solver import LearnedPhysicalResidualSolver
-    args = ablation.parse_args(["--device", "cpu", "--cases", "1", "--depths", "9",
+    args = ablation.parse_args(["--device", "cpu", "--cases", "1", "--depths", "1", "9",
         "--geometry_base_channels", "8", "--diffusion_base_channels", "8", "--time_dim", "32",
         "--spectral_hidden", "2", "--diffusion_steps", "4", "--diffusion_output", mode,
         "--output_dir", str(tmp_path / mode)])
@@ -120,10 +120,12 @@ def test_full_rerun_routes_all_geometry_conditions_through_the_same_output_mode(
         ablation.run(args)
     finally:
         torch.set_num_threads(old)
-    assert len(calls)==3 and all(value[0]==mode for value in calls)
+    assert len(calls)==4 and all(value[0]==mode for value in calls)
     assert len({value[1] for value in calls})==1
     manifest=json.loads((tmp_path / mode / "manifest.json").read_text())
     assert manifest["diffusion_output"]==mode
     with (tmp_path / mode / "summary.csv").open() as stream:
         rows=list(csv.DictReader(stream))
-    assert len(rows)==3 and all("EPE" in row and "EPE95" in row for row in rows)
+    assert len(rows)==4 and all("EPE" in row and "EPE95" in row for row in rows)
+    assert "One-shot" in {row["Variant"] for row in rows}
+    assert "Depth diagnostic K1" in {row["Variant"] for row in rows}

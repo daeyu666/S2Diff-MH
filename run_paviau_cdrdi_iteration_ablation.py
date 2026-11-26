@@ -393,8 +393,8 @@ def run(args):
     one_shot_model.eval().requires_grad_(False)
 
     depths = sorted(set(int(x) for x in args.depths))
-    if any(x < 2 for x in depths):
-        raise ValueError("--depths are recursive depth diagnostics; values must be >=2")
+    if any(x < 1 for x in depths):
+        raise ValueError("--depths are recursive depth diagnostics; values must be >=1")
     if args.recursive_steps not in depths:
         raise ValueError("--depths must include --recursive_steps")
     if args.cases < 1:
@@ -412,6 +412,8 @@ def run(args):
     print("HPGC/GIGI: disabled")
     print("w/o CDRDI: identity geometry")
     print("One-shot: independently trained single-update CDRDI checkpoint")
+    if 1 in depths:
+        print("K=1: one inference update using the recursive CDRDI weights; separate from One-shot")
     print(f"Recursive main condition: K={args.recursive_steps}")
     print("Stage-2D diffusion: same frozen checkpoint for all conditions")
     print("Diffusion output:", args.diffusion_output)
@@ -621,6 +623,7 @@ def run(args):
         "one_shot_definition": "independently trained CDRDI checkpoint with variant=one_shot and steps=1; evaluated with the same frozen Stage-2D diffusion checkpoint as recursive conditions",
         "recursive_definition": f"K={args.recursive_steps} inference using the K=6-trained recursive CDRDI weights",
         "depth_diagnostics": depths,
+        "k1_definition": "one inference update using recursive CDRDI weights, not the independently trained One-shot checkpoint",
         "same_observation_per_case": True,
         "geometry_sampler": "sample_synthetic_geometry; seed reset to seed+70000 per test patch",
         "aggregation": "mean over cases within each patch, then equal-weight mean over test patches",
